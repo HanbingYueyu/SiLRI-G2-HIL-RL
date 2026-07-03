@@ -135,9 +135,9 @@ def train_cli(env_cfg):
     # 使用 draccus.parse 直接加载配置，并通过 args 传入覆盖
     with draccus.config_type("json"):
         if not env_cfg.fix_gripper:
-            cfg = draccus.parse(TrainRLServerPipelineConfig, config_path, args=[f"--policy.type={env_cfg.policy_type}",f"--policy.num_discrete_actions=2"])
+            cfg = draccus.parse(TrainRLServerPipelineConfig, config_path, args=[f"--policy.type={env_cfg.policy_type}",f"--policy.num_discrete_actions=2", f"--policy.actor_learner_config.learner_port={env_cfg.learner_port}"])
         else:
-            cfg = draccus.parse(TrainRLServerPipelineConfig, config_path, args=[f"--policy.type={env_cfg.policy_type}"])
+            cfg = draccus.parse(TrainRLServerPipelineConfig, config_path, args=[f"--policy.type={env_cfg.policy_type}", f"--policy.actor_learner_config.learner_port={env_cfg.learner_port}"])
     # Safely override dataset only if provided in env_cfg, converting Hydra DictConfig to DatasetConfig
     if hasattr(env_cfg, "dataset") and env_cfg.dataset is not None:
         try:

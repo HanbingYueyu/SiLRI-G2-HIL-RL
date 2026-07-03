@@ -30,11 +30,10 @@ robot_config:
   random_rz_range: 0.05
   gripper_sleep: 0.0
   max_episode_length: ${max_episode_length}
-
   control_mode: ${control_mode}
   classifier_cfg: ${classifier_cfg}
   gripper_penalty: ${gripper_penalty}
-  intervene_penalty: ${intervene_penalty}
   close_gripper: ${close_gripper}
   fix_gripper: ${fix_gripper}
   ego_mode: ${ego_mode}
+  enable_rotation: ${enable_rotation}

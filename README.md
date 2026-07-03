@@ -25,7 +25,7 @@ SiLRI: A state-wise Lagrangian RL algorithm for real-world robotic manipulation 
 <sup>&#9993;</sup>Corresponding author,
 
 [![arXiv](https://img.shields.io/badge/arXiv-2512.24288-b31b1b?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2512.24288)
- [![Project Page](https://img.shields.io/badge/Project-Page-green.svg?logo=github&logoColor=white)](https://silri-rl.github.io/)
+ [![Project Page](https://img.shields.io/badge/Project-Page-green.svg?logo=github&logoColor=white)](https://silri-anonymous.github.io/)
 
 
 <!-- [\[📖 Documents\]](#-documents) [\[🚀 Installation\]](#-installation) [\[📖 Training Recipe\]](#-training-recipe)  [\[🙋 FAQs\]](#-faqs) -->
@@ -36,6 +36,11 @@ SiLRI: A state-wise Lagrangian RL algorithm for real-world robotic manipulation 
 </div>
 
 ## Update Logs
+### v1.0.2
+
+#### Improvements
+* Added so101 support. Set `robot_type` to `so101` and add `so101.yaml` to enable it. so101 only supports joint control.
+
 
 ### v1.0.1
 

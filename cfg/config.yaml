@@ -4,7 +4,8 @@ defaults:
   - task@_global_: close_trashbin_franka_1028
   - override hydra/launcher: submitit_local
 
-
+learner_host: 10.10.247.23
+learner_port: 50065
 
 fake_env: false
 control_mode: pose

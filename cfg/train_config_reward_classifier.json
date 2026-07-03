@@ -20,17 +20,17 @@
             "observation.images.right": {
                 "type": "VISUAL",
                 "shape": [
+                    3,  
                     128,
-                    128,
-                    3
+                    128
                 ]
             },
             "observation.images.wrist": {
                 "type": "VISUAL",
                 "shape": [
+                    3,
                     128,
-                    128,
-                    3
+                    128
                 ]
             },
             "observation.state": {

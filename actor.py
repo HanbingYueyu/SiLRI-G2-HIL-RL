@@ -145,9 +145,9 @@ def actor_cli(env_cfg):
         raise ValueError(f"Invalid robot type: {env_cfg.robot_type}")
     with draccus.config_type("json"):
         if not env_cfg.fix_gripper:
-            cfg = draccus.parse(TrainRLServerPipelineConfig, lerobot_config_path, args=[f"--policy.type={env_cfg.policy_type}", f"--policy.num_discrete_actions=2"])
+            cfg = draccus.parse(TrainRLServerPipelineConfig, lerobot_config_path, args=[f"--policy.type={env_cfg.policy_type}", f"--policy.num_discrete_actions=2", f"--policy.actor_learner_config.learner_host={env_cfg.learner_host}", f"--policy.actor_learner_config.learner_port={env_cfg.learner_port}"])
         else:
-            cfg = draccus.parse(TrainRLServerPipelineConfig, lerobot_config_path, args=[f"--policy.type={env_cfg.policy_type}"])
+            cfg = draccus.parse(TrainRLServerPipelineConfig, lerobot_config_path, args=[f"--policy.type={env_cfg.policy_type}", f"--policy.actor_learner_config.learner_host={env_cfg.learner_host}", f"--policy.actor_learner_config.learner_port={env_cfg.learner_port}"])
 
     if env_cfg.dataset is not None:
         dataset_obj = OmegaConf.to_object(env_cfg.dataset)

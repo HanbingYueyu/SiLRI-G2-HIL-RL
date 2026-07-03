@@ -207,8 +207,8 @@ def step_env_and_process_transition(
         Processed transition with updated state.
     """
     device = torch.device("cpu")
-    action[2] = 1.0
-    print(f"action: {action}")
+    # action[2] = 1.0
+    # print(f"action: {action}")
     # input("press Enter to continue...")
     obs, reward, terminated, truncated, info = env.step(action)
     obs = make_policy_obs(obs, device, env_cfg.robot_config.robot_type)
