@@ -4,3 +4,6 @@
 [submodule "lerobot"]
 	path = lerobot
 	url = https://github.com/nuomizai/lerobot.git
+[submodule "rl_envs_sim"]
+	path = rl_envs_sim
+	url = https://github.com/zxylijinbu/rl_envs_sim.git

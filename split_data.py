@@ -130,12 +130,12 @@ def split_dataset_by_reward(
     
     # Output statistics for each episode
     logging.info(f"\n{'='*60}")
-    logging.info(f"Statistics per episode (成功/失败 counts):")
+    logging.info(f"Statistics per episode (success/failure counts):")
     logging.info(f"{'='*60}")
     for ep_idx in sorted(episode_stats.keys()):
         stats = episode_stats[ep_idx]
         total = stats["success"] + stats["failure"]
-        logging.info(f"Episode {ep_idx}: 成功={stats['success']}, 失败={stats['failure']}, 总计={total}")
+        logging.info(f"Episode {ep_idx}: success={stats['success']}, failure={stats['failure']}, total={total}")
     logging.info(f"{'='*60}")
     
     logging.info(f"\nSplit results (Overall):")

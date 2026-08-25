@@ -1,0 +1,79 @@
+task_name: sim_arrange_box
+
+lerobot:
+  cameras: [front, wrist]
+  state_dim: 6
+  action_dim: 3
+  fps: 15
+  num_discrete_actions: null
+  expert_state_dim: 6
+  expert_cameras: [front, wrist]
+  expert_env_state_dim: 18
+
+
+dataset: null
+
+
+close_gripper: true
+fix_gripper: true
+max_episode_length: 200
+max_train_time: 24000
+evaluation_interval: 200
+evaluation_episode: 50
+max_step: 30000
+max_intervention_steps_per_episode: 15
+save_checkpoint: true
+quantile_level: 0.7
+front_camera: front  
+wrist_camera: wrist  
+
+
+env_id: "gym_hil/PandaArrangeBoxesGamepad-v0"
+
+
+use_gripper: false
+use_gamepad: false
+controller_config_path: "../../../gym-hil/gym_hil/PS5_config.json"
+random_block_position: false
+use_human_intervention: false
+intervention_signal_source: human
+resume_model: false
+
+
+use_gripper_penalty: false
+action_noise_duration: 10
+time_penalty: 0.0
+intervention_steps: 10
+expert:
+    load_path:  ../../rl_envs_sim/expert/sim_arrange_box/pretrained_model/
+    device: ${device}
+    policy_type: tqc
+
+
+env_cfg:
+    id: ${env_id}    
+    seed: ${seed}  
+    render_mode: "human"
+    image_obs: true
+    front_camera: ${front_camera}
+    wrist_camera: ${wrist_camera}
+    headless: ${headless}
+    use_gamepad: ${use_gamepad}
+    max_episode_steps: ${max_episode_length}
+    controller_config_path: ${controller_config_path}
+    reward_type: ${reward_type}
+    use_gripper: false
+    close_gripper: true
+    fix_gripper: true
+    hz: 1000
+    time_penalty: ${time_penalty}
+    random_block_position: ${random_block_position}
+    expert_cfg: null
+    use_expert_control: ${use_expert_control}
+    intervention_signal_source: ${intervention_signal_source}
+    use_inputs_control: ${use_inputs_control}
+    max_intervention_steps_per_episode: ${max_intervention_steps_per_episode}
+    action_noise_duration: ${action_noise_duration}
+    reset_delay_seconds: ${reset_delay_seconds}
+    max_step: ${max_step}
+    intervention_steps: ${intervention_steps}

@@ -1,0 +1,50 @@
+robot_config:
+  robot_type: sim
+  joint_dim: 17
+  gripper_dim: 1
+  image_crop: {
+      "front": [[0, 480], [225, -50]]
+  }
+  # action_scale: [0.01, 0.03, 1.0]
+  action_scale: [0.02, 0.06, 1.0]
+  # action_scale: [1.0, 1.0, 1.0]
+  image_keys: ["front", "wrist"]
+  # classifier_keys: ["right", "wrist"]
+
+  proprio_keys: ["tcp_pose", "gripper_pose", "ee_force"]
+
+  image_resize: {
+    "front": [128, 128, 3],
+  }
+  dual_arm: false
+    
+  bgr2rgb: true
+
+# ======================================= 1. change here ========================================================
+  
+  control_mode: ${control_mode}
+
+  close_gripper: ${close_gripper}
+  fix_gripper: ${fix_gripper}
+  use_gripper: ${use_gripper}
+
+  auto_reset: true
+  reset_delay_seconds: 1.0
+  show_ui: true
+  use_human_intervention: ${use_human_intervention}
+
+
+
+
+
+
+
+
+
+    
+
+
+
+
+
+

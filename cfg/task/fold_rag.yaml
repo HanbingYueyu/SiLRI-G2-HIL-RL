@@ -10,13 +10,13 @@ reset_joint: [4.064019, -1.8681937, -1.4756237, -1.2299589, 2.094602, 3.48865]
 "dataset": {
     "repo_id": "lerobot/RoboMIND",
     "use_imagenet_stats": false,
-    # "root": "/home/ps/Dev/linda/HIL-RL/experiments/fold_rag/offline_dataset/fold_rag" 
+    "root": "../../../../offline_dataset/fold_rag" 
 }
 
 classifier_cfg:
     classifier_keys: ["right"]
-    pretrained_encoder_path: /home/ps/Dev/linda/HIL-RL/experiments/resnet10_params.pkl
-    checkpoint_path: /home/ps/Dev/linda/HIL-RL/experiments/fold_rag/classifier_ckpt_hilserl
+    pretrained_encoder_path: ../resnet10_params.pkl
+    checkpoint_path: classifier/checkpoints/000500
     reward_pos: 10.0
     reward_neg: -0.05
     require_train: true

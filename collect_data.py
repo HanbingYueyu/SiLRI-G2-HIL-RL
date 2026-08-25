@@ -175,7 +175,7 @@ def sanitize_info_for_transition(info: dict) -> dict:
 
 
 def make_policy_obs(obs: dict, device: torch.device, robot_type: str) -> dict:
-    # 先将numpy数组转换为Tensor，再调整维度顺序
+    # Convert numpy arrays to tensors first, then reorder the dimensions
     policy_obs = {}
     for keys in obs.keys():
         if "state" not in keys:

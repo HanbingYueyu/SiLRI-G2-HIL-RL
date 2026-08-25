@@ -53,7 +53,6 @@ from pathlib import Path
 from pprint import pformat
 
 import grpc
-from keras.src.callbacks import optimizer
 import torch
 from termcolor import colored
 from torch import nn
@@ -71,7 +70,7 @@ from lerobot.constants import (
 )
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.policies.factory import make_policy
+from lerobot.policies.factory import make_policy, make_policy_config
 # from lerobot.policies.sac.modeling_sac import SACPolicy
 from lerobot.robots import so100_follower  # noqa: F401
 from lerobot.scripts.rl import learner_service
@@ -98,8 +97,11 @@ from lerobot.utils.utils import (
     get_safe_torch_device,
     init_logging,
 )
+from lerobot.configs.types import FeatureType, PolicyFeature
+
 from lerobot.utils.wandb_utils import WandBLogger
 import hydra
+from hydra.core.hydra_config import HydraConfig
 import draccus
 from omegaconf import OmegaConf
 from lerobot.configs.default import DatasetConfig
@@ -117,27 +119,32 @@ new_offline_transition_num = 0
 
 
 # @parser.wrap()
-@hydra.main(config_path="./cfg", config_name="config") 
+@hydra.main(config_path="./cfg", config_name="config", version_base=None) 
 def train_cli(env_cfg):
+    cfg_dir = Path(__file__).resolve().parent / "cfg"
     if env_cfg.robot_config.robot_type == "ur_wrist":
-        env_cfg.lerobot_config_path = "../../../../../cfg/train_config_silri_ur.json"
+        env_cfg.lerobot_config_path = str(cfg_dir / "train_config_silri_ur.json")
     elif "franka" in env_cfg.robot_config.robot_type:
-        env_cfg.lerobot_config_path = "../../../../../cfg/train_config_silri_franka.json"
-    
+        env_cfg.lerobot_config_path = str(cfg_dir / "train_config_silri_franka.json")
     elif "tienkung" in env_cfg.robot_config.robot_type:
-        env_cfg.lerobot_config_path = "../../../../../cfg/train_config_silri_tienkung.json"
+        env_cfg.lerobot_config_path = str(cfg_dir / "train_config_silri_tienkung.json")
+    elif "sim" in env_cfg.robot_config.robot_type:
+        env_cfg.lerobot_config_path = str(cfg_dir / "train_config_simulator.json")
     else:
         raise ValueError(f"Invalid robot type: {env_cfg.robot_type}")
-    
-    
+
     config_path = env_cfg.lerobot_config_path
 
-    # 使用 draccus.parse 直接加载配置，并通过 args 传入覆盖
+    # Load the config directly with draccus.parse, passing overrides through args
     with draccus.config_type("json"):
         if not env_cfg.fix_gripper:
-            cfg = draccus.parse(TrainRLServerPipelineConfig, config_path, args=[f"--policy.type={env_cfg.policy_type}",f"--policy.num_discrete_actions=2", f"--policy.actor_learner_config.learner_port={env_cfg.learner_port}"])
+            cfg = draccus.parse(TrainRLServerPipelineConfig, config_path, args=[f"--policy.type={env_cfg.policy_type}",f"--policy.num_discrete_actions=2", f"--policy.actor_learner_config.learner_port={env_cfg.learner_port}", f"--seed={env_cfg.seed}"])
         else:
-            cfg = draccus.parse(TrainRLServerPipelineConfig, config_path, args=[f"--policy.type={env_cfg.policy_type}", f"--policy.actor_learner_config.learner_port={env_cfg.learner_port}"])
+            cfg = draccus.parse(TrainRLServerPipelineConfig, config_path, args=[f"--policy.type={env_cfg.policy_type}", f"--policy.actor_learner_config.learner_port={env_cfg.learner_port}", f"--seed={env_cfg.seed}"])
+    
+    if "sim" in env_cfg.robot_config.robot_type:
+        apply_sim_task_overrides(cfg, env_cfg)
+
     # Safely override dataset only if provided in env_cfg, converting Hydra DictConfig to DatasetConfig
     if hasattr(env_cfg, "dataset") and env_cfg.dataset is not None:
         try:
@@ -157,7 +164,9 @@ def train_cli(env_cfg):
         cfg.output_dir = Path(env_cfg.resume_path)
     else:
         cfg.resume = False
-        cfg.output_dir = os.getcwd()
+        # Keep as str so validate() does not raise FileExistsError on Hydra's already-created run dir.
+        # Example: experiments/<task>/exp_local/<date>/<overrides>/<seed>
+        cfg.output_dir = os.path.abspath(HydraConfig.get().runtime.output_dir)
     cfg.job_name = env_cfg.task_name
     cfg.validate(config_path)
     cfg.wandb.name = env_cfg.task_name
@@ -385,7 +394,7 @@ def add_actor_information_and_train(
 
     last_time_policy_pushed = time.time()
 
-    optimizers, lr_scheduler = make_optimizers_and_scheduler(cfg=cfg, policy=policy)
+    optimizers, lr_scheduler = policy.get_optimizer_and_scheduler()
 
     # If we are resuming, we need to load the training state
     resume_optimization_step, resume_interaction_step = load_training_state(cfg=cfg, optimizers=optimizers)
@@ -394,23 +403,22 @@ def add_actor_information_and_train(
     replay_buffer = initialize_replay_buffer(cfg, device, storage_device)
     batch_size = cfg.batch_size
     offline_replay_buffer = None
-    if cfg.dataset is not None:
-        try:
-            offline_replay_buffer = initialize_offline_replay_buffer(
-                cfg=cfg,
-                device=device,
-                storage_device=storage_device,
-            )
-        except Exception as e:
-            print(f"WARN: Ignoring invalid dataset override: {e}")
-            exit(0)
+    try:
+        offline_replay_buffer = initialize_offline_replay_buffer(
+            cfg=cfg,
+            device=device,
+            storage_device=storage_device,
+        )
+    except Exception as e:
+        print(f"WARN: Ignoring invalid dataset override: {e}")
+        exit(0)
 
-        """
-            只取offline_replay_buffer, batch_size无需减半
-        """
-        if "hgdagger" not in cfg.policy.type:
-        # if not cfg.policy.only_off_and_intervention:
-            batch_size: int = batch_size // 2  # We will sample from both replay buffer
+    """
+        When only the offline_replay_buffer is used, the batch size does not need halving
+    """
+    if "hgdagger" not in cfg.policy.type:
+    # if not cfg.policy.only_off_and_intervention:
+        batch_size: int = batch_size // 2  # We will sample from both replay buffer
 
     logging.info("Starting learner thread")
     interaction_message = None
@@ -500,7 +508,7 @@ def add_actor_information_and_train(
             break
 
         # Wait until the replay buffer has enough samples to start training
-        if len(replay_buffer) < online_step_before_learning:
+        if len(replay_buffer) < online_step_before_learning  or len(offline_replay_buffer) < online_step_before_learning:
             continue
 
         if online_iterator is None:
@@ -515,63 +523,45 @@ def add_actor_information_and_train(
 
         time_for_one_optimization_step = time.time()
         
-        # 前 utd_ratio - 1 次优化critic
+        # First utd_ratio - 1 updates: critic only
         for _ in range(utd_ratio - 1):
             # Sample from the iterators
             """
-                只需要离线数据+人类介入的数据
+                Only offline data plus human-intervention data is needed
             """
             if "hgdagger" in cfg.policy.type:
             # if cfg.policy.only_off_and_intervention:
-                if dataset_repo_id is not None:
+                if offline_replay_buffer is not None:
                     batch_offline = next(offline_iterator)
                     batch_offline['is_intervention'] = torch.ones_like(batch_offline['done']).to(device)
                     batch = batch_offline
             else:
                 batch = next(online_iterator)
-                online_batch_size = batch["action"].shape[0]
                 batch['is_intervention'] = batch["complementary_info"]["is_intervention"]
             
-                if dataset_repo_id is not None:
+                if offline_replay_buffer is not None:
                     batch_offline = next(offline_iterator)
                     batch_offline['is_intervention'] = torch.ones_like(batch_offline['done']).to(device)
                     batch = concatenate_batch_transitions(
                         left_batch_transitions=batch, right_batch_transition=batch_offline
                     )
-
-            actions = batch["action"]
-            rewards = batch["reward"]
-            observations = batch["state"]
-            next_observations = batch["next_state"]
-            done = batch["done"]
-            is_intervention = batch["is_intervention"]
-
-            # weight = batch["complementary_info"]["weight"]
-
-
-            check_nan_in_transition(observations=observations, actions=actions, next_state=next_observations)
+            
+            check_nan_in_transition(observations=batch["state"], actions=batch["action"], next_state=batch["next_state"])
 
             observation_features, next_observation_features = get_observation_features(
-                policy=policy, observations=observations, next_observations=next_observations
+                policy=policy, observations=batch["state"], next_observations=batch["next_state"]
             )
 
             # Create a batch dictionary with all required elements for the forward method
-            forward_batch = {
-                "action": actions,
-                "reward": rewards,
-                "state": observations,
-                "next_state": next_observations,
-                "done": done,
-                "is_intervention": is_intervention,
-                "observation_feature": observation_features,
-                "next_observation_feature": next_observation_features,
-                "complementary_info": batch["complementary_info"],
-            }
+            forward_batch = batch
+            forward_batch['observation_feature'] = observation_features
+            forward_batch['next_observation_feature'] = next_observation_features
+
 
             """
-                hgdagger模仿学习不需要critic
+                hgdagger is pure imitation learning and needs no critic
             """
-            if "hgdagger" not in cfg.policy.type:
+            if "critic" in optimizers.keys():
                 # Use the forward method for critic loss
                 critic_output = policy.forward(forward_batch, model="critic")
 
@@ -580,23 +570,23 @@ def add_actor_information_and_train(
                 
                 optimizers["critic"].zero_grad()
                 loss_critic.backward()
-                critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    parameters=policy.critic_ensemble.parameters(), max_norm=clip_grad_norm_value
-                )
+
+                if hasattr(policy, "critic_ensemble"):
+                    critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        parameters=policy.critic_ensemble.parameters(), max_norm=clip_grad_norm_value
+                    )
+                elif hasattr(policy, "critic_qc"):
+                    critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        parameters=policy.critic_qc.parameters(), max_norm=clip_grad_norm_value
+                    )
                 optimizers["critic"].step()
 
             # Discrete critic optimization (if available)
-            """
-                hgdagger和silri夹爪部分模仿学习不需要discrete critic
-            """
-            if policy.config.num_discrete_actions is not None and "hgdagger" not in cfg.policy.type and "silri" not in cfg.policy.type:
+            if "discrete_critic" in optimizers.keys():
                 discrete_critic_output = policy.forward(forward_batch, model="discrete_critic")
                 loss_discrete_critic = discrete_critic_output["loss_discrete_critic"]
                 optimizers["discrete_critic"].zero_grad()
                 loss_discrete_critic.backward()
-                discrete_critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    parameters=policy.discrete_critic.parameters(), max_norm=clip_grad_norm_value
-                )
                 optimizers["discrete_critic"].step()
                 
 
@@ -604,13 +594,13 @@ def add_actor_information_and_train(
             policy.update_target_networks()
 
         # Sample for the last update in the UTD ratio
-        # 第 utd_ratio 次优化critic，同步更新 Actor
+        # Final (utd_ratio-th) update: critic plus actor
         """
-            只需要离线数据+人类介入的数据
+            Only offline data plus human-intervention data is needed
         """
         if "hgdagger" in cfg.policy.type:
         # if cfg.policy.only_off_and_intervention:
-            if dataset_repo_id is not None:
+            if offline_replay_buffer is not None:
                 batch_offline = next(offline_iterator)
                 batch_offline['is_intervention'] = torch.ones_like(batch_offline['done']).to(device)
                 batch = batch_offline
@@ -618,75 +608,53 @@ def add_actor_information_and_train(
             batch = next(online_iterator)
             batch['is_intervention'] = batch["complementary_info"]["is_intervention"]
         
-            if dataset_repo_id is not None:
+            if offline_replay_buffer is not None:
                 batch_offline = next(offline_iterator)
                 batch_offline['is_intervention'] = torch.ones_like(batch_offline['done']).to(device)
                 batch = concatenate_batch_transitions(
                     left_batch_transitions=batch, right_batch_transition=batch_offline
                 )
 
-        actions = batch["action"]
-        rewards = batch["reward"]
-        observations = batch["state"]
-        next_observations = batch["next_state"]
-        done = batch["done"]
-        is_intervention = batch["is_intervention"]
-
-
-        check_nan_in_transition(observations=observations, actions=actions, next_state=next_observations)
+        check_nan_in_transition(observations=batch["state"], actions=batch["action"], next_state=batch["next_state"])
 
         observation_features, next_observation_features = get_observation_features(
-            policy=policy, observations=observations, next_observations=next_observations
+            policy=policy, observations=batch["state"], next_observations=batch["next_state"]
         )
 
         # Create a batch dictionary with all required elements for the forward method
-        forward_batch = {
-            "action": actions,
-            "reward": rewards,
-            "state": observations,
-            "next_state": next_observations,
-            "done": done,
-            "observation_feature": observation_features,
-            "next_observation_feature": next_observation_features,
-            "is_intervention": is_intervention,
-            "complementary_info": batch["complementary_info"],
-        }
+        forward_batch = batch
+        forward_batch['observation_feature'] = observation_features
+        forward_batch['next_observation_feature'] = next_observation_features
 
-        """
-            hgdagger模仿学习不需要critic
-        """
-        if "hgdagger" not in cfg.policy.type:
+
+        training_infos = {}
+        if "critic" in optimizers.keys():
             critic_output = policy.forward(forward_batch, model="critic")
 
-            loss_critic = critic_output["loss_critic"]
+            loss_critic = critic_output.pop("loss_critic")
 
             optimizers["critic"].zero_grad()
             loss_critic.backward()
-            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-                parameters=policy.critic_ensemble.parameters(), max_norm=clip_grad_norm_value
-            )
+            training_infos["loss_critic"] = loss_critic.item()
+            if hasattr(policy, "critic_ensemble"):
+                critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    parameters=policy.critic_ensemble.parameters(), max_norm=clip_grad_norm_value
+                )
+            elif hasattr(policy, "critic_qc"):
+                critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    parameters=policy.critic_qc.parameters(), max_norm=clip_grad_norm_value
+                )
             optimizers["critic"].step()
 
             # Initialize training info dictionary
-            training_infos = {
-                "loss_critic": loss_critic.item(),
-                "critic_grad_norm": critic_grad_norm.mean().item(),
-            }
-        else:
-            training_infos = {
-                "loss_actor": 0.0,
-                "bc_loss": 0.0,
-                "min_q_preds": 0.0,
-                "actor_grad_norm": 0.0,
-            }
+            training_infos["critic_grad_norm"] = critic_grad_norm.mean().item()
+
+            training_infos.update(critic_output)
 
         # Discrete critic optimization (if available)
-        """
-            hgdagger和silri夹爪部分模仿学习不需要discrete critic
-        """
-        if policy.config.num_discrete_actions is not None and "hgdagger" not in cfg.policy.type and "silri" not in cfg.policy.type:
+        if "discrete_critic" in optimizers.keys():
             discrete_critic_output = policy.forward(forward_batch, model="discrete_critic")
-            loss_discrete_critic = discrete_critic_output["loss_discrete_critic"]
+            loss_discrete_critic = discrete_critic_output.pop("loss_discrete_critic")
             optimizers["discrete_critic"].zero_grad()
             loss_discrete_critic.backward()
             discrete_critic_grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -697,8 +665,7 @@ def add_actor_information_and_train(
             # Add discrete critic info to training info
             training_infos["loss_discrete_critic"] = loss_discrete_critic.item()
             training_infos["discrete_critic_grad_norm"] = discrete_critic_grad_norm
-            training_infos["loss_q"] = discrete_critic_output.get("loss_q", 0.0)
-            training_infos["loss_bc"] = discrete_critic_output.get("loss_bc", 0.0)
+            training_infos.update(discrete_critic_output)
 
 
 
@@ -707,8 +674,31 @@ def add_actor_information_and_train(
             for _ in range(policy_update_freq):
                 # Actor optimization
                 actor_output = policy.forward(forward_batch, model="actor")
-                loss_actor = actor_output["loss_actor"] 
-                optimizers["actor"].zero_grad() # 重置Actor网络参数的梯度缓存
+                # if hasattr(policy.actor, "mean_layer"):
+                #     last_layer_modules = [policy.actor.mean_layer]
+                #     if hasattr(policy.actor, "std_layer"):
+                #         last_layer_modules.append(policy.actor.std_layer)
+                #     last_layer_params = [
+                #         p for m in last_layer_modules for p in m.parameters() if p.requires_grad
+                #     ]
+
+                #     def _grad_norm(loss, retain):
+                #         grads = torch.autograd.grad(loss, last_layer_params, retain_graph=retain, allow_unused=True)
+                #         gs = [g for g in grads if g is not None]
+                #         return torch.norm(torch.stack([g.norm() for g in gs])).item()
+
+                #     # ── 测量各项损失的梯度贡献（不修改 .grad，不需要 zero_grad）──
+                #     # donated_buffer=False 已在 modeling 中设置，retain_graph=True 可正常使用
+                #     trace_keys = ['loss_from_q', 'loss_from_entropy']
+                #     for key in trace_keys:
+                #         if key in actor_output:
+                #             trace_loss = actor_output.pop(key)
+                #             new_key = key.split('_')[-1]
+                #             grad_norm_from_key = _grad_norm(trace_loss, retain=True)
+                #             training_infos[f"grad_norm_from_{new_key}"] = grad_norm_from_key
+
+                loss_actor = actor_output.pop("loss_actor") 
+                optimizers["actor"].zero_grad() # Reset the gradient buffers of the actor
                 loss_actor.backward()
                 actor_grad_norm = torch.nn.utils.clip_grad_norm_(
                         parameters=policy.actor.parameters(), max_norm=clip_grad_norm_value
@@ -717,19 +707,13 @@ def add_actor_information_and_train(
 
                 # Add actor info to training info
                 training_infos["loss_actor"] = loss_actor.item()
-                training_infos["bc_loss"] = actor_output.get("bc_loss", 0.0)
-                training_infos["min_q_preds"] = actor_output.get("min_q_preds", 0.0)
                 training_infos["actor_grad_norm"] = actor_grad_norm
-                training_infos["allow_d_actor"] = actor_output.get("allow_d", 0.0)
+                training_infos.update(actor_output)
                 
 
-                if "silri" in cfg.policy.type:
-                    training_infos["lagrange_multiplier_value"] = actor_output["lagrange_multiplier_value"]
-                
-
-                if "silri" in cfg.policy.type and optimization_step % 1 == 0:
+                if "lagrange" in optimizers.keys() and optimization_step % 1 == 0:
                     lagrange_output = policy.forward(forward_batch, model="lagrange")
-                    loss_lagrange = lagrange_output["loss_lagrange"]
+                    loss_lagrange = lagrange_output.pop("loss_lagrange")
 
                     optimizers["lagrange"].zero_grad()
                     loss_lagrange.backward()
@@ -739,16 +723,14 @@ def add_actor_information_and_train(
                     optimizers["lagrange"].step()
                     training_infos["loss_lagrange"] = loss_lagrange.item()
                     training_infos["lagrange_grad_norm"] = lagrange_grad_norm
-                    training_infos["mean_d"] = lagrange_output.get("mean_d", 0.0)
-                    training_infos["allow_d"] = lagrange_output.get("allow_d", 0.0)
-                    training_infos["cost_dev"] = lagrange_output.get("cost_dev", 0.0)
+                    training_infos.update(lagrange_output)
             
                 policy.update_target_networks()
 
                 # # Temperature optimization
-                if "sac" in cfg.policy.type:
+                if "temperature" in optimizers.keys():
                     temperature_output = policy.forward(forward_batch, model="temperature")
-                    loss_temperature = temperature_output["loss_temperature"]
+                    loss_temperature = temperature_output.pop("loss_temperature")
                     optimizers["temperature"].zero_grad()
                     loss_temperature.backward()
                     temp_grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -760,12 +742,13 @@ def add_actor_information_and_train(
                     training_infos["loss_temperature"] = loss_temperature.item()
                     training_infos["temperature_grad_norm"] = temp_grad_norm
                     training_infos["temperature"] = policy.temperature
+                    training_infos.update(temperature_output)
 
                     # Update temperature
                     policy.update_temperature()
 
         # Push policy to actors if needed
-        # 将最新策略参数发送给 Actor 端，让 Actor 用新策略与环境交互
+        # Push the latest policy parameters to the actor so it interacts with the updated policy
         if time.time() - last_time_policy_pushed > policy_parameters_push_frequency:
             push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)
             last_time_policy_pushed = time.time()
@@ -774,7 +757,6 @@ def add_actor_information_and_train(
 
         # Log training metrics at specified intervals
         if optimization_step % 5 == 0:
-            # print('-----------> training_infos:', training_infos)
             training_infos["replay_buffer_size"] = len(replay_buffer)
             if offline_replay_buffer is not None:
                 training_infos["offline_replay_buffer_size"] = len(offline_replay_buffer)
@@ -1080,165 +1062,120 @@ def save_training_checkpoint(
     dataset_repo_id: str | None = None,
     fps: int = 30,
 ) -> None:
-    # 日志输出当前检查点保存的优化步数，便于调试和监控
+    # Log the step this checkpoint is saved at, for debugging and monitoring
     logging.info(f"Checkpoint policy after step {optimization_step}")
     
-    # 计算步数显示的最小位数（确保目录命名对齐，如000001、000100）
+    # Minimum digit count for step numbers, so directory names stay aligned (e.g. 000001, 000100)
     _num_digits = max(6, len(str(online_steps)))
     
-    # 提取当前交互步数（若未收到交互信息则默认为0，用于恢复训练时对齐进度）
+    # Current interaction step (defaults to 0 if no interaction message was received); used to align progress when resuming
     interaction_step = interaction_message["Interaction step"] if interaction_message is not None else 0
 
-    # 1. 创建检查点根目录：格式为 output_dir/checkpoints/step_xxx（xxx为总步数_当前步数）
-    checkpoint_dir = get_step_checkpoint_dir(Path(cfg.output_dir), online_steps, optimization_step)
+    # 1. Create the checkpoint root directory under the Hydra run dir:
+    #    experiments/<task>/exp_local/<date>/<overrides>/<seed>/checkpoints/step_xxx
+    output_dir = Path(cfg.output_dir)
+    checkpoint_dir = get_step_checkpoint_dir(output_dir, online_steps, optimization_step)
     
-    # 2. 定义模型保存路径：检查点目录/pretrained_model/当前优化步数
+    # 2. Model save path: <checkpoint_dir>/pretrained_model/<current step>
     model_dir = os.path.join(checkpoint_dir, PRETRAINED_MODEL_DIR, str(optimization_step))
     
-    # 保存模型权重和配置
-    # 会自动保存模型state_dict、配置文件等，支持后续from_pretrained加载
+    # Save the model weights and config
+    # Stores the state_dict and config files so the policy can be reloaded with from_pretrained
     policy.save_pretrained(model_dir)
     print('save model under', model_dir)
 
     if "hgdagger" not in cfg.policy.type:
-        # （注释掉的备用逻辑）保存完整检查点（含优化器、调度器状态）
-        # 若需恢复训练时继续使用之前的优化器状态，需取消注释此段
+        # (Disabled alternative) save a full checkpoint including optimizer and scheduler state
+        # Uncomment this block to restore the previous optimizer state when resuming
         save_checkpoint(
             checkpoint_dir=checkpoint_dir,
             step=optimization_step,
             cfg=cfg,
             policy=policy,
             optimizer=optimizers,
-            scheduler=None,  # 本训练流程未使用学习率调度器，设为None
+            scheduler=None,  # This pipeline uses no LR scheduler, so pass None
         )
 
-    # 3. 保存训练状态（优化步数+交互步数）
+    # 3. Save the training state (optimization step + interaction step)
     training_state_dir = os.path.join(checkpoint_dir, TRAINING_STATE_DIR)
-    os.makedirs(training_state_dir, exist_ok=True)  # 确保目录存在，不存在则创建
+    os.makedirs(training_state_dir, exist_ok=True)  # Create the directory if it does not exist
     
-    # 训练状态字典：包含恢复训练必需的核心进度信息
+    # Training state: the progress information required to resume training
     training_state = {
-        "step": optimization_step,  # 优化步数（恢复时从该步继续训练）
-        "interaction_step": interaction_step  # 交互步数（对齐Actor端进度）
+        "step": optimization_step,  # Optimization step; training resumes from here
+        "interaction_step": interaction_step  # Interaction step, aligned with the actor's progress
     }
-    # 保存训练状态到文件
+    # Write the training state to disk
     torch.save(training_state, os.path.join(training_state_dir, "training_state.pt"))
 
-    # 4. 更新"last"符号链接：指向当前最新检查点目录
-    # 作用：快速访问最新模型，无需记住具体步数目录
+    # 4. Update the "last" symlink to point at the newest checkpoint directory
+    # This gives quick access to the latest model without knowing its step number
     update_last_checkpoint(checkpoint_dir)
 
-    # 5. 保存在线回放缓冲区为标准数据集（临时逻辑，后续可迁移到机器人端控制）
-    # 数据集保存路径：output_dir/dataset
-    dataset_dir = os.path.join(cfg.output_dir, "dataset")
+    # 5. Save the online replay buffer as a standard dataset (temporary; may move to the robot side later)
+    # Dataset path: <hydra_run_dir>/dataset
+    dataset_dir = os.path.join(output_dir, "dataset")
     if os.path.exists(dataset_dir) and os.path.isdir(dataset_dir):
         shutil.rmtree(dataset_dir)
 
-    # 确定数据集仓库ID：优先使用传入的dataset_repo_id，未指定则使用环境任务名
+    # Dataset repo id: prefer the given dataset_repo_id, otherwise fall back to the env task name
     repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
     
-    # 将回放缓冲区转换为LeRobot标准数据集格式（支持后续加载复用）
+    # Convert the replay buffer into the standard LeRobot dataset format for later reuse
     replay_buffer.to_lerobot_dataset(
-        repo_id=repo_id_buffer_save,  # 数据集标识
-        fps=fps,  # 与环境帧率一致，保证数据时间同步
-        root=dataset_dir  # 保存根目录
+        repo_id=repo_id_buffer_save,  # Dataset identifier
+        fps=fps,  # Matches the env frame rate to keep timing consistent
+        root=dataset_dir  # Save root directory
     )
 
-    # 6. 保存离线回放缓冲区为独立数据集
+    # 6. Save the offline replay buffer as a separate dataset
     if offline_replay_buffer is not None:
-        # 离线数据集保存路径：output_dir/dataset_offline
-        dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
+        # Offline dataset path: <hydra_run_dir>/dataset_offline
+        dataset_offline_dir = os.path.join(output_dir, "dataset_offline")
         
-        # 若离线数据集目录已存在，先删除旧数据
+        # Remove stale data if the offline dataset directory already exists
         if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
             shutil.rmtree(dataset_offline_dir)
 
-        # 保存离线缓冲区为标准数据集（使用离线数据的repo_id标识）
+        # Save the offline buffer as a standard dataset, keyed by the offline repo_id
         offline_replay_buffer.to_lerobot_dataset(
-            cfg.dataset.repo_id,  # 离线数据集的仓库ID（从配置中读取）
-            fps=fps,  # 保持与环境帧率一致
-            root=dataset_offline_dir  # 离线数据集保存根目录
+            repo_id_buffer_save,  # Offline dataset repo id, taken from the config
+            fps=fps,  # Matches the env frame rate
+            root=dataset_offline_dir  # Offline dataset save root directory
         )
 
-    # 日志输出保存完成，提示支持恢复训练
+    # Log completion and note that training can be resumed
     logging.info("Resume training")
 
 
-def make_optimizers_and_scheduler(cfg: TrainRLServerPipelineConfig, policy: nn.Module):
-    """
-    Creates and returns optimizers for the actor, critic, and temperature components of a reinforcement learning policy.
+def apply_sim_task_overrides(cfg, env_cfg):
+    features = {}
+    features_map = {}
+    for cam in env_cfg.lerobot.cameras:
+        key = f"observation.images.{cam}"
+        features[key] = PolicyFeature(type=FeatureType.VISUAL, shape=(128, 128, 3))
+        features_map[key] = key
+    features["observation.state"] = PolicyFeature(type=FeatureType.STATE, shape=(env_cfg.lerobot.state_dim,))
+    features_map["observation.state"] = "observation.state"
+    features["action"] = PolicyFeature(type=FeatureType.ACTION, shape=(env_cfg.lerobot.action_dim,))
+    features_map["action"] = "action"
 
-    This function sets up Adam optimizers for:
-    - The **actor network**, ensuring that only relevant parameters are optimized.
-    - The **critic ensemble**, which evaluates the value function.
-    - The **temperature parameter**, which controls the entropy in soft actor-critic (SAC)-like methods.
+    cfg.job_name = env_cfg.task_name
+    cfg.env.fps = env_cfg.lerobot.fps
+    cfg.env.features = features
+    cfg.env.features_map = features_map
+    cfg.policy.num_discrete_actions = env_cfg.lerobot.num_discrete_actions
 
-    It also initializes a learning rate scheduler, though currently, it is set to `None`.
+    policy_input_features = {}
+    for cam in env_cfg.lerobot.cameras:
+        policy_input_features[f"observation.images.{cam}"] = PolicyFeature(
+            type=FeatureType.VISUAL, shape=(3, 128, 128)
+        )
+    policy_input_features["observation.state"] = PolicyFeature(
+        type=FeatureType.STATE, shape=(env_cfg.lerobot.state_dim,)
+    )
+    cfg.policy.input_features = policy_input_features
 
-    NOTE:
-    - If the encoder is shared, its parameters are excluded from the actor's optimization process.
-    - The policy's log temperature (`log_alpha`) is wrapped in a list to ensure proper optimization as a standalone tensor.
-
-    Args:
-        cfg: Configuration object containing hyperparameters.
-        policy (nn.Module): The policy model containing the actor, critic, and temperature components.
-
-    Returns:
-        Tuple[Dict[str, torch.optim.Optimizer], Optional[torch.optim.lr_scheduler._LRScheduler]]:
-        A tuple containing:
-        - `optimizers`: A dictionary mapping component names ("actor", "critic", "temperature") to their respective Adam optimizers.
-        - `lr_scheduler`: Currently set to `None` but can be extended to support learning rate scheduling.
-
-    """
-
-
-    optimizer_critic = None
-    optimizer_discrete_critic = None
-    
-    # 定义critic和discrete_critic优化器
-    if "hgdagger" not in cfg.policy.type:
-        optimizer_critic = torch.optim.Adam(params=list(policy.critic_ensemble.parameters()), lr=cfg.policy.critic_lr)
-    
-    actor_params = [
-            p
-            for n, p in policy.actor.named_parameters()
-        ]
-
-    if cfg.policy.num_discrete_actions is not None:
-        if "silri" in cfg.policy.type or "hgdagger" in cfg.policy.type:
-            actor_params = actor_params + list(policy.discrete_actor.parameters())
-        else:
-            optimizer_discrete_critic = torch.optim.Adam(
-                params=policy.discrete_critic.parameters(), lr=cfg.policy.critic_lr
-            )
-
-
-    optimizer_actor = torch.optim.Adam(params=actor_params, lr=cfg.policy.actor_lr)
-
-
-    lr_scheduler = None
-    
-    optimizers = {
-        "actor": optimizer_actor,
-        "critic": optimizer_critic,
-    }
-
-    if "silri" in cfg.policy.type:
-        optimizer_lagrange = torch.optim.Adam(params=list(policy.lagrange_net.parameters()), lr=0.01 * cfg.policy.critic_lr)
-        optimizers["lagrange"] = optimizer_lagrange
-
-        optimizer_expert = torch.optim.Adam(params=list(policy.expert_network.parameters()), lr=cfg.policy.actor_lr)
-        optimizers["expert"] = optimizer_expert
-
-
-    if "sac" in cfg.policy.type:
-        optimizer_temperature = torch.optim.Adam(params=[policy.log_alpha], lr=cfg.policy.critic_lr)
-        optimizers["temperature"] = optimizer_temperature
-    
-    if optimizer_discrete_critic is not None:
-        optimizers["discrete_critic"] = optimizer_discrete_critic
-        
-    return optimizers, lr_scheduler
 
 
 #################################################
@@ -1430,6 +1367,15 @@ def initialize_offline_replay_buffer(
     Returns:
         ReplayBuffer: Initialized offline replay buffer
     """
+    if cfg.dataset is None:
+        return ReplayBuffer(
+            capacity=cfg.policy.offline_buffer_capacity,
+            device=device,
+            state_keys=cfg.policy.input_features.keys(),
+            storage_device=storage_device,
+            optimize_memory=True,
+        )
+        
     if not cfg.resume:
         logging.info("make_dataset offline buffer")
         # INSERT_YOUR_CODE
@@ -1562,6 +1508,12 @@ def push_actor_policy_to_queue(parameters_queue: Queue, policy: nn.Module):
             policy.discrete_actor.state_dict(), device="cpu"
         )
         logging.debug("[LEARNER] Including discrete actor in state dict push")
+    
+    if hasattr(policy, "critic_qc") and policy.critic_qc is not None:
+        state_dicts["critic_qc"] = move_state_dict_to_device(
+            policy.critic_qc.state_dict(), device="cpu"
+        )
+        logging.debug("[LEARNER] Including critic_qc in state dict push")
 
     state_bytes = state_to_bytes(state_dicts)
     parameters_queue.put(state_bytes)
@@ -1634,9 +1586,9 @@ def process_transitions(
             # Add all valid data to the main online buffer
             replay_buffer.add(**transition)
             # Add data with intervention to the offline buffer
-            if dataset_repo_id is not None and transition.get("complementary_info", {}).get(
-                "is_intervention"
-            ):
+            if offline_replay_buffer is not None and (transition.get("complementary_info", {}).get(
+                "is_intervention") or transition.get("complementary_info", {}).get(
+                "first_intervene_reward") < 0 ):
                 offline_replay_buffer.add(**transition)
                 new_offline_transition_num += 1
                 if new_offline_transition_num % 50 == 0 and "silri" in cfg.policy.type:

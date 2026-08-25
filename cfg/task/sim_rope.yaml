@@ -1,0 +1,67 @@
+task_name: sim_rope
+
+
+lerobot:
+  cameras: [front]
+  state_dim: 7
+  action_dim: 2
+  fps: 10
+  num_discrete_actions: 2
+  expert_state_dim: 7
+  expert_cameras: [front]
+
+gripper_penalty: -0.05
+
+
+dataset: null
+close_gripper: true
+fix_gripper: false
+max_episode_length: 70
+max_train_time: 14400
+evaluation_interval: 200
+evaluation_episode: 50
+max_step: 8000
+max_intervention_steps_per_episode: 1000
+save_checkpoint: true
+
+
+env_id: "gym_hil/RopeBase-v0"
+
+use_gripper: true
+use_gamepad: false
+controller_config_path: "../../../gym-hil/gym_hil/PS5_config.json"
+intervention_signal_source: human
+resume_model: false
+
+time_penalty: 0.0
+use_gripper_penalty: true
+action_noise_duration: 2
+intervention_steps: 5
+quantile_level: 0.5
+expert:
+    load_path:  ../../rl_envs_sim/expert/sim_rope/pretrained_model/
+    policy_type: gains
+
+env_cfg:
+    id: ${env_id}    
+    image_obs: true
+    seed: ${seed}
+    headless: ${headless}
+    use_gamepad: ${use_gamepad}
+    max_episode_steps: ${max_episode_length}
+    controller_config_path: ${controller_config_path}
+    reward_type: ${reward_type}
+    gripper_penalty: ${gripper_penalty}
+    time_penalty: ${time_penalty}
+    intervention_signal_source: ${intervention_signal_source}
+    expert_cfg: null
+    use_expert_control: ${use_expert_control}
+    use_inputs_control: ${use_inputs_control}
+    image_resize: ${robot_config.image_resize}
+    max_intervention_steps_per_episode: ${max_intervention_steps_per_episode}
+    deterministic_eval: ${deterministic_eval}
+    max_step: ${max_step}
+    action_noise_duration: ${action_noise_duration}
+    intervention_steps: ${intervention_steps}
+
+

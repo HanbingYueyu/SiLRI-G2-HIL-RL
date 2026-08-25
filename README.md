@@ -36,6 +36,62 @@ SiLRI: A state-wise Lagrangian RL algorithm for real-world robotic manipulation 
 </div>
 
 ## Update Logs
+### v1.1
+
+<!-- #### New Features
+
+* Added **simulator support** for users without a real robot or teleoperation system. Simulation environments are provided via the `rl_envs_sim` submodule — see [rl_envs_sim/README.md](rl_envs_sim/README.md) for details. It bundles:
+  * [`gym-hil`](rl_envs_sim/gym-hil): Human-In-the-Loop Gymnasium environments (e.g., Pick-Cube, Arrange-Boxes, Open-Cabinet)
+  * [`AdaptiGraph`](rl_envs_sim/AdaptiGraph): deformable object manipulation (e.g., Straighten-Rope)
+* Added **`GAINS`** policy (`policy_type=gains`): *GAINS: Leveraging Inconsistent Human Intervention Signals in Reinforcement Learning*.
+* Added simulation training entry points and configs:
+  * `actor_sim.sh` for the actor side; `learner.sh` supports sim tasks as well
+  * `cfg/robot_type/sim.yaml` and `cfg/task/sim_*.yaml` (`sim_pick_cube`, `sim_arrange_box`, `sim_open_slidecabinet`, `sim_rope`)
+  * `cfg/train_config_simulator.json`
+
+Quick start for simulation training:
+
+```bash
+# Set task_name in actor_sim.sh / learner.sh to one of:
+# sim_arrange_box | sim_open_slidecabinet | sim_pick_cube | sim_rope
+bash learner.sh    # on learner server
+bash actor_sim.sh  # on actor server
+``` -->
+
+#### New Features
+
+* lerobot/ — Algorithms
+
+  - New policy: GAINS (policy_type=gains) — GAINS: Leveraging Inconsistent Human Intervention Signals in Reinforcement Learning. Uses a quantile-based critic (critic_qc) instead of the standard critic ensemble.
+  - New baseline policies: tqc (Truncated Quantile Critics) and sac_wo_img (state-only SAC), both registered in policies/factory.py and usable as simulation experts.
+  - Optimizer construction moved into the policies: every policy now implements get_optimizer_and_scheduler(), so each algorithm owns its own optimizer/scheduler set (actor, critic, discrete_critic, lagrange, temperature, expert). Adding a new algorithm no longer requires touching the learner.
+  - FeatureType.ENVIRONMENT_STATE added, so experts can consume privileged environment state (observation.environment_state) that the learner policy does not see.
+
+
+* rl_envs_sim/ — Simulation (new submodule, HIL-RM)
+
+  - New submodule giving users without a real robot or teleoperation rig a complete HIL-RL loop. Four tasks: Arrange-Boxes, Straighten-Rope, Pick-Cube, Open-Cabinet.
+  - Built-in RL expert per task (expert/sim_*/pretrained_model/): pressing Space triggers an intervention whose action comes from a pretrained expert instead of a human, making intervention studies reproducible and letting long HIL runs proceed unattended.
+  - Configurable intervention behaviour exposed through the env config: intervention_signal_source, use_expert_control, use_inputs_control, intervention_steps, max_intervention_steps_per_episode, action_noise_duration, deterministic_eval, etc.
+
+* rl_envs/ — Real-world
+
+    - Keyboard listener (Scroll-Lock to toggle intervention, Space/Pause to terminate) moved from actor.py into rl_envs/wrappers.py, so the actor no longer starts a pynput listener that simulation users don't need.
+
+* HIL-RL/ — Framework (actor / learner / configs)
+
+  - Simulation entry points: actor_sim.sh and learner_sim.sh (taken from rl_envs_sim/example/), with cfg/robot_type/sim.yaml, cfg/task/sim_{pick_cube,arrange_box,open_slidecabinet,rope}.yaml and cfg/train_config_simulator.json. actor_sim.sh also wires up MUJOCO_GL, PYFLEXROOT and the AdaptiGraph paths.
+  - Algorithm-agnostic learner loop: training branches are now driven by which optimizers a policy actually declares (if "critic" in optimizers) rather than by string matching on policy.type; per-module metrics are forwarded verbatim from each policy.forward() call.
+  - Intervention-onset labelling: the transition immediately preceding the first human intervention is tagged with first_intervene_reward = -1.0 and routed into the offline buffer, so the state that provoked the intervention is learned from — the core signal GAINS consumes.
+  - critic_qc parameter sync between learner and actor added to the push/load path, to visualize the Q distribution during training.
+  - Simulation-specific termination and checkpointing: sim runs are bounded by max_step (real-world runs still use wall-clock max_train_time), and full policy checkpoints are saved every evaluation_interval steps.
+  - Observation handling: make_policy_obs now maps state → observation.state and environment_state → observation.environment_state; the fix_gripper action-padding logic was rewritten to handle single-arm, dual-arm and sim (wrapper-padded) cases uniformly.
+  - Optional offline dataset: when cfg.dataset is None, an empty offline replay buffer is created instead of skipping offline learning entirely.
+  - HILLogger now records a violation field alongside intervention/step/episode/success.
+  - Reproducibility & portability: --seed is threaded through to the lerobot config and into the Hydra output path (exp_local/\<date\>/\<overrides\>/\<seed\>); config paths are resolved relative to __file__ instead of relying on the working directory; hard-coded internal IPs, proxies and private paths were removed from all shell scripts (learner_host now defaults to 127.0.0.1).
+
+
+
 ### v1.0.2
 
 #### Improvements
@@ -75,8 +131,8 @@ ValueError: Unrecognized configuration class <class 'transformers_modules.helper
 
 * [✅] **Real World:** Release the 3D model and corresponding shopping list for the homogeneous UR arm.
 * [✅] **Real World:** Release the 3D STL files for UR robots.
+* [✅] **Simulator:** Release simulator examples for users without a teleoperation system.
 * [ ] **Real World:** Release the Docker image and the `xrocs`/`xtele` packages for Franka.
-* [ ] **Simulator:** Release simulator examples for users without a teleoperation system.
 
 
 
@@ -90,7 +146,9 @@ ValueError: Unrecognized configuration class <class 'transformers_modules.helper
 * `rl_envs/`: Robot environments and wrappers (Franka and UR supported).
     * `xrocs/`: Interface package connecting actor with robot, camera, and gripper components.
     * `xtele/`: Interface package connecting actor with teleoperation system.
-* `lerobot/`: Open-source RL baseline library. In addition to `HIL-SERL`, we added `SilRI` and `HG-Dagger`.
+* `rl_envs_sim/`: Simulation environments submodule ([gym-hil](rl_envs_sim/gym-hil) + [AdaptiGraph](rl_envs_sim/AdaptiGraph)). See [rl_envs_sim/README.md](rl_envs_sim/README.md).
+* `actor_sim.sh`: Actor script for simulation training with `policy_type=gains`.
+* `lerobot/`: Open-source RL baseline library. In addition to `HIL-SERL`, we added `SilRI`, `HG-Dagger`, and `GAINS`.
 
 **HIL-RL** (other components)
 
@@ -120,7 +178,7 @@ conda create -n silri python=3.10
 conda activate silri
 
 cd lerobot && pip install -e . && cd ..
-pip install torch==2.1.1 torchvision==0.16.1 torchaudio==2.1.1 --index-url https://download.pytorch.org/whl/cu121
+pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
 
 pip install -r requirements.txt
 
@@ -128,6 +186,7 @@ pip install -r requirements.txt
 cd rl_envs/xrocs && pip install -e . && cd ../../
 cd rl_envs/xtele && pip install -e . 
 cd xtele/scripts && bash install_all.sh && cd ../../../../
+
 ```
 Some users may need to run the following command:
 ```
@@ -136,6 +195,8 @@ pip uninstall torchcodec
 ```
 
 To validate if `xrocs` and `xtele` are correctly installed, please refer to [rl_envs/README.md](https://github.com/nuomizai/rl_envs) for more details.
+
+For **HIL-RM (simulation)** installation (including `gym-hil`, dependencies, and the rope / PyFleX setup), please refer to [rl_envs_sim/README.md](rl_envs_sim/README.md). Then use `actor_sim.sh` and `learner.sh` with `robot_type@_global_=sim` and a `sim_*` task name.
 
 ## 📖 Training Recipe
 
@@ -187,8 +248,10 @@ robot_type@_global_: the robot platform same as that under cfg/robot_type, e.g.,
 classifier_cfg.require_train: continue to train the classifier during RL training, we set True for all tasks
 use_human_intervention: enable human intervention during RL training, always True, set False only when debugging.
 ego_mode: intervene and reset scene by one person, set False if you have others assist to reset.
-policy_type: silri (ours), hgdagger(HG-Dagger), sac(HIL-SERL)
+policy_type: silri (ours), gains (ours), hgdagger (HG-Dagger), sac (HIL-SERL)
 ```
+
+For **simulation** tasks, set `robot_type@_global_=sim`, choose a `sim_*` task under `cfg/task/`, and run `bash actor_sim.sh` / `bash learner.sh`. See [rl_envs_sim/README.md](rl_envs_sim/README.md) for supported environments.
 
 ```yaml
 # learner.sh

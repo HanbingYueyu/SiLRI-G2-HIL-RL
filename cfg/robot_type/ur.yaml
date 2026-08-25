@@ -36,4 +36,3 @@ robot_config:
   close_gripper: ${close_gripper}
   fix_gripper: ${fix_gripper}
   ego_mode: ${ego_mode}
-  enable_rotation: ${enable_rotation}

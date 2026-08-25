@@ -3,7 +3,7 @@ import numpy as np
 import os
 
 class HILLogger:
-    def __init__(self, log_path="./hil_log", name_dict={"is_intervene", "step", "episode", "time", "success"}, log_interval=100):
+    def __init__(self, log_path="./hil_log", name_dict={"is_intervene", "step", "episode", "time", "success", "violation"}, log_interval=100):
         self.log_path = Path(log_path)
         self.log_path.mkdir(parents=True, exist_ok=True)
         self.log_file = self.log_path / "hil_log.npy"

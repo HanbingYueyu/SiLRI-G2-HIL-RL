@@ -2,9 +2,8 @@ defaults:
   - _self_
   - robot_type@_global_: franka
   - task@_global_: close_trashbin_franka_1028
-  - override hydra/launcher: submitit_local
 
-learner_host: 10.10.247.23
+learner_host: 127.0.0.1
 learner_port: 50065
 
 fake_env: false
@@ -16,6 +15,18 @@ policy_type: silri
 ego_mode: false
 use_force: false
 load_classifier: true
+
+
+#============= sim env config =============
+headless: false
+seed: 1001
+device: cuda:0
+reset_delay_seconds: 1.0
+use_expert_control: true
+use_inputs_control: true
+deterministic_eval: true
+reward_type: sparse
+
 
 # add config for spacemouse intervention
 intervention_backend: xtele # xtele or spacemouse
@@ -29,7 +40,12 @@ spacemouse_axis_signs: [1.0, -1.0, -1.0, 1.0, -1.0, -1.0]
 
 hydra:
   run:
-    dir: ./exp_local/${now:%Y.%m.%d}/${hydra.job.override_dirname}
+    dir: ./exp_local/${now:%Y.%m.%d}/${hydra.job.override_dirname}/${seed}
   sweep:
     dir: ./exp_local
-    subdir: ${now:%Y.%m.%d}/${hydra.job.override_dirname}
+    subdir: ${now:%Y.%m.%d}/${hydra.job.override_dirname}/${seed}
+  job:
+    config:
+      override_dirname:
+        exclude_keys:
+          - seed

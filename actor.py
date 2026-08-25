@@ -49,6 +49,7 @@ import logging
 import os
 import time
 from functools import lru_cache
+from pathlib import Path
 from queue import Empty
 from tqdm import tqdm
 import json
@@ -63,7 +64,7 @@ import copy
 from lerobot.cameras import opencv  # noqa: F401
 
 from lerobot.configs.train import TrainRLServerPipelineConfig
-from lerobot.policies.factory import make_policy
+from lerobot.policies.factory import make_policy, make_policy_config
 
 from lerobot.robots import so100_follower  # noqa: F401
 from lerobot.scripts.rl.gym_manipulator import make_robot_env
@@ -91,13 +92,14 @@ from lerobot.utils.utils import (
     get_safe_torch_device,
     init_logging,
 )
+from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.utils.train_utils import get_step_checkpoint_dir
+from lerobot.constants import PRETRAINED_MODEL_DIR
 
 import numpy as np
-from pynput import keyboard
 from omegaconf import OmegaConf
 import draccus
 from make_env import make_env
-from rl_envs.shared_state import shared_state
 import hydra
 import traceback
 import sys
@@ -111,44 +113,30 @@ import cv2
 #################################################
 
 
-def on_press(key):
-    try:
-        if str(key) == 'Key.scroll_lock':
-            print("----------------set human intervention key to {}!----------------".format(shared_state.human_intervention_key))
-            shared_state.human_intervention_key = not shared_state.human_intervention_key
-            time.sleep(0.5)
-        if str(key) == 'Key.space' or str(key) == 'Key.pause':
-            print("----------------set terminate to true!----------------")
-            shared_state.terminate = True
-            time.sleep(0.5)
-    except AttributeError:
-        pass
-try:
-    listener = keyboard.Listener(
-        on_press=on_press)
-    listener.start()
-except Exception as e:
-    print("error in keyboard listener:", e)
-    exit(0)
+
 
 from lerobot.configs.default import DatasetConfig
 @hydra.main(config_path="./cfg", config_name="config", version_base=None) 
 def actor_cli(env_cfg):
+    cfg_dir = Path(__file__).resolve().parent / "cfg"
     if "ur" in env_cfg.robot_config.robot_type:
-        lerobot_config_path = "../../cfg/train_config_silri_ur.json"
+        lerobot_config_path = str(cfg_dir / "train_config_silri_ur.json")
     elif "franka" in env_cfg.robot_config.robot_type:
-        lerobot_config_path = "../../cfg/train_config_silri_franka.json"
-    
+        lerobot_config_path = str(cfg_dir / "train_config_silri_franka.json")
     elif "tienkung" in env_cfg.robot_config.robot_type:
-        lerobot_config_path = "../../cfg/train_config_silri_tienkung.json"
+        lerobot_config_path = str(cfg_dir / "train_config_silri_tienkung.json")
+    elif "sim" in env_cfg.robot_config.robot_type:
+        lerobot_config_path = str(cfg_dir / "train_config_simulator.json")
     else:
         raise ValueError(f"Invalid robot type: {env_cfg.robot_type}")
     with draccus.config_type("json"):
         if not env_cfg.fix_gripper:
-            cfg = draccus.parse(TrainRLServerPipelineConfig, lerobot_config_path, args=[f"--policy.type={env_cfg.policy_type}", f"--policy.num_discrete_actions=2", f"--policy.actor_learner_config.learner_host={env_cfg.learner_host}", f"--policy.actor_learner_config.learner_port={env_cfg.learner_port}"])
+            cfg = draccus.parse(TrainRLServerPipelineConfig, lerobot_config_path, args=[f"--policy.type={env_cfg.policy_type}", f"--policy.num_discrete_actions=2", f"--policy.actor_learner_config.learner_host={env_cfg.learner_host}", f"--policy.actor_learner_config.learner_port={env_cfg.learner_port}", f"--seed={env_cfg.seed}"])
         else:
-            cfg = draccus.parse(TrainRLServerPipelineConfig, lerobot_config_path, args=[f"--policy.type={env_cfg.policy_type}", f"--policy.actor_learner_config.learner_host={env_cfg.learner_host}", f"--policy.actor_learner_config.learner_port={env_cfg.learner_port}"])
+            cfg = draccus.parse(TrainRLServerPipelineConfig, lerobot_config_path, args=[f"--policy.type={env_cfg.policy_type}", f"--policy.actor_learner_config.learner_host={env_cfg.learner_host}", f"--policy.actor_learner_config.learner_port={env_cfg.learner_port}", f"--seed={env_cfg.seed}"])
 
+    if "sim" in env_cfg.robot_config.robot_type:
+        apply_sim_task_overrides(cfg, env_cfg)
     if env_cfg.dataset is not None:
         dataset_obj = OmegaConf.to_object(env_cfg.dataset)
         cfg.dataset = DatasetConfig(**dataset_obj)
@@ -168,6 +156,9 @@ def actor_cli(env_cfg):
 
     # Create logs directory to ensure it exists
     cfg.job_name = env_cfg.task_name
+    if hasattr(cfg.policy, "quantile_level"):
+        cfg.policy.quantile_level = env_cfg.quantile_level
+
 
     
     log_dir = os.path.join(cfg.output_dir, "logs")
@@ -180,8 +171,8 @@ def actor_cli(env_cfg):
     shutdown_event = ProcessSignalHandler(is_threaded, display_pid=display_pid).shutdown_event
 
     learner_client, grpc_channel = learner_service_client(
-        host=cfg.policy.actor_learner_config.learner_host,  # Learner 的 IP 地址
-        port=cfg.policy.actor_learner_config.learner_port,  # Learner 的端口号
+        host=cfg.policy.actor_learner_config.learner_host,  # Learner IP address
+        port=cfg.policy.actor_learner_config.learner_port,  # Learner port
     )
 
 
@@ -212,28 +203,28 @@ def actor_cli(env_cfg):
 
         concurrency_entity = Process
 
-    # 任务1：从learner接收模型参数，放入parameters_queue
+    # Task 1: receive model parameters from the learner into parameters_queue
     receive_policy_process = concurrency_entity(
         target=receive_policy,
         args=(cfg, parameters_queue, shutdown_event, grpc_channel),
         daemon=True,
     )
 
-    # 任务2：将transitions_queue中的过渡数据发送给learner
+    # Task 2: send transitions from transitions_queue to the learner
     transitions_process = concurrency_entity(
         target=send_transitions,
         args=(cfg, transitions_queue, shutdown_event, grpc_channel),
         daemon=True,
     )
 
-    # 任务3：将interactions_queue中的交互统计发送给learner
+    # Task 3: send interaction stats from interactions_queue to the learner
     interactions_process = concurrency_entity(
         target=send_interactions,
         args=(cfg, interactions_queue, shutdown_event, grpc_channel),
         daemon=True,
     )
 
-    # # 启动任务
+    # # Start the tasks
     transitions_process.start()
     interactions_process.start()
     receive_policy_process.start()
@@ -248,13 +239,13 @@ def actor_cli(env_cfg):
     )
     logging.info("[ACTOR] Policy process joined")
 
-    # 关闭队列（阻止新数据写入）
+    # Close the queues (no further writes allowed)
     logging.info("[ACTOR] Closing queues")
     transitions_queue.close()
     interactions_queue.close()
     parameters_queue.close()
 
-    # 等待并发任务结束
+    # Wait for the concurrent tasks to finish
     transitions_process.join()
     logging.info("[ACTOR] Transitions process joined")
     interactions_process.join()
@@ -262,7 +253,7 @@ def actor_cli(env_cfg):
     receive_policy_process.join()
     logging.info("[ACTOR] Receive policy process joined")
 
-    # 取消队列的join线程（避免阻塞）
+    # Cancel the queues' join threads to avoid blocking
     logging.info("[ACTOR] join queues")
     transitions_queue.cancel_join_thread()
     interactions_queue.cancel_join_thread()
@@ -338,7 +329,7 @@ def act_with_policy(
     obs, info = online_env.reset()
 
     # NOTE: For the moment we will solely handle the case of a single environment
-    sum_reward_episode = 0    # 累计当前episode的奖励
+    sum_reward_episode = 0    # Accumulated reward of the current episode
     list_transition_to_send_to_learner = []  
     episode_intervention = False   
     episode_intervention_steps = 0  
@@ -347,6 +338,8 @@ def act_with_policy(
     policy_timer = TimerManager("Policy inference", log=False)
     time_step = 0
     episode = 0
+    prev_intervene = False
+
 
     for interaction_step in range(cfg.policy.online_steps):
         start_time = time.perf_counter()
@@ -355,31 +348,19 @@ def act_with_policy(
             return
 
         with policy_timer:
-            # 双臂（left_ee_pos+left_gripper + right_ee_pos+right_gripper）
-            if env_cfg.robot_config.dual_arm:
-                action = np.zeros(policy.continuous_action_dim+2)
-            # 单臂（ee_pos+gripper）
-            else:
-                action = np.zeros(policy.continuous_action_dim+1)
-
-            # Policy output action
             policy_obs = make_policy_obs(obs, device, env_cfg.robot_config.robot_type)
-            policy_action, action_info = policy.select_action(batch=policy_obs)
+            action, _ = policy.select_action(batch=policy_obs)
+            action = action.squeeze(0).cpu().detach().numpy()
 
-            policy_action = policy_action.squeeze(0).cpu().detach().numpy()
-
-
-            if env_cfg.fix_gripper: 
-                if env_cfg.robot_config.dual_arm:
-                    # 双臂无夹爪时，分别赋值left_ee_pos和right_ee_pos
-                    action[0:policy.continuous_action_dim//2] = policy_action[0:policy.continuous_action_dim//2]
-                    action[policy.continuous_action_dim//2+1:-1] = policy_action[policy.continuous_action_dim//2:] 
-                else:
-                    # 单臂无夹爪时，只赋值ee_pos
-                    action[0:policy_action.shape[0]] = policy_action
-            else:
-                # 有夹爪直接赋值
-                action = copy.deepcopy(policy_action)
+            # When the gripper is fixed, the policy only outputs the end-effector pose; 
+            # the environment action needs to insert gripper=0 after each arm.
+            # Except for single-arm sim: the wrapper will automatically pad the gripper.
+            pad_fixed_gripper = env_cfg.fix_gripper and (
+                env_cfg.robot_config.dual_arm or env_cfg.robot_config.robot_type != "sim"
+            )
+            if pad_fixed_gripper:
+                n_arms = 2 if env_cfg.robot_config.dual_arm else 1
+                action = np.concatenate([np.append(chunk, 0.0) for chunk in np.split(action, n_arms)])
 
             if env_cfg.freeze_actor:
                 action = 0 * action
@@ -392,6 +373,7 @@ def act_with_policy(
         next_obs, reward, terminated, truncated, info = online_env.step(action)
 
         done = terminated or truncated
+        violation = info.get("violation", None)
 
         sum_reward_episode += float(reward)
         # Increment the total steps counter for the intervention rate
@@ -401,6 +383,9 @@ def act_with_policy(
         
         # NOTE: We override the action if the intervention is True, because the applied action is the intervention action
         if "is_intervention" in info and info["is_intervention"]:
+            if not prev_intervene:
+                if len(list_transition_to_send_to_learner) > 0:
+                    list_transition_to_send_to_learner[-1]["complementary_info"]["first_intervene_reward"] = -1.0
 
             action = info["intervene_action"] 
 
@@ -409,13 +394,19 @@ def act_with_policy(
             episode_intervention_steps += 1
         else:
             """
-            恢复episode_intervention
+            Reset episode_intervention
             """
             episode_intervention = False
+        
+        if hasattr(policy, "draw_critic_qc"):
+            with torch.no_grad():
+                policy.draw_critic_qc(action, device, policy_obs)
 
-        hil_logger.log({"is_intervene": episode_intervention, "step": time_step, "episode": episode, "time": time.time(), "success": terminated})
+        hil_logger.log({"is_intervene": episode_intervention, "step": time_step, "episode": episode, "time": time.time(), "success": info["succeed"], "violation": violation})
         print("current action:", action, 'reward:', reward)
-        # 存储当前步的过渡数据
+        # Store the transition of the current step
+        prev_intervene = info["is_intervention"]
+        info["first_intervene_reward"] = 0
         obs_tensor = make_policy_obs(obs, device, env_cfg.robot_config.robot_type)
         next_obs_tensor = make_policy_obs(next_obs, device, env_cfg.robot_config.robot_type)
         act_tensor = torch.from_numpy(action)
@@ -440,11 +431,11 @@ def act_with_policy(
         if done:
             logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
 
-            # 更新网络参数
+            # Update the network parameters
             update_policy_parameters(policy=policy, parameters_queue=parameters_queue, device=device)
 
 
-            # 将当前episode收集的过渡数据推送到transitions_queu
+            # Push the transitions collected in this episode to transitions_queue
             if len(list_transition_to_send_to_learner) > 0:
 
                 push_transitions_to_transport_queue(
@@ -460,6 +451,7 @@ def act_with_policy(
             # Calculate the intervention rate (intervention steps / total steps)
             intervention_rate = 0.0
             time_step = 0
+            prev_intervene = False
             episode += 1
             if episode_total_steps > 0:
                 intervention_rate = episode_intervention_steps / episode_total_steps
@@ -485,34 +477,63 @@ def act_with_policy(
             obs, info = online_env.reset()
 
        # Add the time span check at the end of the loop
-        current_time_span = hil_logger.update_time_span()
-        if current_time_span >= env_cfg.max_train_time:  
-            logging.info(f"[ACTOR] Time span reached {current_time_span} seconds, shut down all processes.")
-            # Send the training complete message to the learner
-            try:
+        if env_cfg.robot_config.robot_type == "sim":
+            if interaction_step % env_cfg.evaluation_interval == 0 and interaction_step > 0:
+                save_training_checkpoint(
+                    cfg=cfg,
+                    interaction_step=interaction_step,
+                    online_steps=interaction_step,
+                    policy=policy,
+                )
+            if interaction_step >= env_cfg.max_step:  # use max_step to limit the training time in simulation experiments
+                interaction_message = {
+                    "training_complete": True,
+                    "Interaction step": interaction_step,
+                    "message": "Training completed due to max training steps reached",
+                }
                 interactions_queue.put(
-                    python_object_to_bytes(
-                        {
-                            "training_complete": True,
-                            "Interaction step": interaction_step,
-                            "Time span": current_time_span,
-                            "message": "Training completed due to time limit reached",
-                        }
+                    python_object_to_bytes(interaction_message)
+                )
+
+                logging.info(f"[ACTOR] Max step reached {env_cfg.max_step}, shut down all processes.")
+                # Save the pending data
+                if len(list_transition_to_send_to_learner) > 0:
+                    push_transitions_to_transport_queue(
+                        transitions=list_transition_to_send_to_learner,
+                        transitions_queue=transitions_queue,
                     )
-                )
-                logging.info("[ACTOR] Sent training complete message to Learner")
-                exit(0)
-            except Exception as e:
-                logging.error(f"[ACTOR] Failed to send training complete message: {e}")
-            # Set the shutdown event, notify all processes to exit
-            shutdown_event.set()
-            # Save the current data
-            if len(list_transition_to_send_to_learner) > 0:
-                push_transitions_to_transport_queue(
-                    transitions=list_transition_to_send_to_learner,
-                    transitions_queue=transitions_queue,
-                )
-            break
+                # Break out of the loop
+                break
+    
+        else:
+            current_time_span = hil_logger.update_time_span() # use max_train_time to limit the training time in real-world experiments
+            if current_time_span >= env_cfg.max_train_time:  
+                logging.info(f"[ACTOR] Time span reached {current_time_span} seconds, shut down all processes.")
+                # Send the training complete message to the learner
+                try:
+                    interactions_queue.put(
+                        python_object_to_bytes(
+                            {
+                                "training_complete": True,
+                                "Interaction step": interaction_step,
+                                "Time span": current_time_span,
+                                "message": "Training completed due to time limit reached",
+                            }
+                        )
+                    )
+                    logging.info("[ACTOR] Sent training complete message to Learner")
+                    exit(0)
+                except Exception as e:
+                    logging.error(f"[ACTOR] Failed to send training complete message: {e}")
+                # Set the shutdown event, notify all processes to exit
+                shutdown_event.set()
+                # Save the current data
+                if len(list_transition_to_send_to_learner) > 0:
+                    push_transitions_to_transport_queue(
+                        transitions=list_transition_to_send_to_learner,
+                        transitions_queue=transitions_queue,
+                    )
+                break
         
         
         if cfg.env.fps is not None:
@@ -526,17 +547,20 @@ def act_with_policy(
 #  Communication Functions - Group all gRPC/messaging functions  #
 #################################################
 def make_policy_obs(obs: dict, device: torch.device, robot_type: str) -> dict:
-    # 先将numpy数组转换为Tensor，再调整维度顺序
+    # Convert numpy arrays to tensors first, then reorder the dimensions
     policy_obs = {}
-    for keys in obs.keys():
-        if "state" not in keys:
-            img = torch.from_numpy(obs[keys]).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.
-            new_key = "observation.images." + keys
-            policy_obs[new_key] = img
+    for key in obs.keys():
+        if key == "state" or key == "environment_state":
+            lerobot_key = f"observation.{key}"
+            policy_obs[lerobot_key] = (
+                torch.from_numpy(obs[key]).float().unsqueeze(0).to(device)
+            )
         else:
-            state = torch.from_numpy(obs[keys]).float().unsqueeze(0).to(device)
-            new_key = "observation.state"
-            policy_obs[new_key] = state
+            lerobot_key = f"observation.images.{key}"
+            policy_obs[lerobot_key] = (
+                torch.from_numpy(obs[key]).permute(2, 0, 1).float().unsqueeze(0).to(device)
+                / 255.0
+            )
     return policy_obs
 
 
@@ -831,10 +855,103 @@ def update_policy_parameters(policy, parameters_queue: Queue, device):
             policy.discrete_actor.load_state_dict(discrete_actor_state_dict)
             logging.info("[ACTOR] Loaded discrete actor parameters from Learner.")
 
+        if hasattr(policy, "critic_qc") and "critic_qc" in state_dicts:
+            critic_qc_state_dict = move_state_dict_to_device(
+                state_dicts["critic_qc"], device=device
+            )
+            policy.critic_qc.load_state_dict(critic_qc_state_dict)
+            logging.info("[ACTOR] Loaded critic_qc parameters from Learner.")
+
+
+def save_training_checkpoint(
+    cfg: TrainRLServerPipelineConfig,
+    interaction_step: int,
+    online_steps: int,
+    policy: nn.Module,
+) -> None:
+    # Log the step this checkpoint is saved at, for debugging and monitoring
+    logging.info(f"Checkpoint policy after step {interaction_step}")
+    
+    # 1. Create the checkpoint root directory: output_dir/checkpoints/step_xxx
+    hydra_output_dir = os.path.join(HydraConfig.get().runtime.output_dir, "checkpoints_full")
+    if not os.path.exists(hydra_output_dir):
+        os.makedirs(hydra_output_dir, exist_ok=True) 
+    checkpoint_dir = get_step_checkpoint_dir(Path(hydra_output_dir), online_steps, interaction_step)
+    
+    # 2. Model save path: <checkpoint_dir>/pretrained_model/<current step>
+    model_dir = os.path.join(checkpoint_dir, PRETRAINED_MODEL_DIR, str(interaction_step))
+    
+    # Save the model weights and config
+    # Stores the state_dict and config files so the policy can be reloaded with from_pretrained
+    policy.save_pretrained(model_dir)
+    print(f"Saved checkpoint to {model_dir}")
+
 
 #################################################
 #  Utilities functions #
 #################################################
+
+def apply_sim_task_overrides(cfg, env_cfg):
+    features = {}
+    features_map = {}
+    for cam in env_cfg.lerobot.cameras:
+        key = f"observation.images.{cam}"
+        features[key] = PolicyFeature(type=FeatureType.VISUAL, shape=(128, 128, 3))
+        features_map[key] = key
+    features["observation.state"] = PolicyFeature(type=FeatureType.STATE, shape=(env_cfg.lerobot.state_dim,))
+    features_map["observation.state"] = "observation.state"
+    features["action"] = PolicyFeature(type=FeatureType.ACTION, shape=(env_cfg.lerobot.action_dim,))
+    features_map["action"] = "action"
+
+    cfg.job_name = env_cfg.task_name
+    cfg.env.fps = env_cfg.lerobot.fps
+    cfg.env.features = features
+    cfg.env.features_map = features_map
+    cfg.policy.num_discrete_actions = env_cfg.lerobot.num_discrete_actions
+
+    policy_input_features = {}
+    for cam in env_cfg.lerobot.cameras:
+        policy_input_features[f"observation.images.{cam}"] = PolicyFeature(
+            type=FeatureType.VISUAL, shape=(3, 128, 128)
+        )
+    policy_input_features["observation.state"] = PolicyFeature(
+        type=FeatureType.STATE, shape=(env_cfg.lerobot.state_dim,)
+    )
+    cfg.policy.input_features = policy_input_features
+
+    # Rebuild expert config to the task yaml type (ChoiceRegistry cannot just mutate .type).
+    old_expert = cfg.expert_policy
+    cfg.expert_policy = make_policy_config(env_cfg.expert.policy_type)
+    for attr in (
+        "device",
+        "storage_device",
+        "vision_encoder_name",
+        "freeze_vision_encoder",
+        "image_encoder_hidden_dim",
+        "shared_encoder",
+        "latent_dim",
+        "normalization_mapping",
+        "repo_id",
+        "dataset_stats",
+    ):
+        if old_expert is not None and hasattr(old_expert, attr) and hasattr(cfg.expert_policy, attr):
+            setattr(cfg.expert_policy, attr, getattr(old_expert, attr))
+
+    cfg.expert_policy.num_discrete_actions = env_cfg.lerobot.num_discrete_actions
+    expert_input_features = {}
+    for cam in env_cfg.lerobot.expert_cameras:
+        expert_input_features[f"observation.images.{cam}"] = PolicyFeature(
+            type=FeatureType.VISUAL, shape=(3, 128, 128)
+        )
+    expert_input_features["observation.state"] = PolicyFeature(
+        type=FeatureType.STATE, shape=(env_cfg.lerobot.expert_state_dim,)
+    )
+    if hasattr(env_cfg.lerobot, "expert_env_state_dim"):
+        expert_input_features["observation.environment_state"] = PolicyFeature(
+            type=FeatureType.ENVIRONMENT_STATE, shape=(env_cfg.lerobot.expert_env_state_dim,)
+        )
+    cfg.expert_policy.input_features = expert_input_features
+
 
 
 def push_transitions_to_transport_queue(transitions: list, transitions_queue):
@@ -928,9 +1045,9 @@ def use_threads(cfg: TrainRLServerPipelineConfig) -> bool:
 
 def load_hydra_yaml(path):
     if not os.path.exists(path):
-        raise FileNotFoundError(f"YAML 配置文件不存在：{path}")
-    cfg = OmegaConf.load(path)  # 加载 Hydra 风格 YAML
-    OmegaConf.resolve(cfg)  # 解析 defaults 和 @_global_，合并 robot_type 和 task
+        raise FileNotFoundError(f"YAML config file does not exist: {path}")
+    cfg = OmegaConf.load(path)  # Load a Hydra-style YAML
+    OmegaConf.resolve(cfg)  # Resolve defaults and @_global_, merging robot_type and task
     return cfg
 
 

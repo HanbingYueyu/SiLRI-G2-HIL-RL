@@ -154,7 +154,7 @@ def train(cfg: TrainPipelineConfig):
     print('failure dataset cfg.dataset:', cfg.dataset)
     failure_dataset = make_dataset(cfg)
 
-    # 合并两个数据集的统计信息
+    # Merge the statistics of the two datasets
     total_num_frames = success_dataset.num_frames + failure_dataset.num_frames
     total_num_episodes = success_dataset.num_episodes + failure_dataset.num_episodes
 

@@ -1,0 +1,70 @@
+task_name: sim_pick_cube
+
+lerobot:
+  cameras: [front, wrist]
+  state_dim: 18
+  action_dim: 3
+  fps: 10
+  num_discrete_actions: 2
+  expert_state_dim: 18
+  expert_cameras: [front, wrist]
+
+
+dataset: null
+gripper_penalty: -0.05
+
+close_gripper: true
+fix_gripper: false
+max_episode_length: 50
+max_train_time: 1800
+evaluation_interval: 200
+evaluation_episode: 50
+max_step: 8000
+max_intervention_steps_per_episode: 5
+save_checkpoint: true
+resume_model: false
+
+env_id: "gym_hil/PandaPickCubeKeyboard-v0"
+
+use_gripper: true
+use_gamepad: false
+controller_config_path: "../../../gym-hil/gym_hil/PS5_config.json"
+random_block_position: true
+intervention_signal_source: human
+
+use_gripper_penalty: true
+action_noise_duration: 5
+quantile_level: 0.5
+
+expert:
+    load_path:  ../../rl_envs_sim/expert/sim_pick_cube/pretrained_model/
+    device: ${device}
+    policy_type: sac
+
+
+time_penalty: 0.0
+intervention_steps: 8
+env_cfg:
+    id: ${env_id}    
+    seed: ${seed}  
+    render_mode: "human"
+    image_obs: true
+    headless: ${headless}
+    use_gamepad: ${use_gamepad}
+    max_episode_steps: ${max_episode_length}
+    controller_config_path: ${controller_config_path}
+    reward_type: ${reward_type}
+    gripper_penalty: ${gripper_penalty}
+    hz: 1000
+    time_penalty: ${time_penalty}
+    random_block_position: ${random_block_position}
+    intervention_signal_source: ${intervention_signal_source}
+    expert_cfg: null
+    use_expert_control: ${use_expert_control}
+    use_inputs_control: ${use_inputs_control}
+    max_intervention_steps_per_episode: ${max_intervention_steps_per_episode}
+    action_noise_duration: ${action_noise_duration}
+    reset_delay_seconds: ${reset_delay_seconds}
+    max_step: ${max_step}
+    deterministic_eval: ${deterministic_eval}
+    intervention_steps: ${intervention_steps}
