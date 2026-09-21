@@ -38,6 +38,10 @@ _TIME_PROPERTY_LINE = re.compile(
     r'^\s*(?P<name>'+_TIME_PROPERTY_NAME+r')\s+(?P<value>[+-]?\d+)\s*$')
 
 
+class TransientMappingFitError(ValueError):
+    """A valid PTP candidate exceeded only drift or residual limits."""
+
+
 def _report_integer(token, *, minimum=MIN_REPORT_INTEGER,
                     maximum=MAX_REPORT_INTEGER):
     digits = token.lstrip('+-')
@@ -158,13 +162,14 @@ def fit_mapping(samples, *, master, utc_offset_s, session):
     offset_at_last_ns = float(offsets[-1] + intercept)
     residual = float(np.max(np.abs(y-(slope*x+intercept))))
     empirical_error_ns = float(MAPPING_BASE_ERROR_NS + residual + max(delays))
-    if (not all(math.isfinite(value) for value in
-                (drift_ppm, offset_at_last_ns, residual, empirical_error_ns)) or
-            abs(offset_at_last_ns) > MAX_REPORT_INTEGER or
-            abs(drift_ppm) > MAX_DRIFT_PPM or
-            not 0 <= residual <= MAX_RESIDUAL_NS or
+    if not all(math.isfinite(value) for value in
+               (drift_ppm, offset_at_last_ns, residual, empirical_error_ns)):
+        raise ValueError('Non-finite PTP mapping result')
+    if (abs(offset_at_last_ns) > MAX_REPORT_INTEGER or
             not 0 <= empirical_error_ns <= MAX_REPORT_INTEGER):
-        raise ValueError('PTP jump, excessive drift or residual')
+        raise ValueError('PTP mapping result is out of range')
+    if abs(drift_ppm) > MAX_DRIFT_PPM or not 0 <= residual <= MAX_RESIDUAL_NS:
+        raise TransientMappingFitError('PTP drift or residual exceeds limit')
     return DiagnosticMapping(session, master, utc_offset_s, times[0], times[-1],
                              times[-1]+PTP_LEASE_NS, offset_at_last_ns,
                              drift_ppm, residual, empirical_error_ns)

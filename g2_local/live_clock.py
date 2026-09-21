@@ -22,6 +22,7 @@ from .clock_mapping import (
     MIN_PTP_SPAN_NS,
     PTP_LEASE_NS,
     UTC_OFFSET_S,
+    TransientMappingFitError,
     fit_mapping,
     integer,
     parse_ptp,
@@ -84,6 +85,7 @@ class ClockWindow:
         self._sequence = 0
         self._last_snapshot_mono_ns = None
         self._last_snapshot = None
+        self._last_ptp_mono_ns = None
 
     @staticmethod
     def _validate_ns(*values):
@@ -170,11 +172,12 @@ class ClockWindow:
             if not 0 <= sample['delay_ns'] <= MAX_PATH_DELAY_NS:
                 self._latch('path_delay')
                 return
-            if self._samples:
-                interval_ns = sample['mono_ns'] - self._samples[-1]['mono_ns']
+            if self._last_ptp_mono_ns is not None:
+                interval_ns = sample['mono_ns'] - self._last_ptp_mono_ns
                 if not 0 < interval_ns <= MAX_PTP_GAP_NS:
                     self._latch('ptp_sample_interval')
                     return
+            self._last_ptp_mono_ns = sample['mono_ns']
 
             candidate = list(self._samples)
             candidate.append(sample)
@@ -187,7 +190,7 @@ class ClockWindow:
                                           session=self.session_id)
                     if not self._mapping_is_valid(mapping):
                         raise ValueError('Invalid PTP mapping')
-                except Exception as error:
+                except TransientMappingFitError:
                     # Before the first mapping is published, one otherwise
                     # well-formed report can be a transient startup residual
                     # outlier.  It cannot seed the next fit, but there is no
@@ -195,10 +198,12 @@ class ClockWindow:
                     # window.  Structural fit failures (for example integer
                     # range/lease overflow) and every post-publication
                     # failure remain fail-closed.
-                    if (self._mapping is None and
-                            str(error) == 'PTP jump, excessive drift or residual'):
+                    if self._mapping is None:
                         self._samples.clear()
                         return
+                    self._latch('mapping_invalid')
+                    return
+                except Exception:
                     self._latch('mapping_invalid')
                     return
             self._samples.append(sample)

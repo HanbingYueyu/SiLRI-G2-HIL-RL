@@ -61,6 +61,41 @@ def test_bad_ptp_evidence_cannot_form_mapping(mutation):
         fit_mapping(s, master='044052.fffe.000010', utc_offset_s=37, session='test')
 
 
+@pytest.mark.parametrize('mutation', ['drift', 'residual'])
+def test_only_drift_or_residual_limit_failures_are_marked_transient(mutation):
+    """Catch startup recovery being enabled for structural mapping errors."""
+    from g2_local.clock_mapping import TransientMappingFitError, fit_mapping
+
+    evidence = samples()
+    if mutation == 'drift':
+        for index, sample in enumerate(evidence):
+            sample['offset_ns'] = 55_000_000_000 + index * 1_000_000
+    else:
+        evidence[5]['offset_ns'] += 3_000_000
+
+    with pytest.raises(TransientMappingFitError):
+        fit_mapping(evidence, master='044052.fffe.000010',
+                    utc_offset_s=37, session='test')
+
+
+@pytest.mark.parametrize('polyfit_result', [
+    (float('nan'), 0.0),
+    (0.0, float(1 << 63)),
+])
+def test_nonfinite_or_out_of_range_fit_result_is_not_transient(
+        monkeypatch, polyfit_result):
+    """Catch structural mapping outputs being mislabeled recoverable."""
+    import g2_local.clock_mapping as clock_mapping
+
+    monkeypatch.setattr(clock_mapping.np, 'polyfit',
+                        lambda *_args, **_kwargs: polyfit_result)
+    with pytest.raises(ValueError) as caught:
+        clock_mapping.fit_mapping(
+            samples(), master='044052.fffe.000010', utc_offset_s=37,
+            session='test')
+    assert not isinstance(caught.value, clock_mapping.TransientMappingFitError)
+
+
 def gdk_rows():
     rows = []
     for i in range(10):

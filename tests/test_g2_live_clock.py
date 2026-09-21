@@ -227,6 +227,7 @@ def test_fit_failures_and_nonfinite_outputs_latch_fail_closed(monkeypatch, failu
     from g2_local.clock_mapping import MAX_REPORT_INTEGER
 
     window = healthy_window()
+    published = window.snapshot(16_100_000_000, wall(16_100_000_000))
     original_fit = live_clock.fit_mapping
     if failure == 'exception':
         def broken_fit(*_args, **_kwargs):
@@ -250,6 +251,7 @@ def test_fit_failures_and_nonfinite_outputs_latch_fail_closed(monkeypatch, failu
     failed = window.snapshot(18_000_000_001, wall(18_000_000_001))
     assert failed.healthy is False
     assert failed.reason == 'mapping_invalid'
+    assert failed.valid_until_ns == published.valid_until_ns
     json.dumps(asdict(failed), allow_nan=False)
 
 
@@ -296,6 +298,70 @@ def test_startup_residual_spike_restarts_warmup_and_allows_a_fresh_mapping():
     assert recovered.healthy is True
     assert recovered.reason == 'ok'
     assert recovered.reference_mono_ns == 32_000_000_000
+
+
+def test_startup_recovery_retains_ptp_ordering_anchor():
+    """Catch candidate reset allowing a repeated PTP report through."""
+    from g2_local.live_clock import ClockWindow
+
+    window = ClockWindow(MASTER, 'boot', 'run')
+    window.feed_ptp(
+        f'ptp4l[1.000]: selected best master clock {MASTER}',
+        1_010_000_000,
+        wall(1_010_000_000),
+    )
+    window.feed_properties(properties(), 1_100_000_000)
+    for index, second in enumerate(range(2, 16, 2)):
+        mono_ns = second * 1_000_000_000
+        window.feed_ptp(
+            offset_line(second, 55_000_000_000 + index * 20_000),
+            mono_ns + 10_000_000,
+            wall(mono_ns + 10_000_000),
+        )
+
+    window.feed_ptp(offset_line(16, 55_002_140_000),
+                    16_010_000_000, wall(16_010_000_000))
+    window.feed_ptp(offset_line(16, 55_002_140_000),
+                    16_020_000_000, wall(16_020_000_000))
+
+    snap = window.snapshot(16_100_000_000, wall(16_100_000_000))
+    assert snap.healthy is False
+    assert snap.reason == 'ptp_sample_interval'
+
+
+@pytest.mark.parametrize('error', [
+    ValueError('Non-finite PTP mapping result'),
+    ValueError('PTP mapping result is out of range'),
+])
+def test_startup_structural_fit_failure_does_not_restart_warmup(monkeypatch, error):
+    """Catch startup recovery accepting a structural fit failure."""
+    import g2_local.live_clock as live_clock
+    from g2_local.live_clock import ClockWindow
+
+    window = ClockWindow(MASTER, 'boot', 'run')
+    window.feed_ptp(
+        f'ptp4l[1.000]: selected best master clock {MASTER}',
+        1_010_000_000,
+        wall(1_010_000_000),
+    )
+    window.feed_properties(properties(), 1_100_000_000)
+    for index, second in enumerate(range(2, 16, 2)):
+        mono_ns = second * 1_000_000_000
+        window.feed_ptp(
+            offset_line(second, 55_000_000_000 + index * 20_000),
+            mono_ns + 10_000_000,
+            wall(mono_ns + 10_000_000),
+        )
+
+    def broken_fit(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(live_clock, 'fit_mapping', broken_fit)
+    window.feed_ptp(offset_line(16, 55_000_160_000),
+                    16_010_000_000, wall(16_010_000_000))
+    snap = window.snapshot(16_100_000_000, wall(16_100_000_000))
+    assert snap.healthy is False
+    assert snap.reason == 'mapping_invalid'
 
 
 def test_mapping_expiry_cannot_exceed_signed_64_bit_report_range():
