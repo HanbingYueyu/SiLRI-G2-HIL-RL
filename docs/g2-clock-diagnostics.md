@@ -3,6 +3,51 @@
 本工具不调整 CLOCK_REALTIME 或 PHC，不切换机器人模式、不发送运动/夹爪指令。
 原有 probe、Gym 和运动许可保持不变。`diagnostic_consistent` 不是运动验收。
 
+## 持续时间映射监控（独立前台进程）
+
+在操作员终端 A 执行：
+
+```bash
+cd /home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL
+sudo -v && bash run_g2_python.sh -m g2_local.clock_monitor \
+  --master 044052.fffe.000010 --max-seconds 43200
+```
+
+`--max-seconds` 必须显式提供，范围为 60–43200 秒，到期退出且不会自动重启。
+每轮创建 `runtime/clock_monitor/<随机会话>/`，终端打印本轮 `clock.sock` 地址。
+也可以用 `--output` 指定全新的输出目录；已有目录或 socket 会在启动 sudo 前拒绝。
+使用较短路径，Unix socket 地址必须适合系统的路径长度上限。
+目录权限为 0700、快照 socket 为 0600。普通用户 Actor/Gym 在另一终端独立启动，
+只读取本轮 socket；不调用 sudo，不启动或停止 PTP。此次真实 `allow_motion=False`
+保持不变，监控健康也不代表运动获准。
+
+监控仅以固定绝对路径启动 `sudo -n → timeout → stdbuf → ptp4l`，
+接口固定 `enp3s0`，二层 E2E、软件时间戳、client-only、`free_running=1`，
+不会改变系统时间或 PHC，也不调用 `phc2sys`。PMC 以普通用户运行，仅向会话专属
+只读 UDS 发出 `GET TIME_PROPERTIES_DATA_SET`；可写管理 UDS 权限为 0600，
+只读 UDS 为 0666。初次属性查询在启动后 8 秒开始，之后约每 5 秒查询一次。
+
+至少 8 个有效 PTP 样本、覆盖 10 秒且属性通过后才可发布健康映射。租约固定截止
+最后有效样本后 2.5 秒；读取快照不会延长租约。PTP 退出、属性查询失败、数据损坏、
+socket 丢失或证据写入失败均进入不健康状态并退出。`evidence.jsonl` 记录原始 PTP
+行、属性响应、映射变化和退出原因；单行 PTP 上限 4096 字节、属性响应上限
+8192 字节、证据文件上限 64 MiB，达到限制停止本次会话，不覆盖已有证据。
+
+停止时先结束独立 Actor/只读消费进程，再在终端 A 按 **Ctrl+C**。
+监控先发布不健康状态，然后仅向自己创建的进程组发 SIGINT，并关闭本轮快照 socket；
+不使用 `pkill`，不影响其他 PTP 服务。正常收尾等待最多 4 秒。若特权进程未响应或
+权限导致信号无法传递，固定的 `timeout --signal=INT --kill-after=3s` 是最终回收
+边界，日志会尽可能记录 `cleanup_pending`。此时等待本轮期限结束并确认旧进程已退出，
+再开新会话。异常终止 Python 后，客户端租约仍会过期，特权命令仍受固定期限限制。
+
+只读检查残留进程（该命令不停止任何进程）：
+
+```bash
+ps -eo pid,ppid,pgid,user,comm,args | rg 'ptp4l|phc2sys|clock_monitor'
+```
+
+现场停止/硬件急停验收与任务阈值批准仍是独立步骤；此监控不构成训练或运动授权。
+
 ## 一次并行采集
 
 先结束之前手动运行的 PTP 测量，保持机器人网线连接；不要同时启动其他校时服务。

@@ -16,7 +16,7 @@ import time
 import uuid
 import numpy as np
 
-from .clock_mapping import associate, fit_mapping, parse_ptp
+from .clock_mapping import associate, fit_mapping, parse_ptp, parse_time_properties
 
 
 def ptp_command(seconds, socket):
@@ -60,19 +60,9 @@ class PtpEvidence:
 
 
 def check_properties(raw):
-    fields = {}
-    for name in ('currentUtcOffset', 'currentUtcOffsetValid', 'leap61', 'leap59', 'ptpTimescale'):
-        match = re.search(r'\b'+name+r'\s+(-?\d+)\b', raw)
-        if not match:
-            raise ValueError('Incomplete PTP TIME_PROPERTIES_DATA_SET')
-        fields[name] = int(match[1])
-    if (fields['currentUtcOffset'] != 37 or fields['ptpTimescale'] != 1 or
-            fields['leap61'] != 0 or fields['leap59'] != 0 or
-            fields['currentUtcOffsetValid'] not in (0, 1)):
-        raise ValueError('PTP time scale/correction changed or leap announced')
     # Invalid UTC announcement is retained explicitly. linuxptp uses the
     # explicitly configured 37 s fallback; it is NOT UTC traceability proof.
-    return fields
+    return parse_time_properties(raw)
 
 
 def transform_pose(transform):
