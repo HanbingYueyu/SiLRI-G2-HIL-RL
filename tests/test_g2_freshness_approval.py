@@ -24,6 +24,7 @@ def recorded(tmp_path_factory):
     root = tmp_path_factory.mktemp('approval-source')
     for index in range(3):
         rig = ActorRig()
+        monitor_start = rig.now-1
         rig.snapshot_fault = lambda snap, i=index: replace(snap, session_id=f'monitor-{i}')
         freshness_audit.run_audit(
             output=root/str(index), duration_s=121, actor_checkpoint=Path('trusted.pt'),
@@ -31,9 +32,9 @@ def recorded(tmp_path_factory):
             client_factory=rig.client, reader_factory=rig.reader,
             monotonic_ns=lambda: rig.now, sleep=rig.sleep)
         (root/str(index)/'monitor.jsonl').write_text(
-            json.dumps(dict(kind='session', mono_ns=1, session_id=f'monitor-{index}',
+            json.dumps(dict(kind='session', mono_ns=monitor_start, session_id=f'monitor-{index}',
                             motion_authorized=False, expected_master='044052.fffe.000010'))+'\n'+
-            json.dumps(dict(kind='exit', mono_ns=2, returncode=0, healthy=False, reason='monitor_shutdown'))+'\n')
+            json.dumps(dict(kind='exit', mono_ns=rig.now+1, returncode=0, healthy=False, reason='signal:2'))+'\n')
     return root
 
 
@@ -129,10 +130,10 @@ def test_changed_raw_evidence_breaks_qualification_hash(approval, sessions):
         approval.validate_sessions(sessions)
 
 
-@pytest.mark.parametrize('listing', ['123 python -m g2_local.freshness_audit',
-                                    '123 python -m g2_local.clock_monitor',
-                                    '123 /usr/sbin/ptp4l -i enp3s0',
-                                    '123 /usr/sbin/pmc -u'])
+@pytest.mark.parametrize('listing', ['123 S python -m g2_local.freshness_audit',
+                                    '123 S python -m g2_local.clock_monitor',
+                                    '123 S /usr/sbin/ptp4l -i enp3s0',
+                                    '123 S /usr/sbin/pmc -u'])
 def test_residual_process_prevents_attestation(approval, sessions, listing):
     path = sessions[0]
     with pytest.raises(ValueError, match='residual_process'):
@@ -312,3 +313,127 @@ def test_120_second_request_cannot_qualify_short_observed_span(approval, session
     mutate(sessions[0], shorten)
     with pytest.raises(ValueError, match='duration'):
         approval.validate_sessions(qualify(approval, sessions))
+
+
+@pytest.mark.parametrize('command', [
+    'python -mg2_local.clock_monitor --master 044052.fffe.000010',
+    'python -mg2_local.freshness_audit --seconds 125',
+    'python\t-m\tg2_local.clock_monitor',
+    'python  -m   g2_local.freshness_audit',
+    '[ptp4l] <defunct>', '[clock_monitor] <defunct>', '[freshness_audit] <defunct>',
+    '[clock_monitor.p] <defunct>', '[freshness_audit] <defunct>',
+])
+def test_process_scan_detects_joined_modules_whitespace_and_zombies(approval, command):
+    state = 'Z' if '<defunct>' in command else 'Sl'
+    assert approval._residuals(f'123 {state} {command}') == [dict(pid=123, command=command)]
+
+
+def test_process_scan_does_not_shell_parse_unrelated_arguments(approval):
+    listing = '''123 S editor --title user's-draft
+124 S editor --title "unfinished
+125 R /usr/bin/ps -eo pid=,stat=,args=
+'''
+    assert approval._residuals(listing) == []
+
+
+def test_process_scan_does_not_exclude_parent_or_current_pid(approval):
+    assert approval._residuals(f'{os.getpid()} S python -mg2_local.clock_monitor')
+    assert approval._residuals(f'{os.getppid()} S python -mg2_local.freshness_audit')
+
+
+def test_process_scan_reports_ambiguous_zombie_python(approval, sessions):
+    path = sessions[0]
+    with pytest.raises(ValueError, match='ambiguous_zombie_python'):
+        approval.record_qualification(path, path/'monitor.jsonl', path/'qualification.json',
+                                      process_listing=lambda: '123 Z [python3.10] <defunct>')
+    assert not (path/'qualification.json').exists()
+    assert approval._residuals('123 S python3.10 unrelated.py') == []
+
+
+def change_monitor(path, change):
+    records = [json.loads(line) for line in (path/'monitor.jsonl').read_text().splitlines()]
+    summary = json.loads((path/'summary.json').read_text())
+    change(records, summary)
+    (path/'monitor.jsonl').write_text(''.join(json.dumps(row)+'\n' for row in records))
+
+
+@pytest.mark.parametrize('fault', [
+    lambda r, s: r[-1].update(reason='ptp_child_exit:0'),
+    lambda r, s: r[-1].update(reason='monitor_deadline'),
+    lambda r, s: r[-1].update(reason='monitor_shutdown'),
+    lambda r, s: r[-1].update(reason='arbitrary'),
+    lambda r, s: r[-1].pop('reason'),
+    lambda r, s: r[-1].update(healthy=True),
+    lambda r, s: r[-1].update(healthy=0),
+    lambda r, s: r[-1].update(mono_ns=s['formal_end_mono_ns']),
+    lambda r, s: r[-1].update(mono_ns=s['formal_end_mono_ns']-1),
+    lambda r, s: r[-1].update(mono_ns=s['formal_start_mono_ns']-1),
+    lambda r, s: r[0].update(mono_ns=s['formal_start_mono_ns']),
+    lambda r, s: r[-1].pop('mono_ns'),
+    lambda r, s: r[-1].update(mono_ns=float(r[-1]['mono_ns'])),
+    lambda r, s: r[0].update(mono_ns=True),
+    lambda r, s: r[0].update(mono_ns=-1),
+    lambda r, s: r.pop(),
+])
+def test_monitor_must_exit_normally_after_formal_audit(approval, sessions, fault):
+    path = sessions[0]
+    change_monitor(path, fault)
+    with pytest.raises(ValueError):
+        approval.record_qualification(path, path/'monitor.jsonl', path/'qualification.json',
+                                      process_listing=lambda: '')
+    assert not (path/'qualification.json').exists()
+
+
+@pytest.mark.parametrize('reason', ['stop_requested', 'signal:2', 'signal:15'])
+def test_documented_normal_monitor_stop_reasons_qualify(approval, sessions, reason):
+    for path in sessions:
+        change_monitor(path, lambda rows, summary: rows[-1].update(reason=reason))
+    assert len(approval.validate_sessions(qualify(approval, sessions)).sessions) == 3
+
+
+@pytest.mark.parametrize('fault', [
+    pytest.param(lambda s, r, a: s.update(rejected_count=False), id='bool-rejected-count'),
+    pytest.param(lambda s, r, a: s.update(rejected_count=0.), id='float-rejected-count'),
+    pytest.param(lambda s, r, a: a[0]['inference'].update(action_shape=[True, 6]), id='bool-action-dimension'),
+    pytest.param(lambda s, r, a: a[0]['inference'].update(action_shape=[1., 6]), id='float-action-dimension'),
+    pytest.param(lambda s, r, a: r[2].update(start_mono_ns=-2, end_mono_ns=-1), id='negative-warmup-time'),
+    pytest.param(lambda s, r, a: r[2].update(start_mono_ns=True), id='bool-warmup-time'),
+    pytest.param(lambda s, r, a: r[2].update(start_mono_ns=float(r[2]['start_mono_ns'])), id='float-warmup-time'),
+    pytest.param(lambda s, r, a: r[2].update(start_mono_ns=r[3]['initial_snapshot']['created_mono_ns']-1), id='warmup-before-preflight'),
+    pytest.param(lambda s, r, a: r[2].update(end_mono_ns=r[2]['start_mono_ns']-1), id='reversed-warmup'),
+    pytest.param(lambda s, r, a: r[2].update(end_mono_ns=2**63), id='overflow-warmup'),
+    pytest.param(lambda s, r, a: r[0].update(warmup_steps=2.), id='float-session-warmup-count'),
+    pytest.param(lambda s, r, a: r[2].update(warmup_steps=2.), id='float-warmup-request'),
+    pytest.param(lambda s, r, a: r[2].update(warmup_completed=2.), id='float-warmup-completed'),
+    pytest.param(lambda s, r, a: s.update(warmup_completed=2.), id='float-summary-warmup-completed'),
+    pytest.param(lambda s, r, a: r[1]['metadata'].update(warmup_completed=False), id='bool-initial-warmup-completed'),
+    pytest.param(lambda s, r, a: r[1]['metadata'].update(warmup_completed=1), id='nonzero-initial-warmup-completed'),
+    pytest.param(lambda s, r, a: r[0].update(duration_s=121.), id='float-session-duration'),
+    pytest.param(lambda s, r, a: s.update(formal_start_mono_ns=float(s['formal_start_mono_ns'])), id='float-summary-formal-start'),
+    pytest.param(lambda s, r, a: s.update(formal_end_mono_ns=float(s['formal_end_mono_ns'])), id='float-summary-formal-end'),
+    pytest.param(lambda s, r, a: s.update(inference_delay_s=False), id='bool-summary-delay'),
+    pytest.param(lambda s, r, a: r[0].update(inference_delay_s=False), id='bool-session-delay'),
+    pytest.param(lambda s, r, a: a[0]['inference'].update(cpu_prepare_ns=2_000_000.), id='float-inference-nanoseconds'),
+    pytest.param(lambda s, r, a: a[0]['inference'].update(cuda_allocated_bytes=2.*1024**2), id='float-memory-bytes'),
+    pytest.param(lambda s, r, a: a[0]['source_intervals_ns']['joint'].__setitem__(0, float(a[0]['source_intervals_ns']['joint'][0])), id='float-source-interval'),
+])
+def test_integer_and_temporal_evidence_is_exact(approval, sessions, fault):
+    mutate(sessions[0], fault)
+    with pytest.raises(ValueError):
+        approval.validate_sessions(qualify(approval, sessions))
+
+
+@pytest.mark.parametrize('field,value', [('schema', True), ('schema', 1.), ('schema', -1),
+                                        ('checked_at_utc', '1960-01-01T00:00:00+00:00'),
+                                        ('checked_at_utc', '2026-01-01T00:00:00+01:00'),
+                                        ('checked_at_utc', '2026-01-01T00:00:00'),
+                                        ('checked_at_utc', 123)])
+def test_qualification_schema_and_timestamp_are_strict(approval, sessions, field, value):
+    qualify(approval, sessions)
+    path = sessions[0]/'qualification.json'
+    data = json.loads(path.read_text())
+    data[field] = value
+    path.chmod(0o600)
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError):
+        approval.validate_sessions(sessions)

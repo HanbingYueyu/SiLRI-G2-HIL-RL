@@ -14,7 +14,6 @@ import json
 import math
 import os
 from pathlib import Path
-import shlex
 import stat
 import subprocess
 
@@ -30,6 +29,7 @@ _FILES = ('evidence.jsonl', 'summary.json')
 _LIMIT_NAMES = frozenset(field.name for field in fields(FreshnessLimits))
 _FLAGS = dict(motion_authorized=False, thresholds_approved=False,
               source_clock_identity_proven=False, actions_discarded=True)
+_PROCESS_COMMAND = ['/usr/bin/ps', '-eo', 'pid=,stat=,args=']
 
 
 def _canonical(value):
@@ -118,25 +118,37 @@ def _exclusive(output, value):
 
 
 def _process_listing():
-    return subprocess.run(['/usr/bin/ps', '-eo', 'pid=,args='], check=True,
+    return subprocess.run(_PROCESS_COMMAND, check=True,
                           capture_output=True, text=True, timeout=10).stdout
 
 
 def _residuals(listing):
     result = []
     for line in listing.splitlines():
-        parts = line.strip().split(maxsplit=1)
-        if len(parts) != 2 or not parts[0].isdigit():
+        parts = line.strip().split(maxsplit=2)
+        if (len(parts) != 3 or not parts[0].isascii() or not parts[0].isdigit() or
+                not parts[1] or any(c not in 'RSDZTWXIKP<NLsl+' for c in parts[1])):
             raise ValueError('Invalid process listing')
-        argv = shlex.split(parts[1])
-        if any(word in ('g2_local.freshness_audit', 'g2_local.clock_monitor') or
-               Path(word).name in ('ptp4l', 'pmc', 'phc2sys', 'freshness_audit.py', 'clock_monitor.py')
+        pid = _integer(int(parts[0]), minimum=1)
+        # ps args is display text, not shell serialization. Splitting only
+        # whitespace preserves literal unmatched quotes in unrelated argv.
+        # No PID/ancestor exclusion is needed: our fixed ps command contains
+        # none of the target tokens, including when it lists itself.
+        argv = parts[2].split()
+        modules = ('g2_local.freshness_audit', 'g2_local.clock_monitor')
+        names = ('ptp4l', 'pmc', 'phc2sys', 'freshness_audit.py', 'clock_monitor.py',
+                 'freshness_audit', 'clock_monitor', 'clock_monitor.p')
+        if any(word.removeprefix('-m') in modules or Path(word.strip('[]')).name in names
                for word in argv):
-            result.append(dict(pid=int(parts[0]), command=parts[1]))
+            result.append(dict(pid=pid, command=parts[2]))
+        elif parts[1].startswith('Z') and Path(argv[0].strip('[]')).name.startswith(('python', 'pypy')):
+            # Zombie interpreters lose their module argv. Do not claim they
+            # belong to this session, but cannot certify their cleanup either.
+            result.append(dict(pid=pid, command=parts[2], reason='ambiguous_zombie_python'))
     return result
 
 
-def _monitor(raw, session_id):
+def _monitor(raw, session_id, initial_mono_ns, formal_end_mono_ns):
     rows = _records(raw)
     sessions = [r for r in rows if r.get('kind') == 'session']
     exits = [r for r in rows if r.get('kind') == 'exit']
@@ -144,9 +156,26 @@ def _monitor(raw, session_id):
             sessions[0].get('expected_master') != _MASTER or
             sessions[0].get('motion_authorized') is not False or
             len(exits) != 1 or type(exits[0].get('returncode')) is not int or
-            exits[0]['returncode'] != 0 or rows[-1] != exits[0] or
+            exits[0]['returncode'] != 0 or rows[0] != sessions[0] or rows[-1] != exits[0] or
+            exits[0].get('healthy') is not False or
+            exits[0].get('reason') not in ('stop_requested', 'signal:2', 'signal:15') or
             any(r.get('kind') == 'cleanup_pending' for r in rows)):
         raise ValueError('Monitor identity or clean exit evidence missing')
+    times = [_timestamp(row.get('mono_ns'), 'monitor timestamp') for row in rows]
+    initial = _timestamp(initial_mono_ns, 'initial snapshot timestamp')
+    formal_end = _timestamp(formal_end_mono_ns, 'formal end timestamp')
+    if (any(a > b for a, b in zip(times, times[1:])) or
+            not times[0] <= initial <= formal_end < times[-1]):
+        raise ValueError('Monitor lifetime must cover the complete formal audit')
+    for row, mono in zip(rows, times):
+        if row.get('kind') == 'ptp':
+            received = _timestamp(row.get('received_mono_ns'), 'PTP receipt timestamp')
+            _timestamp(row.get('wall_ns'), 'PTP wall timestamp')
+            if not times[0] <= received <= mono:
+                raise ValueError('Monitor PTP timestamp ordering invalid')
+        if row.get('kind') == 'properties':
+            if _integer(row.get('returncode'), minimum=0, maximum=255) != 0:
+                raise ValueError('Monitor properties query failed')
 
 
 def record_qualification(audit_dir, monitor_evidence, output, *, process_listing=None):
@@ -168,10 +197,14 @@ def record_qualification(audit_dir, monitor_evidence, output, *, process_listing
     monitor_path = str(Path(os.path.abspath(monitor_evidence)))
     monitor_raw, monitor_hash = _read(monitor_path)
     monitor_id = samples[0]['snapshot']['session_id']
-    _monitor(monitor_raw, monitor_id)
+    if rows[3].get('event') != 'formal_start' or rows[-1].get('event') != 'formal_end':
+        raise ValueError('Formal timing evidence missing')
+    _monitor(monitor_raw, monitor_id, rows[3]['initial_snapshot']['created_mono_ns'],
+             rows[-1]['formal_end_mono_ns'])
     residuals = _residuals((process_listing or _process_listing)())
     if residuals:
-        raise ValueError('residual_process: audit, monitor or PTP process remains')
+        reasons = ', '.join(r.get('reason', 'audit_monitor_or_ptp') for r in residuals)
+        raise ValueError('residual_process: '+reasons)
     # Bind a stable set: do not attest files that changed during the scan.
     for name, (_, digest) in blobs.items():
         if _read(audit_dir/name)[1] != digest:
@@ -181,7 +214,7 @@ def record_qualification(audit_dir, monitor_evidence, output, *, process_listing
     return _exclusive(output, dict(
         schema=1, audit_session_id=_text(summary['audit_session_id']),
         monitor_session_id=monitor_id, checked_at_utc=datetime.now(timezone.utc).isoformat(),
-        process_check=dict(command=['/usr/bin/ps', '-eo', 'pid=,args='], residuals=[], clean=True),
+        process_check=dict(command=_PROCESS_COMMAND, residuals=[], clean=True),
         audit_hashes={name: digest for name, (_, digest) in blobs.items()},
         monitor_evidence=monitor_path, monitor_sha256=monitor_hash,
         motion_authorized=False, thresholds_approved=False))
@@ -250,6 +283,11 @@ def _metrics(row, previous_row, previous_snapshot):
             raise ValueError('Future source timestamp')
         intervals[source] = [math.floor(lo), math.ceil(hi)]
         ages[source], lower[source] = float((now-lo)/1_000_000), float((now-hi)/1_000_000)
+    for interval in row['source_intervals_ns'].values():
+        if type(interval) is not list or len(interval) != 2:
+            raise ValueError('Raw source interval shape invalid')
+        if _integer(interval[0]) > _integer(interval[1]):
+            raise ValueError('Raw source interval ordering invalid')
     if intervals != row['source_intervals_ns']:
         raise ValueError('Raw source interval mismatch')
     left, right = intervals['left_wrist'], intervals['right_aux']
@@ -273,16 +311,18 @@ def _metrics(row, previous_row, previous_snapshot):
         if not math.isclose(value, info[key], rel_tol=1e-9, abs_tol=1e-7):
             raise ValueError('Raw TF pose error mismatch')
         metrics[key] = info[key]
-    if raw['action_discarded'] is not True or raw['action_shape'] != [1, 6]:
+    shape = raw['action_shape']
+    if (raw['action_discarded'] is not True or type(shape) is not list or
+            len(shape) != 2 or any(type(dimension) is not int for dimension in shape) or shape != [1, 6]):
         raise ValueError('Invalid discarded action')
     low, high = raw['action_min'], raw['action_max']
     if type(low) not in (int, float) or type(high) not in (int, float) or not -1+1e-6 <= low <= high <= 1-1e-6:
         raise ValueError('Invalid action range')
     for source, metric in [('cpu_prepare_ns', 'cpu_prepare_ms'), ('h2d_resize_ns', 'h2d_resize_ms'),
                            ('forward_ns', 'actor_forward_ms'), ('total_ns', 'actor_inference_ms')]:
-        metrics[metric] = _finite(raw[source], source)/1e6
+        metrics[metric] = _integer(raw[source], minimum=0)/1e6
     for name in ('cuda_allocated', 'cuda_reserved', 'cuda_peak_allocated'):
-        metrics[name+'_mib'] = _finite(raw[name+'_bytes'], name)/1024**2
+        metrics[name+'_mib'] = _integer(raw[name+'_bytes'], minimum=0)/1024**2
     if raw['total_ns'] > end-start or any(raw[k] > raw['total_ns'] for k in ('cpu_prepare_ns', 'h2d_resize_ns', 'forward_ns')):
         raise ValueError('Inference timing inconsistent')
     if _canonical(metrics) != _canonical(row['metrics']):
@@ -317,12 +357,14 @@ def _validate(path):
     if any(qualification['audit_hashes'][name] != blobs[name][1] for name in _FILES):
         raise ValueError('Qualification hash mismatch')
     scan = qualification['process_check']
-    if (qualification.get('schema') != 1 or scan.get('clean') is not True or scan.get('residuals') != [] or
-            scan.get('command') != ['/usr/bin/ps', '-eo', 'pid=,args='] or
+    if (_integer(qualification.get('schema'), minimum=1, maximum=1) != 1 or
+            scan.get('clean') is not True or scan.get('residuals') != [] or
+            scan.get('command') != _PROCESS_COMMAND or
             qualification.get('motion_authorized') is not False or qualification.get('thresholds_approved') is not False):
         raise ValueError('residual_process: clean qualification required')
-    if datetime.fromisoformat(qualification['checked_at_utc']).utcoffset() is None:
-        raise ValueError('Qualification timestamp requires timezone')
+    checked = datetime.fromisoformat(_text(qualification['checked_at_utc']))
+    if checked.utcoffset() != timezone.utc.utcoffset(None) or checked.timestamp() <= 0:
+        raise ValueError('Qualification timestamp must be positive UTC')
     monitor_raw, digest = _read(qualification['monitor_evidence'])
     if digest != qualification['monitor_sha256']:
         raise ValueError('Monitor hash mismatch')
@@ -341,26 +383,40 @@ def _validate(path):
             raise ValueError('Authorization flags must remain fixed')
     if any(session.get(key) is not _FLAGS[key] for key in ('motion_authorized', 'thresholds_approved', 'actions_discarded')):
         raise ValueError('Raw authorization flags invalid')
+    for record in (summary, session):
+        _finite(record['inference_delay_s'], 'inference_delay_s')
     if (summary['status'] != 'completed' or summary['reason'] != '' or
             summary['actor_mode'] is not True or session['actor_mode'] is not True or
             summary['inference_delay_s'] != 0 or session['inference_delay_s'] != 0):
         raise ValueError('Completed real Actor session required')
-    if summary['rejected_count'] != 0:
+    if _integer(summary['rejected_count'], minimum=0, maximum=36000) != 0:
         raise ValueError('rejected samples')
     for key in ('accepted_count', 'sample_count'):
-        if type(summary[key]) is not int or summary[key] != len(samples) or len(samples) < 1000:
+        if _integer(summary[key], minimum=1000, maximum=36000) != len(samples):
             raise ValueError('samples count mismatch or too small')
-    if type(summary['duration_s']) is not int or summary['duration_s'] < 120 or summary['duration_s'] != session['duration_s']:
+    if (_integer(summary['duration_s'], minimum=120, maximum=1800) !=
+            _integer(session['duration_s'], minimum=120, maximum=1800)):
         raise ValueError('duration too short or mismatched')
     start, end = _timestamp(begin['formal_start_mono_ns'], 'formal start'), _timestamp(finish['formal_end_mono_ns'], 'formal end')
-    observed = (samples[-1]['received_mono_ns']-samples[0]['info']['read_start_monotonic_ns'])/1e9
+    observed = (_timestamp(samples[-1]['received_mono_ns'], 'last receive')-
+                _timestamp(samples[0]['info']['read_start_monotonic_ns'], 'first read'))/1e9
     elapsed = (end-start)/1e9
+    for record in (summary, finish):
+        _finite(record['formal_elapsed_s'], 'formal_elapsed_s', positive=True)
+    _timestamp(summary['formal_start_mono_ns'], 'summary formal start')
+    _timestamp(summary['formal_end_mono_ns'], 'summary formal end')
     if (observed < 120 or elapsed < 120 or
             not start <= samples[0]['info']['read_start_monotonic_ns'] <= samples[-1]['received_mono_ns'] <= end or
             summary['formal_start_mono_ns'] != start or summary['formal_end_mono_ns'] != end or
             summary['formal_elapsed_s'] != elapsed or finish['formal_elapsed_s'] != elapsed):
         raise ValueError('duration raw boundaries do not qualify')
     metadata = summary['actor_metadata']
+    for record in (session, summary, warmup, metadata, actor['metadata'], warmup['metadata']):
+        _integer(record['warmup_steps'], minimum=0)
+        if record is not session:
+            _integer(record['warmup_completed'], minimum=0)
+    if actor['metadata']['warmup_completed'] != 0:
+        raise ValueError('Initial warmup count must be zero')
     if _canonical(metadata) != _canonical(warmup['metadata']):
         raise ValueError('checkpoint/config/gpu metadata mismatch')
     initial = dict(actor['metadata'])
@@ -376,17 +432,20 @@ def _validate(path):
             type(metadata['checkpoint_version']) is not int or metadata['checkpoint_version'] < 0 or
             type(metadata['policy_config']) is not dict or not metadata['policy_config']):
         raise ValueError('checkpoint config missing')
+    _integer(metadata['checkpoint_version'], minimum=0)
     requested = summary['warmup_steps']
+    previous = _snapshot(begin['initial_snapshot'])
+    warmup_start = _timestamp(warmup['start_mono_ns'], 'warmup start')
+    warmup_end = _timestamp(warmup['end_mono_ns'], 'warmup end')
     if (type(requested) is not int or requested < 0 or
             any(value != requested for value in (session['warmup_steps'], warmup['warmup_steps'], warmup['warmup_completed'],
                 summary['warmup_completed'], metadata['warmup_steps'], metadata['warmup_completed'])) or
-            not warmup['start_mono_ns'] <= warmup['end_mono_ns'] <= start):
+            not previous.created_mono_ns <= warmup_start <= warmup_end <= start):
         raise ValueError('Warmup evidence mismatch')
-    previous = _snapshot(begin['initial_snapshot'])
     monitor_id = previous.session_id
     if qualification['monitor_session_id'] != monitor_id:
         raise ValueError('Monitor session mismatch')
-    _monitor(monitor_raw, monitor_id)
+    _monitor(monitor_raw, monitor_id, previous.created_mono_ns, end)
     metrics, old = [], None
     for row in samples:
         metric, previous = _metrics(row, old, previous)
