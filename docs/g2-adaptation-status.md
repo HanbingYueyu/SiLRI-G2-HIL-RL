@@ -14,8 +14,27 @@ min/p50/p95/p99/max 分布。断线、快照无效、源冻结/倒退或证据�
 `thresholds_approved=false`；没有生产默认阈值，没有写入配置或启用运动建议。
 审计不创建命令端口/运动后端，也不发送保持或其他命令。
 
-本轮只完成软件实现与离线测试，计划 Task 7 Step 6 的 120 秒监控 + 60 秒现场
-负载审计尚未执行；不能把历史 45 秒回顾式诊断当成新的持续映射验收。
+计划 Task 7 Step 6 已执行一次现场采集：监控最大期限 120 秒，审计 60 秒、
+模拟推理等待 0.02 秒。审计证据位于
+`runtime/freshness_audit/7bf7d98a6b7345f892573635aad109ce/`，摘要为
+`status=completed`、717 个样本，无 `rejected` 行；`motion_authorized=false`、
+`thresholds_approved=false`、`source_clock_identity_proven=false` 均保持不变。
+快照 sequence 668→2599 严格递增，覆盖 31 个不同的最后 PTP 样本时间；
+同一 `last_sample_mono_ns` 的 `valid_until_ns` 不变，没有靠重复读取延长租约。
+
+左/右相机年龄上界最大 80.234 / 97.302 ms，p99 为 78.047 / 72.604 ms；
+关节/TF 年龄上界最大 35.549 / 35.528 ms，相机时差最大 38.585 ms。
+审计窗口映射误差最大 2.573 ms、漂移最大 15.316 ppm、残差最大 0.252 ms、
+路径延迟最大 0.0392 ms；TF/motion 位置/旋转差最大 `5.77e-7 m` / `2.38e-6 rad`，
+GDK 单次读取最大 37.594 ms。这些是观测统计，不是批准后的生产阈值。
+
+监控证据位于 `/tmp/g2-clock-audit-20260921-02/`。审计结束后出现原始 PTP 行
+`master offset 56328758690 s0 freq +705874 path delay 42102`，ClockWindow 随后
+锁存 `mapping_invalid`、发布不健康状态并以 `returncode=2` 退出，记录了
+fail-closed 行为；不能声称监控全程健康或据此批准运动。收尾已核对无残留
+`ptp4l`、`phc2sys`、`clock_monitor`、`freshness_audit`。此前 `-01` 目录的
+`sudo: 需要密码` 失败证据仍保留，该次退出码 1、未启动 PTP。
+
 模拟等待不是实际 Actor/GPU 推理负载，最终六项阈值仍须在真实只读负载下分别批准。
 两终端启动、B→A 停止顺序、证据位置和残留检查见
 [持续时钟与负载审计说明](g2-clock-diagnostics.md)。SDK 同步调用卡死时不能保证
