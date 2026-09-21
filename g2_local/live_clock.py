@@ -187,7 +187,18 @@ class ClockWindow:
                                           session=self.session_id)
                     if not self._mapping_is_valid(mapping):
                         raise ValueError('Invalid PTP mapping')
-                except Exception:
+                except Exception as error:
+                    # Before the first mapping is published, one otherwise
+                    # well-formed report can be a transient startup residual
+                    # outlier.  It cannot seed the next fit, but there is no
+                    # lease yet to revoke: begin a wholly fresh candidate
+                    # window.  Structural fit failures (for example integer
+                    # range/lease overflow) and every post-publication
+                    # failure remain fail-closed.
+                    if (self._mapping is None and
+                            str(error) == 'PTP jump, excessive drift or residual'):
+                        self._samples.clear()
+                        return
                     self._latch('mapping_invalid')
                     return
             self._samples.append(sample)

@@ -253,6 +253,51 @@ def test_fit_failures_and_nonfinite_outputs_latch_fail_closed(monkeypatch, failu
     json.dumps(asdict(failed), allow_nan=False)
 
 
+def test_startup_residual_spike_restarts_warmup_and_allows_a_fresh_mapping():
+    """Catch a one-off startup fit failure being latched permanently."""
+    from g2_local.live_clock import ClockWindow
+
+    window = ClockWindow(MASTER, 'boot', 'run')
+    window.feed_ptp(
+        f'ptp4l[1.000]: selected best master clock {MASTER}',
+        1_010_000_000,
+        wall(1_010_000_000),
+    )
+    window.feed_properties(properties(), 1_100_000_000)
+    for index, second in enumerate(range(2, 16, 2)):
+        mono_ns = second * 1_000_000_000
+        window.feed_ptp(
+            offset_line(second, 55_000_000_000 + index * 20_000),
+            mono_ns + 10_000_000,
+            wall(mono_ns + 10_000_000),
+        )
+
+    # The eighth candidate is valid PTP syntax/delivery evidence, but its
+    # offset makes the first fit exceed the fixed residual limit.
+    window.feed_ptp(
+        offset_line(16, 55_002_140_000),
+        16_010_000_000,
+        wall(16_010_000_000),
+    )
+    warming = window.snapshot(16_100_000_000, wall(16_100_000_000))
+    assert warming.healthy is False
+    assert warming.reason == 'warming_up'
+
+    # Eight clean reports after the rejected startup candidate form a new
+    # window; none of the earlier candidate samples may contaminate it.
+    for index, second in enumerate(range(18, 34, 2)):
+        mono_ns = second * 1_000_000_000
+        window.feed_ptp(
+            offset_line(second, 55_100_000_000 + index * 20_000),
+            mono_ns + 10_000_000,
+            wall(mono_ns + 10_000_000),
+        )
+    recovered = window.snapshot(32_100_000_000, wall(32_100_000_000))
+    assert recovered.healthy is True
+    assert recovered.reason == 'ok'
+    assert recovered.reference_mono_ns == 32_000_000_000
+
+
 def test_mapping_expiry_cannot_exceed_signed_64_bit_report_range():
     from g2_local.clock_mapping import MAX_REPORT_INTEGER
     from g2_local.live_clock import ClockWindow
