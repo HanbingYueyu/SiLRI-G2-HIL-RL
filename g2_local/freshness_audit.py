@@ -196,6 +196,8 @@ def run_audit(*, output, duration_s, socket_path=None, inference_delay_s=0.,
     action_min = action_max = None
     warmup_start = None
     warmup_recorded = False
+    audit_session_id = uuid.uuid4().hex
+    formal_start = formal_end = None
 
     def encode_record(record):
         encoded = (json.dumps(record, allow_nan=False, separators=(',', ':'))+'\n').encode()
@@ -231,7 +233,7 @@ def run_audit(*, output, duration_s, socket_path=None, inference_delay_s=0.,
         fd = os.open('evidence.jsonl', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                      0o600, dir_fd=directory_fd)
         stream = os.fdopen(fd, 'wb')
-        write_record(dict(event='session', duration_s=duration_s,
+        write_record(dict(event='session', audit_session_id=audit_session_id, duration_s=duration_s,
                           inference_delay_s=inference_delay_s, motion_authorized=False,
                           thresholds_approved=False, actions_discarded=True,
                           actor_mode=actor_mode, warmup_steps=warmup_steps))
@@ -254,6 +256,9 @@ def run_audit(*, output, duration_s, socket_path=None, inference_delay_s=0.,
                 del warmup_observation
             record_warmup()
         start = _timestamp(now_fn(), 'audit start')
+        formal_start = start
+        write_record(dict(event='formal_start', formal_start_mono_ns=start,
+                          initial_snapshot=asdict(previous_snapshot)))
         deadline = start+duration_s*1_000_000_000
         while now_fn() < deadline:
             if len(rows) >= _MAX_SAMPLES:
@@ -295,6 +300,9 @@ def run_audit(*, output, duration_s, socket_path=None, inference_delay_s=0.,
             remaining = (deadline-now_fn())/1e9
             if remaining > 0:
                 sleep_fn(min(_SAMPLE_PERIOD_S, remaining))
+        formal_end = _timestamp(now_fn(), 'audit end')
+        write_record(dict(event='formal_end', formal_end_mono_ns=formal_end,
+                          formal_elapsed_s=(formal_end-formal_start)/1e9))
     except KeyboardInterrupt:
         status, reason = 'interrupted', 'operator_interrupt'
     except BaseException as error:
@@ -339,6 +347,9 @@ def run_audit(*, output, duration_s, socket_path=None, inference_delay_s=0.,
                             failure = RuntimeError(reason)
             result = summarize_audit(rows)
             result.update(status=status, reason=reason, duration_s=duration_s,
+                          audit_session_id=audit_session_id,
+                          formal_start_mono_ns=formal_start, formal_end_mono_ns=formal_end,
+                          formal_elapsed_s=None if formal_end is None else (formal_end-formal_start)/1e9,
                           inference_delay_s=inference_delay_s, actor_mode=actor_mode,
                           accepted_count=len(rows), rejected_count=attempted-len(rows),
                           warmup_steps=warmup_steps,

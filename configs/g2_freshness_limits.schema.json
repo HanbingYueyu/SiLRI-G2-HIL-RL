@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Explicit evidence-qualified freshness limits; no motion authorization",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "limits", "margins", "worst_case", "sessions", "checkpoint_sha256", "policy_config", "gpu_name", "approved_at_utc", "thresholds_approved", "motion_authorized", "source_clock_identity_proven"],
+  "properties": {
+    "schema": {"const": 1},
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["camera_age_s", "state_age_s", "camera_skew_s", "mapping_error_s", "tf_position_error_m", "tf_rotation_error_rad"],
+      "properties": {
+        "camera_age_s": {"type": "number", "exclusiveMinimum": 0},
+        "state_age_s": {"type": "number", "exclusiveMinimum": 0},
+        "camera_skew_s": {"type": "number", "exclusiveMinimum": 0},
+        "mapping_error_s": {"type": "number", "exclusiveMinimum": 0},
+        "tf_position_error_m": {"type": "number", "const": 0.005},
+        "tf_rotation_error_rad": {"type": "number", "const": 0.02}
+      }
+    },
+    "margins": {
+      "description": "Explicit proposal minus worst observed raw upper bound, in the units named by each field. Timing margins must be positive; TF margins may be zero at the fixed task ceiling.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["camera_age_s", "state_age_s", "camera_skew_s", "mapping_error_s", "tf_position_error_m", "tf_rotation_error_rad"],
+      "properties": {
+        "camera_age_s": {"type": "number", "exclusiveMinimum": 0},
+        "state_age_s": {"type": "number", "exclusiveMinimum": 0},
+        "camera_skew_s": {"type": "number", "exclusiveMinimum": 0},
+        "mapping_error_s": {"type": "number", "exclusiveMinimum": 0},
+        "tf_position_error_m": {"type": "number", "minimum": 0},
+        "tf_rotation_error_rad": {"type": "number", "minimum": 0}
+      }
+    },
+    "worst_case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["camera_age_s", "state_age_s", "camera_skew_s", "mapping_error_s", "tf_position_error_m", "tf_rotation_error_rad"],
+      "properties": {
+        "camera_age_s": {"type": "number"},
+        "state_age_s": {"type": "number"},
+        "camera_skew_s": {"type": "number", "minimum": 0},
+        "mapping_error_s": {"type": "number", "minimum": 0},
+        "tf_position_error_m": {"type": "number", "minimum": 0, "maximum": 0.005},
+        "tf_rotation_error_rad": {"type": "number", "minimum": 0, "maximum": 0.02}
+      }
+    },
+    "sessions": {
+      "type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["path", "audit_session_id", "monitor_session_id", "hashes", "monitor_evidence", "monitor_sha256", "actor_metadata", "observed_elapsed_s", "sample_count", "metrics"],
+        "properties": {
+          "path": {"type": "string", "minLength": 1},
+          "audit_session_id": {"type": "string", "minLength": 1},
+          "monitor_session_id": {"type": "string", "minLength": 1},
+          "hashes": {
+            "type": "object", "additionalProperties": false,
+            "required": ["evidence.jsonl", "summary.json", "qualification.json"],
+            "properties": {
+              "evidence.jsonl": {"$ref": "#/$defs/sha256"},
+              "summary.json": {"$ref": "#/$defs/sha256"},
+              "qualification.json": {"$ref": "#/$defs/sha256"}
+            }
+          },
+          "monitor_evidence": {"type": "string", "minLength": 1},
+          "monitor_sha256": {"$ref": "#/$defs/sha256"},
+          "actor_metadata": {"type": "object"},
+          "observed_elapsed_s": {"type": "number", "minimum": 120},
+          "sample_count": {"type": "integer", "minimum": 1000},
+          "metrics": {"type": "object"}
+        }
+      }
+    },
+    "checkpoint_sha256": {"$ref": "#/$defs/sha256"},
+    "policy_config": {"type": "object", "minProperties": 1},
+    "gpu_name": {"const": "NVIDIA GeForce RTX 3090"},
+    "approved_at_utc": {"type": "string", "format": "date-time"},
+    "thresholds_approved": {"const": true},
+    "motion_authorized": {"const": false},
+    "source_clock_identity_proven": {"const": false}
+  },
+  "$defs": {"sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+}

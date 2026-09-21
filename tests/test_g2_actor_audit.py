@@ -81,6 +81,25 @@ class ActorRig(Rig):
                         device='cuda', probe_factory=self.probe, **kwargs)
 
 
+def test_formal_boundaries_and_unique_audit_identity_are_raw_evidence(audit, tmp_path):
+    reports = []
+    for index in range(2):
+        output = tmp_path/str(index)
+        report = ActorRig().run_actor(audit, output, warmup_steps=2)
+        rows = [json.loads(line) for line in (output/'evidence.jsonl').read_text().splitlines()]
+        start = next(row for row in rows if row['event'] == 'formal_start')
+        end = next(row for row in rows if row['event'] == 'formal_end')
+        assert rows[0]['audit_session_id'] == report['audit_session_id']
+        assert report['formal_start_mono_ns'] == start['formal_start_mono_ns']
+        assert start['initial_snapshot']['sequence'] < next(r for r in rows if r['event'] == 'sample')['snapshot']['sequence']
+        assert report['formal_end_mono_ns'] == end['formal_end_mono_ns']
+        assert report['formal_elapsed_s'] == 30.
+        assert end['formal_elapsed_s'] == 30.
+        assert start['formal_start_mono_ns'] >= next(r for r in rows if r['event'] == 'warmup')['end_mono_ns']
+        reports.append(report)
+    assert reports[0]['audit_session_id'] != reports[1]['audit_session_id']
+
+
 def test_snapshot_and_age_are_measured_after_real_inference(audit, tmp_path, monkeypatch):
     rig = ActorRig()
     original = audit._measure
