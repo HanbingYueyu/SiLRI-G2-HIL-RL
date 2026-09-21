@@ -5,6 +5,7 @@ import pytest
 from g2_local.config import LocalTaskConfig
 from g2_local.contract import EpisodeContext
 from g2_local.env import G2LocalEnv
+from g2_local.freshness import FreshnessDecision
 
 
 class Reader:
@@ -27,20 +28,40 @@ class Port:
         self.reader = reader
         self.sent = []
         self.stopped = False
+        self.stop_calls = 0
     def send(self, target):
         self.sent.append(target)
         self.reader.state = np.array((*target.position_m,*target.orientation_xyzw))
     def stop(self):
+        self.stop_calls += 1
         self.stopped = True
 
 
-def backend(reader, port, **kwargs):
+def backend(reader, port, *, observation_guard=None, outcome=None, **kwargs):
     from g2_local.motion_backend import MotionBackend
     config = LocalTaskConfig(action_scale=(.01,)*6, workspace_low=(-1,)*3,workspace_high=(1,)*3)
+    if observation_guard is None:
+        observation_guard = lambda obs, info, after: info['captured'] >= (after or 0)
+    if outcome is None:
+        outcome = lambda obs: (0., False)
     return MotionBackend(reader, port, config=config,
-                         observation_guard=lambda obs, info, after: info['captured'] >= (after or 0),
-                         outcome=lambda obs: (0., False), command_timeout=.3, send_timeout=.1,
+                         observation_guard=observation_guard, outcome=outcome,
+                         command_timeout=.3, send_timeout=.1,
                          step_period=.02, **kwargs)
+
+
+class RejectingGuard:
+    def __init__(self, code, *, after_send=False):
+        self.code = code
+        self.after_send = after_send
+        self.healthy = False
+        self.last_decision = FreshnessDecision('not_checked', 'fixture')
+
+    def __call__(self, obs, info, after):
+        reject = not self.healthy and (after is not None if self.after_send else True)
+        self.last_decision = FreshnessDecision(
+            self.code if reject else 'ok', 'fixture decision')
+        return not reject
 
 
 def test_default_denies_motion():
@@ -90,15 +111,127 @@ def test_successor_observation_failure_discards_step_and_stops():
         driver.close()
 
 
-def test_stale_observation_guard_blocks_before_send():
+def test_mapping_failure_before_plan_sends_nothing_and_stops_backend():
     reader = Reader()
     port = Port(reader)
-    driver = backend(reader, port, allow_motion=True)
-    driver.observation_guard = lambda *args: False
+    guard = RejectingGuard('mapping_expired')
+    driver = backend(reader, port, observation_guard=guard, allow_motion=True)
     try:
-        with pytest.raises(RuntimeError, match='observation'):
+        with pytest.raises(RuntimeError, match='mapping_expired'):
             driver.execute((0,)*6)
         assert port.sent == []
+        assert driver.stopped is True
+        guard.healthy = True
+        with pytest.raises(RuntimeError, match='reconstruct'):
+            driver.observe()
+    finally:
+        driver.close()
+
+
+def test_ambiguous_successor_stops_once_discards_step_and_never_auto_recovers():
+    reader = Reader()
+    port = Port(reader)
+    guard = RejectingGuard('not_after_command:tf', after_send=True)
+    outcomes = []
+    driver = backend(reader, port, observation_guard=guard,
+                     outcome=lambda obs: outcomes.append(obs) or (0., False),
+                     allow_motion=True)
+    try:
+        with pytest.raises(RuntimeError, match='not_after_command:tf'):
+            driver.execute((0,)*6)
+        assert port.stop_calls == 1
+        assert outcomes == []
+        assert driver.stopped is True
+        guard.healthy = True
+        with pytest.raises(RuntimeError, match='reconstruct'):
+            driver.observe()
+        assert port.stop_calls == 1
+    finally:
+        driver.close()
+
+
+@pytest.mark.parametrize('result', [False, None, 1, np.bool_(True)])
+def test_guard_accepts_only_the_exact_true_singleton(result):
+    reader = Reader()
+    port = Port(reader)
+
+    class Guard:
+        last_decision = FreshnessDecision('mapping_invalid', 'fixture')
+
+        def __call__(self, obs, info, after):
+            return result
+
+    driver = backend(reader, port, observation_guard=Guard(), allow_motion=True)
+    try:
+        with pytest.raises(RuntimeError, match='mapping_invalid'):
+            driver.execute((0,)*6)
+        assert port.sent == []
+        assert driver.stopped is True
+    finally:
+        driver.close()
+
+
+def test_diagnostic_lookup_failure_still_fails_closed_without_masking_rejection():
+    reader = Reader()
+    port = Port(reader)
+
+    class Guard:
+        diagnostic_reads = 0
+
+        def __call__(self, obs, info, after):
+            return False
+
+        @property
+        def last_decision(self):
+            self.diagnostic_reads += 1
+            raise LookupError('diagnostic unavailable')
+
+    guard = Guard()
+    driver = backend(reader, port, observation_guard=guard, allow_motion=True)
+    try:
+        with pytest.raises(RuntimeError, match='freshness not confirmed'):
+            driver.execute((0,)*6)
+        assert guard.diagnostic_reads == 1
+        assert port.sent == []
+        assert driver.stopped is True
+    finally:
+        driver.close()
+
+
+def test_unsafe_diagnostic_code_is_not_interpolated_into_the_error():
+    reader = Reader()
+    port = Port(reader)
+
+    class Guard:
+        last_decision = FreshnessDecision('unsafe\noperator message', 'fixture')
+
+        def __call__(self, obs, info, after):
+            return False
+
+    driver = backend(reader, port, observation_guard=Guard(), allow_motion=True)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            driver.execute((0,)*6)
+        assert str(caught.value) == 'Source observation freshness not confirmed'
+        assert port.sent == []
+        assert driver.stopped is True
+    finally:
+        driver.close()
+
+
+def test_guard_exception_fails_closed_before_send():
+    reader = Reader()
+    port = Port(reader)
+
+    def broken_guard(obs, info, after):
+        raise TimeoutError('snapshot timed out')
+
+    driver = backend(reader, port, observation_guard=broken_guard, allow_motion=True)
+    try:
+        with pytest.raises(TimeoutError, match='snapshot timed out'):
+            driver.execute((0,)*6)
+        assert port.sent == []
+        assert driver.stopped is True
     finally:
         driver.close()
 

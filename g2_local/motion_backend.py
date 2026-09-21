@@ -66,7 +66,15 @@ class MotionBackend:
                     or min(array.shape[:2]) <= 0):
                 raise ValueError('Invalid RGB observation')
         if self.observation_guard(obs, info, after) is not True:
-            raise RuntimeError('Source observation freshness not confirmed')
+            message = 'Source observation freshness not confirmed'
+            try:
+                code = self.observation_guard.last_decision.code
+            except Exception:
+                code = None
+            if (type(code) is str and 0 < len(code) <= 128 and code.isascii() and
+                    all(character.isalnum() or character in '_:-.' for character in code)):
+                message += f': {code}'
+            raise RuntimeError(message)
         self.stream.check()  # Camera may have blocked past the target lease.
         return deepcopy(obs)
 
