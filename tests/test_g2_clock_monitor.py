@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import pty
 import signal
 import stat
 import subprocess
@@ -21,6 +22,12 @@ POPEN = subprocess.Popen
 def monitor():
     from g2_local import clock_monitor
     return clock_monitor
+
+
+def timestamp_context():
+    fields = Path('/proc/self/stat').read_text().rsplit(') ', 1)[1].split()
+    tty = int(fields[4])
+    return ('tty', os.getsid(0), tty) if tty else ('ppid', os.getpid())
 
 
 def test_fixed_command_is_non_adjusting_get_only_and_finitely_bounded():
@@ -51,7 +58,7 @@ def test_command_rejects_non_session_socket_paths(uds, ro):
 @pytest.fixture
 def credentials(monkeypatch):
     """Inject the sole interactive subprocess boundary without executing sudo."""
-    state = {'calls': [], 'authenticated': False, 'returncode': 0, 'inspect': None}
+    state = {'calls': [], 'ticket_context': None, 'returncode': 0, 'inspect': None}
 
     def validate(argv, **kwargs):
         assert argv == ['/usr/bin/sudo', '-v']
@@ -61,7 +68,7 @@ def credentials(monkeypatch):
             state['inspect']()
         if state['returncode']:
             raise subprocess.CalledProcessError(state['returncode'], argv)
-        state['authenticated'] = True
+        state['ticket_context'] = timestamp_context()
         return subprocess.CompletedProcess(argv, 0)
 
     monkeypatch.setattr(monitor().subprocess, 'run', validate)
@@ -73,6 +80,8 @@ def launch(monkeypatch, credentials):
     """Run harmless real pipes/processes instead of either external executable."""
     module = monitor()
     original = subprocess.Popen
+    original_spawn = os.posix_spawn
+    spawn_measurement = module._spawn_measurement
     children, calls = [], []
     scripts = {'ptp': 'import time; time.sleep(10)',
                'pmc': 'print("TIME_PROPERTIES_DATA_SET\\ncurrentUtcOffset 37\\n'
@@ -81,18 +90,32 @@ def launch(monkeypatch, credentials):
     def start(argv, **kwargs):
         calls.append((argv, kwargs))
         assert kwargs.get('shell', False) is False
-        script = scripts['ptp' if argv[0] == '/usr/bin/sudo' else 'pmc']
-        if argv[0] == '/usr/bin/sudo' and not credentials['authenticated']:
-            script = 'print("sudo: 需要密码"); raise SystemExit(1)'
+        assert argv[0] == '/usr/sbin/pmc'
+        script = scripts['pmc']
         child = original([PYTHON, '-c', script, *argv], **kwargs)
         children.append(child)
         return child
 
+    def spawn(executable, argv, env, **kwargs):
+        assert executable == '/usr/bin/sudo'
+        calls.append((argv, kwargs))
+        context = ('ppid', os.getpid()) if kwargs.get('setsid') else timestamp_context()
+        script = scripts['ptp'] if context == credentials['ticket_context'] else (
+            'print("sudo: 需要密码"); raise SystemExit(1)')
+        return original_spawn(PYTHON, [PYTHON, '-c', script, *argv], env, **kwargs)
+
+    def measurement(argv):
+        child = spawn_measurement(argv)
+        children.append(child)
+        return child
+
     monkeypatch.setattr(module.subprocess, 'Popen', start)
+    monkeypatch.setattr(module.os, 'posix_spawn', spawn)
+    monkeypatch.setattr(module, '_spawn_measurement', measurement)
     yield scripts, calls, children
     for child in children:
         if child.poll() is None:
-            child.kill()
+            os.kill(child.pid, signal.SIGKILL)
         child.wait(timeout=3)
         if child.stdout:
             child.stdout.close()
@@ -110,7 +133,8 @@ def test_child_exit_publishes_unhealthy_and_never_restarts(tmp_path, launch):
     assert item.provider().healthy is False
     assert item.provider().reason == 'ptp_child_exit:7'
     assert len(calls) == 1
-    assert calls[0][1]['start_new_session'] is True
+    assert calls[0][1]['setpgroup'] == 0
+    assert 'setsid' not in calls[0][1]
     events = [json.loads(line) for line in (item.output/'evidence.jsonl').read_text().splitlines()]
     assert events[-1]['kind'] == 'exit'
     assert events[-1]['healthy'] is False
@@ -227,7 +251,7 @@ def test_log_failure_during_cleanup_still_reaps_pmc(tmp_path, launch, monkeypatc
     item = runtime(tmp_path)
     # Simulate a privileged leader that cannot be reaped within the grace
     # period; PMC is still our ordinary child and must always be cleaned up.
-    original_wait = POPEN.wait
+    original_wait = monitor()._SpawnedProcess.wait
     monkeypatch.setattr(monitor(), '_FIRST_PROPERTIES_S', 0)
     launch[0]['pmc'] = 'import time; time.sleep(10)'
 
@@ -236,7 +260,7 @@ def test_log_failure_during_cleanup_still_reaps_pmc(tmp_path, launch, monkeypatc
             raise subprocess.TimeoutExpired('owned sudo', 4)
         return original_wait(child, timeout=timeout)
 
-    monkeypatch.setattr(POPEN, 'wait', wait)
+    monkeypatch.setattr(monitor()._SpawnedProcess, 'wait', wait)
     record = item._record
 
     def record_failure(kind, **fields):
@@ -329,7 +353,8 @@ def test_monitor_deadline_stops_owned_child_even_if_timeout_wrapper_misbehaves(t
     item = runtime(tmp_path)
     ticks = iter([100., 164.])
     monkeypatch.setattr(monitor(), 'time', SimpleNamespace(
-        monotonic=lambda: next(ticks), monotonic_ns=time.monotonic_ns, time_ns=time.time_ns))
+        monotonic=lambda: next(ticks, time.monotonic()), monotonic_ns=time.monotonic_ns,
+        time_ns=time.time_ns, sleep=time.sleep))
     assert item.run() == 124
     assert item.provider().reason == 'monitor_deadline'
     assert launch[2][0].poll() is not None
@@ -492,7 +517,7 @@ def test_pmc_anchored_datagram_address_can_receive_reply_from_another_process(tm
         responder.stderr.close()
 
 
-def test_monitor_authenticates_itself_before_evidence_and_detached_sudo(tmp_path, launch, credentials):
+def test_monitor_authenticates_itself_before_evidence_and_measurement_sudo(tmp_path, launch, credentials):
     item = runtime(tmp_path)
     launch[0]['ptp'] = 'raise SystemExit(0)'
 
@@ -502,11 +527,11 @@ def test_monitor_authenticates_itself_before_evidence_and_detached_sudo(tmp_path
 
     credentials['inspect'] = before_authentication
     # An external shell ticket intentionally does not set this Python
-    # parent's authentication state. Detached sudo -n rejects it in launch.
+    # parent's timestamp context. Unauthenticated sudo -n rejects it in launch.
     assert item.run() == 0
     assert len(credentials['calls']) == 1
     assert launch[1][0][0][:2] == ['/usr/bin/sudo', '-n']
-    assert launch[1][0][1]['start_new_session'] is True
+    assert launch[1][0][1]['setpgroup'] == 0
     assert (item.output/'evidence.jsonl').exists()
 
 
@@ -527,3 +552,161 @@ def test_path_created_during_authentication_is_not_overwritten(tmp_path, launch,
     assert len(credentials['calls']) == 1
     assert list(item.output.iterdir()) == []
     assert launch[1] == []
+
+
+def test_measurement_preserves_authenticated_tty_but_owns_separate_process_group(tmp_path):
+    # The harness becomes a session leader, acquires a real controlling PTY,
+    # and substitutes only the sudo executable with harmless Python probes.
+    # Kernel SID/tty_nr values decide ticket compatibility, not a boolean.
+    script = r'''
+import fcntl, json, os, subprocess, sys, termios
+from pathlib import Path
+from g2_local import clock_monitor as module
+fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+original_popen, original_spawn = subprocess.Popen, os.posix_spawn
+probe = "import json,os; f=open('/proc/self/stat').read().rsplit(') ',1)[1].split(); print(json.dumps(dict(pid=os.getpid(),ppid=os.getppid(),pgid=os.getpgrp(),sid=os.getsid(0),tty=int(f[4]))),flush=True)"
+authenticated = None
+def validate(argv, **kwargs):
+    global authenticated
+    assert argv == ['/usr/bin/sudo','-v']
+    child = original_popen([sys.executable,'-c',probe], stdout=subprocess.PIPE, text=True)
+    authenticated = json.loads(child.communicate(timeout=1)[0])
+    assert child.returncode == 0 and authenticated['tty'] != 0
+    return subprocess.CompletedProcess(argv, 0)
+def measurement_probe():
+    return probe + "; " + "raise SystemExit(0 if (os.getsid(0),int(f[4]),os.getppid()) == " + repr((authenticated['sid'],authenticated['tty'],authenticated['ppid'])) + " else 1)"
+def popen(argv, **kwargs):
+    assert argv[0] == '/usr/bin/sudo'
+    return original_popen([sys.executable,'-c',measurement_probe()], **kwargs)
+def spawn(executable, argv, env, **kwargs):
+    assert executable == '/usr/bin/sudo'
+    return original_spawn(sys.executable,[sys.executable,'-c',measurement_probe()],env,**kwargs)
+module.subprocess.run = validate
+module.subprocess.Popen = popen
+module.os.posix_spawn = spawn
+item = module.MonitorRuntime(max_seconds=60, master='044052.fffe.000010', output=Path(sys.argv[1]))
+code = item.run()
+events = [json.loads(line) for line in (item.output/'evidence.jsonl').read_text().splitlines()]
+measured = [json.loads(event['raw']) for event in events if event['kind']=='ptp'][0]
+print(json.dumps(dict(code=code,authenticated=authenticated,measured=measured)),flush=True)
+'''
+    master_fd, slave_fd = pty.openpty()
+    try:
+        process = POPEN([PYTHON, '-c', script, str(tmp_path/'run')], stdin=slave_fd,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        start_new_session=True, text=True)
+        try:
+            stdout, stderr = process.communicate(timeout=3)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=1)
+        assert process.returncode == 0, stderr
+        evidence = json.loads(stdout.splitlines()[-1])
+        auth, measured = evidence['authenticated'], evidence['measured']
+        assert auth['tty'] != 0
+        assert evidence['code'] == 0, evidence
+        assert (measured['sid'], measured['tty'], measured['ppid']) == (auth['sid'], auth['tty'], auth['ppid'])
+        assert measured['pgid'] == measured['pid']
+        assert measured['pgid'] != auth['pgid']
+    finally:
+        os.close(slave_fd)
+        os.close(master_fd)
+
+
+def test_spawn_adapter_merges_output_and_reaps_nonzero_exit(monkeypatch):
+    original = os.posix_spawn
+
+    def harmless(executable, argv, env, **kwargs):
+        assert executable == '/usr/bin/sudo'
+        assert kwargs['setpgroup'] == 0
+        assert 'setsid' not in kwargs
+        return original(PYTHON, [PYTHON, '-c',
+            'import sys; print("out"); print("err",file=sys.stderr); raise SystemExit(7)'],
+            env, **kwargs)
+
+    monkeypatch.setattr(monitor().os, 'posix_spawn', harmless)
+    process = monitor()._spawn_measurement(['/usr/bin/sudo', '-n'])
+    try:
+        assert process.wait(timeout=1) == 7
+        assert process.poll() == 7
+        assert set(process.stdout.read().splitlines()) == {b'out', b'err'}
+        with pytest.raises(ChildProcessError):
+            os.waitpid(process.pid, os.WNOHANG)
+    finally:
+        if process.poll() is None:
+            os.kill(process.pid, signal.SIGKILL)
+            process.wait(timeout=1)
+        process.stdout.close()
+
+
+def test_spawn_adapter_timeout_preserves_child_for_owned_group_cleanup(monkeypatch):
+    original = os.posix_spawn
+    monkeypatch.setattr(monitor().os, 'posix_spawn', lambda executable, argv, env, **kwargs:
+        original(PYTHON, [PYTHON, '-c', 'import time; time.sleep(10)'], env, **kwargs))
+    process = monitor()._spawn_measurement(['/usr/bin/sudo', '-n'])
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            process.wait(timeout=.03)
+        assert process.poll() is None
+        assert os.getpgid(process.pid) == process.pid
+        os.killpg(process.pid, signal.SIGINT)
+        assert process.wait(timeout=1) == -signal.SIGINT
+        assert process.poll() == -signal.SIGINT
+    finally:
+        if process.poll() is None:
+            os.kill(process.pid, signal.SIGKILL)
+            process.wait(timeout=1)
+        process.stdout.close()
+
+
+def test_failed_spawn_closes_both_pipe_descriptors(monkeypatch):
+    original_pipe = os.pipe2
+    descriptors = []
+
+    def pipe(flags):
+        result = original_pipe(flags)
+        descriptors.extend(result)
+        return result
+
+    def failed(*args, **kwargs):
+        raise FileNotFoundError('measurement executable missing')
+
+    monkeypatch.setattr(monitor().os, 'pipe2', pipe)
+    monkeypatch.setattr(monitor().os, 'posix_spawn', failed)
+    with pytest.raises(FileNotFoundError):
+        monitor()._spawn_measurement(['/usr/bin/sudo', '-n'])
+    assert len(descriptors) == 2
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_pipe_wrapper_failure_closes_descriptors_before_spawn(monkeypatch):
+    original_pipe = os.pipe2
+    descriptors = []
+
+    def pipe(flags):
+        result = original_pipe(flags)
+        descriptors.extend(result)
+        return result
+
+    def failed(*args, **kwargs):
+        raise OSError('cannot allocate pipe reader')
+
+    monkeypatch.setattr(monitor().os, 'pipe2', pipe)
+    monkeypatch.setattr(monitor().os, 'fdopen', failed)
+    monkeypatch.setattr(monitor().os, 'posix_spawn',
+                        lambda *args, **kwargs: pytest.fail('Spawn must not run without its pipe'))
+    with pytest.raises(OSError, match='pipe reader'):
+        monitor()._spawn_measurement(['/usr/bin/sudo', '-n'])
+    try:
+        for descriptor in descriptors:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+    finally:
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass

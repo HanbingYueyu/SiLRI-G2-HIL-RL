@@ -88,6 +88,69 @@ def ptp_monitor_command(max_seconds, uds, uds_ro) -> list[str]:
             '--uds_ro_file_mode=0666', f'--uds_address={uds}', f'--uds_ro_address={uds_ro}']
 
 
+class _SpawnedProcess:
+    """Own one posix_spawn child and reap only its exact PID."""
+
+    def __init__(self, command, pid, stdout):
+        self.args = command
+        self.pid = pid
+        self.stdout = stdout
+        self.returncode = None
+
+    def poll(self):
+        if self.returncode is None:
+            pid, status = os.waitpid(self.pid, os.WNOHANG)
+            if pid:
+                self.returncode = os.waitstatus_to_exitcode(status)
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if timeout is None:
+            if self.returncode is None:
+                _, status = os.waitpid(self.pid, 0)
+                self.returncode = os.waitstatus_to_exitcode(status)
+            return self.returncode
+        deadline = time.monotonic()+timeout
+        while self.poll() is None:
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            time.sleep(min(.01, remaining))
+        return self.returncode
+
+
+def _spawn_measurement(command):
+    """Create an owned process group without losing the authenticated TTY.
+
+    Python 3.10 Popen lacks process_group. posix_spawn sets the group in libc,
+    avoiding a Python preexec_fn after the IPC thread has started. Unlike
+    setsid, setpgroup=0 retains the session/controlling TTY timestamp context.
+    """
+    read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+    stdout = None
+    try:
+        stdout = os.fdopen(read_fd, 'rb')
+        actions = [
+            (os.POSIX_SPAWN_OPEN, 0, '/dev/null', os.O_RDONLY, 0),
+            (os.POSIX_SPAWN_DUP2, write_fd, 1),
+            (os.POSIX_SPAWN_DUP2, write_fd, 2),
+            (os.POSIX_SPAWN_CLOSE, read_fd),
+            (os.POSIX_SPAWN_CLOSE, write_fd),
+        ]
+        pid = os.posix_spawn(command[0], command, os.environ,
+                             file_actions=actions, setpgroup=0,
+                             setsigdef=(signal.SIGPIPE, signal.SIGXFSZ))
+    except BaseException:
+        if stdout is None:
+            os.close(read_fd)
+        else:
+            stdout.close()
+        raise
+    finally:
+        os.close(write_fd)
+    return _SpawnedProcess(command, pid, stdout)
+
+
 class MonitorRuntime:
     """One finite measurement session, with no restart or motion capability."""
 
@@ -306,7 +369,7 @@ class MonitorRuntime:
 
     def _stop_children(self):
         # Child leaders remain unreaped until poll/wait, so their PID cannot be
-        # reused here. start_new_session makes the sudo PID our owned PGID.
+        # reused here. posix_spawn(setpgroup=0) makes sudo PID our owned PGID.
         if self.process is not None and self.process.poll() is None:
             try:
                 os.killpg(self.process.pid, signal.SIGINT)
@@ -342,9 +405,9 @@ class MonitorRuntime:
         code = 2
         try:
             self._preflight()
-            # Both sudo invocations have this ordinary Python process as their
-            # parent. A ticket obtained by an outer shell is not sufficient on
-            # all sudo policies once the measurement starts its own session.
+            # Validation and measurement share this parent AND its controlling
+            # TTY/session. A separate group must not turn a TTY ticket into a
+            # no-TTY PPID ticket by using setsid/start_new_session.
             # Inherit the terminal; never read, pipe, capture, or save passwords.
             subprocess.run(['/usr/bin/sudo', '-v'], check=True, shell=False,
                            stdin=None, stdout=None, stderr=None)
@@ -358,9 +421,7 @@ class MonitorRuntime:
             if self._apply_stop():
                 code = 0
                 return code
-            self.process = subprocess.Popen(self.command, stdin=subprocess.DEVNULL,
-                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                            start_new_session=True, shell=False)
+            self.process = _spawn_measurement(self.command)
             print(f'Clock snapshot socket: {self.socket_path}', flush=True)
             with selectors.DefaultSelector() as selector:
                 selector.register(self.process.stdout, selectors.EVENT_READ, 'ptp')

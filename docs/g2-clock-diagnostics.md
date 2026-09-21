@@ -16,8 +16,10 @@ bash run_g2_python.sh -m g2_local.clock_monitor \
 `--max-seconds` 必须显式提供，范围为 60–43200 秒，到期退出且不会自动重启。
 监控在完成路径安全预检后，由普通用户 Python 主进程执行一次固定的
 `/usr/bin/sudo -v`，需要密码时直接在当前终端输入。认证通过后才创建会话证据并
-启动固定的 `sudo -n` PTP 子会话；认证失败不创建输出、不启动 PTP。外层 shell
-预先 `sudo -v` 在本机票据策略下不足以代替这一步，无需额外执行。不要用 sudo
+启动固定的 `sudo -n` PTP 测量进程组；认证失败不创建输出、不启动 PTP。
+认证与测量保留同一控制终端和 TTY 会话，同时测量具有独立、已知的进程组。
+仅共享父 PID 不够：若测量另建会话并丢失控制终端，TTY 票据仍可能失配。
+外层 shell 预先 `sudo -v` 无需额外执行，也不能代替这一步。不要用 sudo
 启动 Python/GDK；程序不读取、转存或记录密码。
 每轮创建 `runtime/clock_monitor/<随机会话>/`，终端打印本轮 `clock.sock` 地址。
 也可以用 `--output` 指定全新的输出目录；已有目录或 socket 会在启动 sudo 前拒绝。
