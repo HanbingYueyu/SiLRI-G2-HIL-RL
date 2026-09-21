@@ -1,4 +1,5 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import asdict, FrozenInstanceError, replace
+import json
 
 import pytest
 
@@ -170,6 +171,113 @@ def test_late_delivery_and_explicit_ptp_fault_are_latched():
     faulty.feed_ptp('ptp4l[16.200]: port 1: SLAVE to LISTENING on FAULT_DETECTED',
                     16_200_000_000, wall(16_200_000_000))
     assert faulty.snapshot(16_200_000_000, wall(16_200_000_000)).reason == 'ptp_fault'
+
+
+@pytest.mark.parametrize('raw', [
+    properties().replace('currentUtcOffset 37', 'currentUtcOffset 37.5'),
+    properties().replace('ptpTimescale 1', 'ptpTimescale 1 trailing'),
+    properties() + 'leap61 0\n',
+    properties() + 'leap61 1\n',
+])
+def test_malformed_or_duplicate_properties_latch_and_cannot_recover(raw):
+    window = healthy_window()
+    window.feed_properties(raw, 16_200_000_000)
+
+    failed = window.snapshot(16_200_000_001, wall(16_200_000_001))
+    assert failed.healthy is False
+    assert failed.reason == 'properties_invalid'
+
+    window.feed_properties(properties(), 16_200_000_002)
+    recovered = window.snapshot(16_200_000_003, wall(16_200_000_003))
+    assert recovered.healthy is False
+    assert recovered.reason == 'properties_invalid'
+
+
+@pytest.mark.parametrize('raw', [
+    offset_line(18, '9' * 400),
+    'ptp4l[' + '9' * 400 + '.000]: master offset 55000160000 '
+    's0 freq +10000 path delay 40000',
+    'ptp4l[18.000]: master offset 55000160000 s0 freq +'
+    + '9' * 400 + ' path delay 40000',
+    offset_line(18, 55_000_160_000, '9' * 400),
+    'ptp4l[18.0000000001]: master offset 55000160000 '
+    's0 freq +10000 path delay 40000',
+])
+def test_out_of_range_or_inexact_report_numbers_latch_fail_closed(raw):
+    window = healthy_window()
+    window.feed_ptp(raw, 18_000_000_000, wall(18_000_000_000))
+
+    failed = window.snapshot(18_000_000_001, wall(18_000_000_001))
+    assert failed.healthy is False
+    assert failed.reason == 'ptp_report_invalid'
+    json.dumps(asdict(failed), allow_nan=False)
+
+    window.feed_ptp(offset_line(18, 55_000_160_000),
+                    18_000_000_002, wall(18_000_000_002))
+    recovered = window.snapshot(18_000_000_003, wall(18_000_000_003))
+    assert recovered.healthy is False
+    assert recovered.reason == 'ptp_report_invalid'
+
+
+@pytest.mark.parametrize('failure', [
+    'exception', 'nonfinite_float', 'nonfinite_time', 'out_of_range',
+])
+def test_fit_failures_and_nonfinite_outputs_latch_fail_closed(monkeypatch, failure):
+    import g2_local.live_clock as live_clock
+    from g2_local.clock_mapping import MAX_REPORT_INTEGER
+
+    window = healthy_window()
+    original_fit = live_clock.fit_mapping
+    if failure == 'exception':
+        def broken_fit(*_args, **_kwargs):
+            raise OverflowError('numeric conversion overflow')
+    elif failure == 'nonfinite_float':
+        def broken_fit(*args, **kwargs):
+            return replace(original_fit(*args, **kwargs),
+                           offset_at_last_ns=float('nan'))
+    elif failure == 'nonfinite_time':
+        def broken_fit(*args, **kwargs):
+            return replace(original_fit(*args, **kwargs),
+                           last_ns=float('inf'))
+    else:
+        def broken_fit(*args, **kwargs):
+            return replace(original_fit(*args, **kwargs),
+                           offset_at_last_ns=float(MAX_REPORT_INTEGER) * 2)
+    monkeypatch.setattr(live_clock, 'fit_mapping', broken_fit)
+
+    window.feed_ptp(offset_line(18, 55_000_160_000),
+                    18_000_000_000, wall(18_000_000_000))
+    failed = window.snapshot(18_000_000_001, wall(18_000_000_001))
+    assert failed.healthy is False
+    assert failed.reason == 'mapping_invalid'
+    json.dumps(asdict(failed), allow_nan=False)
+
+
+def test_mapping_expiry_cannot_exceed_signed_64_bit_report_range():
+    from g2_local.clock_mapping import MAX_REPORT_INTEGER
+    from g2_local.live_clock import ClockWindow
+
+    window = ClockWindow(MASTER, 'boot', 'run')
+    last_ns = MAX_REPORT_INTEGER - 1_000_000_000
+    first_ns = last_ns - 14_000_000_000
+    window.feed_ptp(
+        f'ptp4l[1.000]: selected best master clock {MASTER}',
+        first_ns - 1,
+        first_ns - 1,
+    )
+    window.feed_properties(properties(), first_ns)
+    for index in range(8):
+        mono_ns = first_ns + index * 2_000_000_000
+        seconds, fraction = divmod(mono_ns, 1_000_000_000)
+        raw = (f'ptp4l[{seconds}.{fraction:09d}]: master offset '
+               f'{55_000_000_000 + index * 20_000} '
+               's0 freq +10000 path delay 40000')
+        window.feed_ptp(raw, mono_ns, mono_ns)
+
+    snap = window.snapshot(last_ns, last_ns)
+    assert snap.healthy is False
+    assert snap.reason == 'mapping_invalid'
+    json.dumps(asdict(snap), allow_nan=False)
 
 
 def test_missing_or_expired_evidence_is_unhealthy_without_extending_the_lease():

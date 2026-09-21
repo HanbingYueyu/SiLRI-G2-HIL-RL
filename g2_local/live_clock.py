@@ -5,17 +5,22 @@ clocks, contact GDK, or authorize motion.
 """
 from collections import deque
 from dataclasses import dataclass
+import math
 import re
 import threading
 
 from .clock_mapping import (
+    MAX_DRIFT_PPM,
     MAX_PATH_DELAY_NS,
     MAX_PTP_DELIVERY_DELAY_NS,
     MAX_PTP_DELIVERY_LEAD_NS,
     MAX_PTP_GAP_NS,
+    MAX_REPORT_INTEGER,
+    MAX_RESIDUAL_NS,
     MAX_WALL_JUMP_NS,
     MIN_PTP_SAMPLES,
     MIN_PTP_SPAN_NS,
+    PTP_LEASE_NS,
     UTC_OFFSET_S,
     fit_mapping,
     integer,
@@ -98,6 +103,28 @@ class ClockWindow:
         elif abs(origin - self._wall_origin_ns) > MAX_WALL_JUMP_NS:
             self._latch('wall_clock_jump')
 
+    def _mapping_is_valid(self, mapping):
+        integer_fields = (mapping.start_ns, mapping.last_ns, mapping.expires_ns)
+        return (
+            all(type(value) is int for value in integer_fields) and
+            0 < mapping.start_ns <= mapping.last_ns and
+            mapping.expires_ns == mapping.last_ns + PTP_LEASE_NS and
+            mapping.expires_ns <= MAX_REPORT_INTEGER and
+            mapping.master == self.expected_master and
+            mapping.session == self.session_id and
+            mapping.utc_offset_s == UTC_OFFSET_S and
+            all(math.isfinite(value) for value in (
+                mapping.offset_at_last_ns,
+                mapping.drift_ppm,
+                mapping.residual_ns,
+                mapping.empirical_error_ns,
+            )) and
+            abs(mapping.offset_at_last_ns) <= MAX_REPORT_INTEGER and
+            abs(mapping.drift_ppm) <= MAX_DRIFT_PPM and
+            0 <= mapping.residual_ns <= MAX_RESIDUAL_NS and
+            0 <= mapping.empirical_error_ns <= MAX_REPORT_INTEGER
+        )
+
     def feed_ptp(self, line, received_mono_ns, wall_ns):
         if type(line) is not str:
             raise ValueError('PTP line must be text')
@@ -122,9 +149,13 @@ class ClockWindow:
                 self._latch('ptp_fault')
                 return
 
-            sample = parse_ptp(line, self._actual_master or None)
+            try:
+                sample = parse_ptp(line, self._actual_master or None)
+            except Exception:
+                self._latch('ptp_report_invalid')
+                return
             if 'master offset' in line and sample is None:
-                self._latch('malformed_ptp')
+                self._latch('ptp_report_invalid')
                 return
             if sample is None:
                 return
@@ -154,7 +185,9 @@ class ClockWindow:
                     mapping = fit_mapping(candidate, master=self.expected_master,
                                           utc_offset_s=UTC_OFFSET_S,
                                           session=self.session_id)
-                except (TypeError, ValueError):
+                    if not self._mapping_is_valid(mapping):
+                        raise ValueError('Invalid PTP mapping')
+                except Exception:
                     self._latch('mapping_invalid')
                     return
             self._samples.append(sample)
@@ -170,7 +203,7 @@ class ClockWindow:
                 return
             try:
                 properties = parse_time_properties(raw)
-            except ValueError:
+            except Exception:
                 self._latch('properties_invalid')
                 return
             if self._properties is not None and properties != self._properties:
