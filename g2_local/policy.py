@@ -5,7 +5,8 @@ from lerobot.policies.silri.modeling_silri import SiLRIPolicy
 from .contract import CAMERA_KEYS
 
 
-def create_policy(device='cpu'):
+def create_policy_config(device='cpu'):
+    """Describe the local policy without allocating model or CUDA resources."""
     features = {'observation.state': PolicyFeature(FeatureType.STATE, (7,))}
     features.update({f'observation.images.{key}': PolicyFeature(FeatureType.VISUAL, (3, 128, 128))
                      for key in CAMERA_KEYS})
@@ -16,4 +17,8 @@ def create_policy(device='cpu'):
                         freeze_vision_encoder=False, latent_dim=32)
     # This uses the upstream small CNN, trained from scratch. It is not the
     # pretrained ResNet recipe and makes no task-learning performance claim.
-    return SiLRIPolicy(config).to(device)
+    return config
+
+
+def create_policy(device='cpu'):
+    return SiLRIPolicy(create_policy_config(device)).to(device)
