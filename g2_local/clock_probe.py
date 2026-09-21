@@ -6,7 +6,6 @@ The diagnostic mapping is retrospective and is NOT loaded by the motion code.
 import argparse
 from dataclasses import asdict
 import json
-import math
 from pathlib import Path
 import re
 import subprocess
@@ -14,9 +13,10 @@ import sys
 import threading
 import time
 import uuid
-import numpy as np
 
 from .clock_mapping import associate, fit_mapping, parse_ptp, parse_time_properties
+from .gdk_backend import (measured_pose, query_tf_directions, source_timestamp_ns,
+                         transform_pose, wait_for_tf, tf_motion_evidence)
 
 
 def ptp_command(seconds, socket):
@@ -65,64 +65,22 @@ def check_properties(raw):
     return parse_time_properties(raw)
 
 
-def transform_pose(transform):
-    return [float(getattr(transform.translation, k)) for k in 'xyz'] + [
-        float(getattr(transform.rotation, k)) for k in 'xyzw']
-
-
-def query_tf_directions(tf):
-    queries = []
-    for target, source in (('base_link', 'arm_l_end_link'), ('arm_l_end_link', 'base_link')):
-        transform, stamp = tf.lookup_transform_latest(target, source, True)
-        queries.append(dict(target=target, source=source, timestamp_ns=int(stamp),
-                            pose=transform_pose(transform)))
-    return queries
-
-
-def wait_for_tf(tf, *, timeout_s=10., retry_s=.05):
-    """Boundedly wait for both TF directions before starting PTP evidence."""
-    if not 0 < timeout_s <= 30 or not 0 < retry_s <= timeout_s:
-        raise ValueError('Invalid TF preflight timeout')
-    deadline = time.monotonic()+timeout_s
-    last_error = None
-    while time.monotonic() < deadline:
-        try:
-            return query_tf_directions(tf)
-        except RuntimeError as exc:
-            last_error = exc
-            time.sleep(min(retry_s, max(0, deadline-time.monotonic())))
-    raise TimeoutError('TF cache did not expose both arm_l_end_link directions') from last_error
-
-
 def sample_gdk(reader, tf):
     start = time.monotonic_ns()
     start_wall = time.time_ns()
     stamps = {}
     for key, stream in reader.streams.items():
-        stamps[key] = int(reader.camera.get_latest_image(stream, 100.).timestamp_ns)
-    stamps['joint'] = int(reader.robot.get_joint_states()['timestamp'])
-    queries = query_tf_directions(tf)
-    # This installed SDK's reverse query matched motion status during the
-    # preliminary check. Preserve BOTH; reject disagreement, never auto-swap.
-    candidate = np.asarray(queries[1]['pose'])
-    measured = reader.controller.read_end_effector_pose('arm_l_end_link')
-    pose = np.asarray((*measured.position_m, *measured.orientation_xyzw), dtype=float)
-    if (not np.isfinite(candidate).all() or not np.isfinite(pose).all() or
-            abs(np.linalg.norm(candidate[3:])-1) > .01 or
-            abs(np.linalg.norm(pose[3:])-1) > .01):
-        raise ValueError('Invalid diagnostic TF/motion pose')
-    position_error = float(np.linalg.norm(candidate[:3]-pose[:3]))
-    dot = float(abs(np.dot(candidate[3:]/np.linalg.norm(candidate[3:]),
-                           pose[3:]/np.linalg.norm(pose[3:]))))
-    rotation_error = 2*math.acos(min(1., dot))
-    stamps['tf'] = queries[1]['timestamp_ns']
-    sdk_ns = int(reader.gdk.Clock.now_ns())
+        stamps[key] = source_timestamp_ns(reader.camera.get_latest_image(stream, 100.).timestamp_ns)
+    stamps['joint'] = source_timestamp_ns(reader.robot.get_joint_states()['timestamp'])
+    pose = measured_pose(reader.controller.read_end_effector_pose('arm_l_end_link'))
+    evidence = tf_motion_evidence(tf, pose)
+    stamps['tf'] = evidence['tf_queries'][1]['timestamp_ns']
+    sdk_ns = source_timestamp_ns(reader.gdk.Clock.now_ns())
     wall = time.time_ns()
     mono = time.monotonic_ns()
     return dict(kind='gdk', start_mono_ns=start, start_wall_ns=start_wall,
                 mono_ns=mono, wall_ns=wall, sdk_ns=sdk_ns, timestamps=stamps,
-                tf_queries=queries, motion_pose=pose.tolist(),
-                tf_position_error_m=position_error, tf_rotation_error_rad=rotation_error)
+                motion_pose=pose.tolist(), **evidence)
 
 
 def summarize(events, *, master, session):
@@ -183,8 +141,7 @@ def collect(seconds, output, master):
                     utc_correction_policy='explicit 37 s fallback; checked via pmc'))
         try:
             reader = GdkReader()
-            tf = reader.gdk.TF()
-            wait_for_tf(tf)
+            tf = reader.tf
             process = subprocess.Popen(ptp_command(seconds, socket), stdout=subprocess.PIPE,
                                        stderr=subprocess.STDOUT, text=True, bufsize=1)
             worker = threading.Thread(target=pump, daemon=True)

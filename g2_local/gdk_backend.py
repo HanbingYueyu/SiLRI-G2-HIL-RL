@@ -8,6 +8,74 @@ import numpy as np
 from .contract import vector
 
 
+def source_timestamp_ns(value):
+    if (isinstance(value, bool) or not isinstance(value, (int, np.integer)) or
+            value <= 0):
+        raise ValueError('Invalid source timestamp: positive integer nanoseconds required')
+    return int(value)
+
+
+def measured_pose(pose):
+    values = np.asarray((*pose.position_m, *pose.orientation_xyzw), dtype=float)
+    return validate_pose(values)
+
+
+def validate_pose(values):
+    values = np.asarray(values, dtype=float)
+    if (values.shape != (7,) or not np.isfinite(values).all() or
+            abs(np.linalg.norm(values[3:]) - 1.) > .01):
+        raise ValueError('Invalid TF/motion pose')
+    return values
+
+
+def transform_pose(transform):
+    values = [float(getattr(transform.translation, k)) for k in 'xyz'] + [
+        float(getattr(transform.rotation, k)) for k in 'xyzw']
+    return validate_pose(values).tolist()
+
+
+def query_tf_directions(tf):
+    queries = []
+    for target, source in (('base_link', 'arm_l_end_link'), ('arm_l_end_link', 'base_link')):
+        transform, stamp = tf.lookup_transform_latest(target, source, True)
+        queries.append(dict(target=target, source=source, timestamp_ns=source_timestamp_ns(stamp),
+                            pose=transform_pose(transform)))
+    return queries
+
+
+def wait_for_tf(tf, *, timeout_s=10., retry_s=.05):
+    """Boundedly retry until both directions are available in the same attempt."""
+    if not 0 < timeout_s <= 30 or not 0 < retry_s <= timeout_s:
+        raise ValueError('Invalid TF preflight timeout')
+    deadline = time.monotonic() + timeout_s
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            return query_tf_directions(tf)
+        except RuntimeError as exc:
+            last_error = exc
+            time.sleep(min(retry_s, max(0, deadline - time.monotonic())))
+    raise TimeoutError('TF cache did not expose both arm_l_end_link directions') from last_error
+
+
+def tf_motion_evidence(tf, pose):
+    """Use the installed SDK's verified direction; never swap to hide a mismatch.
+
+    Motion has no independent source timestamp. Its pose is only cross-checked
+    against TF; the freshness guard owns the caller-supplied error thresholds.
+    """
+    pose = validate_pose(pose)
+    queries = query_tf_directions(tf)
+    candidate = np.asarray(queries[1]['pose'])
+    position_error = math.dist(candidate[:3], pose[:3])
+    if not math.isfinite(position_error):
+        raise ValueError('Invalid TF/motion pose difference')
+    dot = float(abs(np.dot(candidate[3:] / np.linalg.norm(candidate[3:]),
+                           pose[3:] / np.linalg.norm(pose[3:]))))
+    return dict(tf_queries=queries, tf_position_error_m=position_error,
+                tf_rotation_error_rad=2 * math.acos(min(1., dot)))
+
+
 class GdkCommandPort:
     """Low-level diagnostic command boundary, NOT a complete Gym backend.
 
@@ -84,7 +152,15 @@ class GdkCommandPort:
 
 
 class GdkReader:
+    """Read-only observations with transactionally committed evidence.
+
+    last_info describes only the last *successful* observe(), or is empty
+    before the first success. A raised read never updates it or last_stamps;
+    callers must not treat retained evidence as a new observation.
+    """
     def __init__(self, adapter_root='/home/flyfuture/g2_hinge_assembly', timeout_s=2.):
+        if not 0 < timeout_s <= 30:
+            raise ValueError('Invalid reader timeout: must be in (0, 30] seconds')
         root = Path(adapter_root).resolve()
         if not (root / 'g2_adapter/control.py').is_file():
             raise FileNotFoundError(f'Missing validated G2 adapter: {root}')
@@ -97,6 +173,7 @@ class GdkReader:
         self.timeout_s = timeout_s
         self.closed = True
         self.last_stamps = {}
+        self.last_info = {}
         if gdk.gdk_init() != gdk.GDKRes.kSuccess:
             raise RuntimeError('GDK initialization failed')
         self.closed = False
@@ -106,6 +183,8 @@ class GdkReader:
             self.streams = {'left_wrist': gdk.CameraType.kHandLeftColor,
                             'right_aux': gdk.CameraType.kHandRightColor}
             self.camera = gdk.Camera(list(self.streams.values()))
+            self.tf = gdk.TF()
+            wait_for_tf(self.tf, timeout_s=timeout_s, retry_s=min(.005, timeout_s))
             time.sleep(1)
         except Exception:
             self.close()
@@ -114,20 +193,22 @@ class GdkReader:
     def observe(self):
         if self.closed:
             raise RuntimeError('Reader is closed')
-        start = time.monotonic()
+        start_mono = time.monotonic_ns()
+        start_wall = time.time_ns()
+        start_sdk = source_timestamp_ns(self.gdk.Clock.now_ns())
         self.controller.checked_arm_state()
-        pose = self.controller.read_end_effector_pose('arm_l_end_link')
+        pose = measured_pose(self.controller.read_end_effector_pose('arm_l_end_link'))
         state_received = time.monotonic_ns()
-        state = np.asarray((*pose.position_m, *pose.orientation_xyzw), dtype=np.float32)
-        if not np.isfinite(state).all() or abs(np.linalg.norm(state[3:]) - 1) > .01:
-            raise ValueError('Invalid measured end-link pose')
+        if np.any(np.abs(pose) > np.finfo(np.float32).max):
+            raise ValueError('Invalid measured pose for float32 observation')
+        state = pose.astype(np.float32)
         obs = {'state': state}
         stamps = {}
         for key, stream in self.streams.items():
             deadline = time.monotonic() + self.timeout_s
             while True:
                 frame = self.camera.get_latest_image(stream, 100.)
-                stamp = int(frame.timestamp_ns)
+                stamp = source_timestamp_ns(frame.timestamp_ns)
                 if stamp > self.last_stamps.get(key, 0):
                     break
                 if time.monotonic() >= deadline:
@@ -135,19 +216,30 @@ class GdkReader:
                 time.sleep(.005)
             obs[key] = self.decode(frame, self.gdk)
             stamps[key] = stamp
+        sources = dict(stamps, joint=source_timestamp_ns(self.robot.get_joint_states()['timestamp']))
+        evidence = tf_motion_evidence(self.tf, pose)
+        sources['tf'] = evidence['tf_queries'][1]['timestamp_ns']
+        status = self.controller.motion_status_summary()
+        end_sdk = source_timestamp_ns(self.gdk.Clock.now_ns())
+        end_wall = time.time_ns()
+        end_mono = time.monotonic_ns()
+        info = dict(evidence, camera_timestamp_ns=dict(stamps), source_timestamp_ns=sources,
+                    read_start_monotonic_ns=start_mono, read_start_wall_ns=start_wall,
+                    read_start_sdk_clock_ns=start_sdk,
+                    read_end_monotonic_ns=end_mono, read_end_wall_ns=end_wall,
+                    read_end_sdk_clock_ns=end_sdk, sdk_clock_ns=end_sdk,
+                    motion_pose=pose.tolist(), state_received_monotonic_ns=state_received,
+                    received_monotonic_ns=end_mono, read_duration_s=(end_mono - start_mono) / 1e9,
+                    motion_status=status, backend='gdk_read_only')
         self.last_stamps = stamps
-        self.last_info = {'camera_timestamp_ns': stamps,
-                          'state_received_monotonic_ns': state_received,
-                          'received_monotonic_ns': time.monotonic_ns(),
-                          'read_duration_s': time.monotonic() - start,
-                          'motion_status': self.controller.motion_status_summary(),
-                          'backend': 'gdk_read_only'}
+        self.last_info = info
         return obs
 
     def close(self):
         if not self.closed:
             self.closed = True
             self.camera = None
+            self.tf = None
             self.controller = None
             self.robot = None
             self.gdk.gdk_release()
