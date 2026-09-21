@@ -174,10 +174,12 @@ class GdkReader:
         self.closed = True
         self.last_stamps = {}
         self.last_info = {}
-        if gdk.gdk_init() != gdk.GDKRes.kSuccess:
-            raise RuntimeError('GDK initialization failed')
-        self.closed = False
         try:
+            # Own the initialization attempt: even an interrupted/failed SDK
+            # init may have allocated resources before control returns here.
+            self.closed = False
+            if gdk.gdk_init() != gdk.GDKRes.kSuccess:
+                raise RuntimeError('GDK initialization failed')
             self.robot = gdk.Robot()
             self.controller = G2Controller(gdk, self.robot, allow_motion=False)
             self.streams = {'left_wrist': gdk.CameraType.kHandLeftColor,
@@ -186,8 +188,13 @@ class GdkReader:
             self.tf = gdk.TF()
             wait_for_tf(self.tf, timeout_s=timeout_s, retry_s=min(.005, timeout_s))
             time.sleep(1)
-        except Exception:
-            self.close()
+        except BaseException:
+            try:
+                self.close()
+            except BaseException as error:
+                # Never let a cleanup interrupt masquerade as a clean Ctrl+C
+                # in the caller, which has not yet received this reader.
+                raise RuntimeError(f'GDK initialization cleanup failed: {type(error).__name__}: {error}') from error
             raise
 
     def observe(self):

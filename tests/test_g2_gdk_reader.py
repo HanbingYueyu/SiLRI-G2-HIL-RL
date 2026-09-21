@@ -269,3 +269,76 @@ def test_reader_rejects_invalid_timeout_before_gdk_initialization(rig, timeout):
     with pytest.raises(ValueError, match='timeout'):
         GdkReader(timeout_s=timeout)
     assert not initialized
+
+
+@pytest.mark.parametrize('stage', ['gdk_init', 'Robot', 'controller', 'Camera', 'TF', 'wait', 'sleep'])
+@pytest.mark.parametrize('error_type', [KeyboardInterrupt, SystemExit, RuntimeError])
+def test_any_initialization_failure_releases_attempted_sdk_once(rig, monkeypatch, stage, error_type):
+    def fail(*args, **kwargs):
+        raise error_type('initialization interrupted')
+    if stage in ('gdk_init', 'Robot', 'Camera', 'TF'):
+        monkeypatch.setattr(sys.modules['agibot_gdk'], stage, fail)
+    elif stage == 'controller':
+        monkeypatch.setattr(sys.modules['g2_adapter.control'], 'G2Controller', fail)
+    elif stage == 'wait':
+        monkeypatch.setattr('g2_local.gdk_backend.wait_for_tf', fail)
+    else:
+        monkeypatch.setattr('g2_local.gdk_backend.time.sleep', fail)
+    with pytest.raises(error_type, match='initialization interrupted'):
+        rig.make()
+    assert rig.released == 1
+
+
+def test_unsuccessful_sdk_initialization_releases_partial_resources(rig, monkeypatch):
+    monkeypatch.setattr(sys.modules['agibot_gdk'], 'gdk_init', lambda: 1)
+    with pytest.raises(RuntimeError, match='GDK initialization failed'):
+        rig.make()
+    assert rig.released == 1
+
+
+@pytest.mark.parametrize('cleanup_error', [None, OSError, KeyboardInterrupt, SystemExit])
+def test_audit_cli_real_reader_initialization_interrupt_only_clean_when_sdk_released(
+        rig, monkeypatch, tmp_path, cleanup_error):
+    from g2_local import freshness_audit as audit
+    from test_g2_freshness_audit import Rig as AuditRig
+    audit_rig = AuditRig()
+    monkeypatch.setattr(audit, 'SnapshotClient', lambda *args, **kwargs: audit_rig.client())
+    monkeypatch.setattr(audit, '_reader', rig.make)
+    monkeypatch.setattr(audit.time, 'monotonic_ns', lambda: audit_rig.now)
+    def interrupt(_):
+        raise KeyboardInterrupt('during reader warmup')
+    monkeypatch.setattr('g2_local.gdk_backend.time.sleep', interrupt)
+    if cleanup_error is not None:
+        def release():
+            rig.released += 1
+            raise cleanup_error('SDK release failed')
+        monkeypatch.setattr(sys.modules['agibot_gdk'], 'gdk_release', release)
+    output = tmp_path/'audit'
+    result = audit.main(['--socket', 'offline.sock', '--seconds', '30', '--output', str(output)])
+    assert rig.released == 1
+    assert audit_rig.closed == ['client']
+    report = json.loads((output/'summary.json').read_text())
+    if cleanup_error is None:
+        assert result == 130 and report['status'] == 'interrupted'
+    else:
+        assert result == 1 and report['status'] == 'failed'
+        assert 'cleanup failed' in report['reason']
+    assert report['motion_authorized'] is False
+
+
+@pytest.mark.parametrize('error_type', [SystemExit, GeneratorExit])
+def test_audit_cli_other_initialization_baseexceptions_are_failed_not_completed(
+        rig, monkeypatch, tmp_path, error_type):
+    from g2_local import freshness_audit as audit
+    from test_g2_freshness_audit import Rig as AuditRig
+    audit_rig = AuditRig()
+    monkeypatch.setattr(audit, 'SnapshotClient', lambda *args, **kwargs: audit_rig.client())
+    monkeypatch.setattr(audit, '_reader', rig.make)
+    monkeypatch.setattr(audit.time, 'monotonic_ns', lambda: audit_rig.now)
+    def fail():
+        raise error_type(0)
+    monkeypatch.setattr(sys.modules['agibot_gdk'], 'Robot', fail)
+    output = tmp_path/'audit'
+    assert audit.main(['--socket', 'offline.sock', '--seconds', '30', '--output', str(output)]) == 1
+    assert rig.released == 1 and audit_rig.closed == ['client']
+    assert json.loads((output/'summary.json').read_text())['status'] == 'failed'

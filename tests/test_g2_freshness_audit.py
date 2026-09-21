@@ -3,6 +3,7 @@ import ast
 from dataclasses import replace
 import importlib
 import json
+import os
 from pathlib import Path
 import stat
 
@@ -316,3 +317,69 @@ def test_audit_import_and_injected_run_never_load_motion_or_vendor_sdk(audit, tm
     monkeypatch.setattr(builtins, '__import__', guarded)
     importlib.reload(audit)
     assert Rig().run(audit, tmp_path/'audit')['motion_authorized'] is False
+
+
+@pytest.mark.parametrize('failure_stage', ['final_flush', 'close', 'summary_write'])
+def test_evidence_finalization_precedes_summary_and_failures_never_leak_directory_fd(
+        audit, tmp_path, monkeypatch, failure_stage):
+    rig = Rig()
+    original_fdopen = audit.os.fdopen
+    original_directory = audit._create_session_directory
+    opened = {}
+    def directory(path):
+        opened['directory_fd'] = original_directory(path)
+        return opened['directory_fd']
+    class Evidence:
+        def __init__(self, stream):
+            self.stream = stream
+        def write(self, data):
+            return self.stream.write(data)
+        def flush(self):
+            if failure_stage == 'final_flush' and rig.closed:
+                raise OSError('final evidence flush failed')
+            return self.stream.flush()
+        def close(self):
+            self.stream.close()
+            if failure_stage == 'close':
+                raise OSError('evidence close failed')
+    class Summary:
+        def __init__(self, stream):
+            self.stream = stream
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            self.stream.close()
+        def write(self, data):
+            raise OSError('summary write failed')
+    def fdopen(fd, mode):
+        stream = original_fdopen(fd, mode)
+        if mode == 'wb':
+            opened['evidence_stream'] = stream
+            return Evidence(stream)
+        opened['evidence_closed_before_summary'] = opened['evidence_stream'].closed
+        return Summary(stream) if failure_stage == 'summary_write' else stream
+    monkeypatch.setattr(audit, '_create_session_directory', directory)
+    monkeypatch.setattr(audit.os, 'fdopen', fdopen)
+    monkeypatch.setattr(audit, 'SnapshotClient', lambda *args, **kwargs: rig.client())
+    monkeypatch.setattr(audit, '_reader', rig.reader)
+    monkeypatch.setattr(audit.time, 'monotonic_ns', lambda: rig.now)
+    monkeypatch.setattr(audit.time, 'sleep', rig.sleep)
+    output = tmp_path/'audit'
+    result = audit.main(['--socket', 'offline.sock', '--seconds', '30', '--output', str(output)])
+    try:
+        assert result == 1
+        assert rig.closed == ['reader', 'client']
+        assert opened['evidence_stream'].closed
+        assert opened['evidence_closed_before_summary'] is True
+        with pytest.raises(OSError):
+            os.fstat(opened['directory_fd'])
+        if failure_stage != 'summary_write':
+            summary = json.loads((output/'summary.json').read_text())
+            assert summary['status'] == 'failed'
+            assert 'evidence' in summary['reason']
+    finally:
+        # Keep RED runs from leaking the descriptor whose missing cleanup is tested.
+        try:
+            os.close(opened['directory_fd'])
+        except OSError:
+            pass

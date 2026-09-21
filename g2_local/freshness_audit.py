@@ -200,8 +200,11 @@ def run_audit(*, output, duration_s, socket_path=None, inference_delay_s=0.,
                 sleep_fn(min(_SAMPLE_PERIOD_S, remaining))
     except KeyboardInterrupt:
         status, reason = 'interrupted', 'operator_interrupt'
-    except Exception as error:
-        status, reason, failure = 'failed', f'{type(error).__name__}: {error}', error
+    except BaseException as error:
+        status, reason = 'failed', f'{type(error).__name__}: {error}'
+        # Non-interrupt BaseExceptions during construction must not publish a
+        # completed summary or exit successfully (e.g. SystemExit(0)).
+        failure = error if isinstance(error, Exception) else RuntimeError(reason)
         if stream is not None:
             try:
                 write_record(dict(event='rejected', reason=reason[:1024], **raw))
@@ -209,15 +212,26 @@ def run_audit(*, output, duration_s, socket_path=None, inference_delay_s=0.,
                 # Invalid/non-finite or oversized input cannot enter JSONL.
                 pass
     finally:
-        for resource in (reader, client):
-            if resource is not None:
-                try:
-                    resource.close()
-                except (Exception, KeyboardInterrupt) as error:
-                    status, reason = 'failed', f'cleanup_failed: {type(error).__name__}: {error}'
-                    if failure is None:
-                        failure = RuntimeError(reason)
         try:
+            for resource in (reader, client):
+                if resource is not None:
+                    try:
+                        resource.close()
+                    except BaseException as error:
+                        status, reason = 'failed', f'cleanup_failed: {type(error).__name__}: {error}'
+                        if failure is None:
+                            failure = RuntimeError(reason)
+            if stream is not None:
+                # Evidence must be finalized before publishing completion.
+                # Always attempt close even when the final flush fails.
+                for operation in ('flush', 'close'):
+                    try:
+                        getattr(stream, operation)()
+                    except BaseException as error:
+                        status = 'failed'
+                        reason = f'evidence_{operation}_failed: {type(error).__name__}: {error}'
+                        if failure is None:
+                            failure = RuntimeError(reason)
             result = summarize_audit(rows)
             result.update(status=status, reason=reason, duration_s=duration_s,
                           inference_delay_s=inference_delay_s)
@@ -227,8 +241,6 @@ def run_audit(*, output, duration_s, socket_path=None, inference_delay_s=0.,
                 json.dump(result, summary, allow_nan=False, indent=2)
                 summary.write('\n')
         finally:
-            if stream is not None:
-                stream.close()
             os.close(directory_fd)
     if failure is not None:
         raise failure
