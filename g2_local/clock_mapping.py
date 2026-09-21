@@ -13,6 +13,20 @@ import numpy as np
 PTP_LINE = re.compile(r'ptp4l\[(\d+\.\d+)\]: master offset\s+(-?\d+) '
                       r's\d+ freq\s+[+-]?\d+ path delay\s+(-?\d+)')
 SOURCES = ('left_wrist', 'right_aux', 'joint', 'tf')
+UTC_OFFSET_S = 37
+MIN_PTP_SAMPLES = 8
+MIN_PTP_SPAN_NS = 10_000_000_000
+MAX_PTP_GAP_NS = 4_000_000_000
+MAX_PATH_DELAY_NS = 1_000_000
+MAX_DRIFT_PPM = 100
+MAX_RESIDUAL_NS = 1_000_000
+MAX_PTP_DELIVERY_LEAD_NS = 1_000_000
+MAX_PTP_DELIVERY_DELAY_NS = 500_000_000
+MAX_WALL_JUMP_NS = 1_000_000
+PTP_LEASE_NS = 2_500_000_000
+MAPPING_BASE_ERROR_NS = 2_000_000
+TIME_PROPERTY_NAMES = ('currentUtcOffset', 'currentUtcOffsetValid',
+                       'leap61', 'leap59', 'ptpTimescale')
 
 
 def parse_ptp(line, master):
@@ -21,6 +35,24 @@ def parse_ptp(line, master):
         return None
     return dict(mono_ns=int(Decimal(match[1])*10**9),
                 offset_ns=int(match[2]), delay_ns=int(match[3]), master=master)
+
+
+def parse_time_properties(raw):
+    """Parse the live/diagnostic TIME_PROPERTIES_DATA_SET contract."""
+    if type(raw) is not str:
+        raise ValueError('PTP time properties must be text')
+    fields = {}
+    for name in TIME_PROPERTY_NAMES:
+        match = re.search(r'\b'+name+r'\s+(-?\d+)\b', raw)
+        if not match:
+            raise ValueError('Incomplete PTP TIME_PROPERTIES_DATA_SET')
+        fields[name] = int(match[1])
+    if (fields['currentUtcOffset'] != UTC_OFFSET_S or
+            fields['ptpTimescale'] != 1 or
+            fields['leap61'] != 0 or fields['leap59'] != 0 or
+            fields['currentUtcOffsetValid'] not in (0, 1)):
+        raise ValueError('PTP time scale/correction changed or leap announced')
+    return fields
 
 
 def integer(value):
@@ -60,7 +92,7 @@ class DiagnosticMapping:
 def fit_mapping(samples, *, master, utc_offset_s, session):
     if not session or not master or type(utc_offset_s) is not int or not 0 <= utc_offset_s <= 100:
         raise ValueError('Explicit session, master and UTC correction required')
-    if len(samples) < 8:
+    if len(samples) < MIN_PTP_SAMPLES:
         raise ValueError('Need at least eight PTP measurements')
     times, offsets, delays = [], [], []
     for s in samples:
@@ -69,22 +101,23 @@ def fit_mapping(samples, *, master, utc_offset_s, session):
         times.append(integer(s['mono_ns']))
         offsets.append(integer(s['offset_ns']))
         delays.append(integer(s['delay_ns']))
-    if any(not 0 < b-a <= 4_000_000_000 for a, b in zip(times, times[1:])):
+    if any(not 0 < b-a <= MAX_PTP_GAP_NS for a, b in zip(times, times[1:])):
         raise ValueError('PTP gap, duplicate, or reversed time')
-    if times[-1]-times[0] < 10_000_000_000 or times[0] <= 0:
+    if times[-1]-times[0] < MIN_PTP_SPAN_NS or times[0] <= 0:
         raise ValueError('Insufficient PTP time span')
-    if min(delays) < 0 or max(delays) > 1_000_000:
+    if min(delays) < 0 or max(delays) > MAX_PATH_DELAY_NS:
         raise ValueError('Invalid or excessive path delay')
     x = np.asarray([(t-times[-1])/1e9 for t in times])
     y = np.asarray([v-offsets[-1] for v in offsets], dtype=float)
     slope, intercept = np.polyfit(x, y, 1)
     residual = float(np.max(np.abs(y-(slope*x+intercept))))
-    if not math.isfinite(slope) or abs(slope/1000) > 100 or residual > 1_000_000:
+    if (not math.isfinite(slope) or abs(slope/1000) > MAX_DRIFT_PPM or
+            residual > MAX_RESIDUAL_NS):
         raise ValueError('PTP jump, excessive drift or residual')
     return DiagnosticMapping(session, master, utc_offset_s, times[0], times[-1],
-                             times[-1]+2_500_000_000, float(offsets[-1]+intercept),
+                             times[-1]+PTP_LEASE_NS, float(offsets[-1]+intercept),
                              float(slope/1000), residual,
-                             2_000_000 + residual + max(delays))
+                             MAPPING_BASE_ERROR_NS + residual + max(delays))
 
 
 def associate(mapping, rows):
