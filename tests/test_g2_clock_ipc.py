@@ -128,6 +128,44 @@ def raw_reply_server(path, reply, *, delay_s=0):
         assert not thread.is_alive()
 
 
+@contextmanager
+def dripping_reply_server(path, reply, *, interval_s):
+    path.parent.mkdir(mode=0o700)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    listener.listen(1)
+
+    def serve():
+        try:
+            connection, _ = listener.accept()
+            with connection:
+                connection.recv(4096)
+                for byte in reply:
+                    connection.sendall(bytes([byte]))
+                    time.sleep(interval_s)
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            listener.close()
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    try:
+        yield path
+    finally:
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+
+
+def receive_all(connection):
+    chunks = []
+    while True:
+        chunk = connection.recv(4096)
+        if not chunk:
+            return b''.join(chunks)
+        chunks.append(chunk)
+
+
 def encoded_snapshot(snapshot):
     return json.dumps(asdict(snapshot), separators=(',', ':')).encode() + b'\n'
 
@@ -227,6 +265,125 @@ def test_client_rejects_oversize_response_and_timeout(tmp_path):
         client = SnapshotClient(path, timeout_s=.01, expected_master=MASTER)
         with pytest.raises(TimeoutError):
             client.read()
+
+
+def test_client_timeout_is_total_across_slow_response_fragments(tmp_path):
+    path = tmp_path / 'drip' / 'clock.sock'
+    with dripping_reply_server(path, b' ' * 30, interval_s=.01):
+        client = SnapshotClient(path, timeout_s=.04, expected_master=MASTER)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            client.read()
+        assert time.monotonic() - started < .15
+
+
+def test_server_timeout_is_total_across_slow_request_fragments(tmp_path):
+    provider_calls = 0
+
+    def provider():
+        nonlocal provider_calls
+        provider_calls += 1
+        return healthy_snapshot()
+
+    server = SnapshotServer(tmp_path / 'clock.sock', provider)
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(1.5)
+    connection.connect(str(server.path))
+
+    def drip_request():
+        try:
+            for _ in range(30):
+                connection.sendall(b' ')
+                time.sleep(.03)
+            connection.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+    sender = threading.Thread(target=drip_request)
+    sender.start()
+    started = time.monotonic()
+    try:
+        reply = receive_all(connection)
+        elapsed = time.monotonic() - started
+    finally:
+        sender.join(timeout=1)
+        connection.close()
+        server.close()
+
+    assert json.loads(reply) == {
+        'schema': 1,
+        'ok': False,
+        'error': 'invalid_request',
+    }
+    assert elapsed < .6
+    assert provider_calls == 0
+
+
+@pytest.mark.parametrize('trailing', [b'{}\n', b'x' * 257])
+def test_fragmented_trailing_request_data_never_reaches_provider(tmp_path, trailing):
+    provider_calls = 0
+
+    def provider():
+        nonlocal provider_calls
+        provider_calls += 1
+        return healthy_snapshot()
+
+    server = SnapshotServer(tmp_path / 'clock.sock', provider)
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(.5)
+    connection.connect(str(server.path))
+    try:
+        connection.sendall(b'{"op":"snapshot","schema":1}\n')
+        time.sleep(.03)
+        try:
+            connection.sendall(trailing)
+            connection.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        reply = receive_all(connection)
+    finally:
+        connection.close()
+        server.close()
+
+    assert json.loads(reply) == {
+        'schema': 1,
+        'ok': False,
+        'error': 'invalid_request',
+    }
+    assert provider_calls == 0
+
+
+def test_close_interrupts_active_request_and_joins_server_thread(tmp_path):
+    server = SnapshotServer(tmp_path / 'clock.sock', healthy_snapshot)
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.connect(str(server.path))
+    first_fragment_sent = threading.Event()
+    stop = threading.Event()
+
+    def drip_request():
+        while not stop.is_set():
+            try:
+                connection.sendall(b' ')
+                first_fragment_sent.set()
+            except OSError:
+                return
+            time.sleep(.03)
+
+    sender = threading.Thread(target=drip_request)
+    sender.start()
+    assert first_fragment_sent.wait(.5)
+    time.sleep(.03)
+    started = time.monotonic()
+    try:
+        server.close()
+        elapsed = time.monotonic() - started
+        assert elapsed < .5
+        assert not server._thread.is_alive()
+    finally:
+        stop.set()
+        connection.close()
+        sender.join(timeout=1)
+        server._thread.join(timeout=1)
 
 
 def test_socket_and_parent_are_current_user_only(tmp_path, server_factory):

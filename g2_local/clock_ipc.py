@@ -60,6 +60,39 @@ def _encode_json(value):
     return (json.dumps(value, separators=(',', ':'), allow_nan=False) + '\n').encode()
 
 
+def _remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError('Snapshot IPC deadline expired')
+    return remaining
+
+
+def _receive_bounded(connection, limit, deadline):
+    message = bytearray()
+    over_limit = False
+    while True:
+        connection.settimeout(_remaining(deadline))
+        chunk = connection.recv(1024)
+        if not chunk:
+            if over_limit:
+                raise ValueError('Snapshot IPC message exceeds its limit')
+            return bytes(message)
+        if over_limit or len(message) + len(chunk) > limit:
+            over_limit = True
+        else:
+            message.extend(chunk)
+
+
+def _send_bounded(connection, message, deadline):
+    remaining = memoryview(message)
+    while remaining:
+        connection.settimeout(_remaining(deadline))
+        sent = connection.send(remaining)
+        if sent == 0:
+            raise ConnectionError('Snapshot IPC connection closed during send')
+        remaining = remaining[sent:]
+
+
 def _read_boot_id():
     try:
         boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
@@ -183,6 +216,10 @@ class SnapshotServer:
         self._provider = provider
         self._request_limit = request_limit
         self._closed = threading.Event()
+        self._close_lock = threading.Lock()
+        self._active_lock = threading.Lock()
+        self._active_connection = None
+        self._close_complete = False
         self._socket_identity = None
         self._listener = None
         self._thread = None
@@ -222,18 +259,12 @@ class SnapshotServer:
             pass
 
     def _read_request(self, connection):
-        message = bytearray()
-        while len(message) <= self._request_limit:
-            chunk = connection.recv(min(256, self._request_limit + 1 - len(message)))
-            if not chunk:
-                break
-            message.extend(chunk)
-            if b'\n' in chunk:
-                break
+        deadline = time.monotonic() + _CONNECTION_TIMEOUT_S
+        message = _receive_bounded(connection, self._request_limit, deadline)
         if (len(message) > self._request_limit or not message.endswith(b'\n') or
                 message.count(b'\n') != 1):
             raise ValueError('Invalid request framing')
-        request = _decode_json(bytes(message[:-1]))
+        request = _decode_json(message[:-1])
         if (type(request) is not dict or set(request) != {'op', 'schema'} or
                 type(request['op']) is not str or request['op'] != 'snapshot' or
                 type(request['schema']) is not int or request['schema'] != 1):
@@ -247,10 +278,10 @@ class SnapshotServer:
                 'ok': False,
                 'error': 'snapshot_unavailable',
             })
-        connection.sendall(encoded)
+        deadline = time.monotonic() + _CONNECTION_TIMEOUT_S
+        _send_bounded(connection, encoded, deadline)
 
     def _handle(self, connection):
-        connection.settimeout(_CONNECTION_TIMEOUT_S)
         try:
             self._read_request(connection)
         except (OSError, ValueError):
@@ -287,20 +318,42 @@ class SnapshotServer:
                 continue
             except OSError:
                 break
-            with connection:
-                self._handle(connection)
+            with self._active_lock:
+                if self._closed.is_set():
+                    connection.close()
+                    break
+                self._active_connection = connection
+            try:
+                with connection:
+                    self._handle(connection)
+            finally:
+                with self._active_lock:
+                    if self._active_connection is connection:
+                        self._active_connection = None
 
     def close(self):
-        if self._closed.is_set():
-            return
-        self._closed.set()
-        listener = self._listener
-        if listener is not None:
-            listener.close()
-        thread = self._thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=1)
-        self._unlink_owned_socket()
+        with self._close_lock:
+            if self._close_complete:
+                return
+            thread = self._thread
+            if thread is threading.current_thread():
+                raise RuntimeError('Snapshot server cannot close from its serving thread')
+            self._closed.set()
+            listener = self._listener
+            if listener is not None:
+                listener.close()
+            with self._active_lock:
+                connection = self._active_connection
+                if connection is not None:
+                    try:
+                        connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    connection.close()
+            if thread is not None:
+                thread.join()
+            self._unlink_owned_socket()
+            self._close_complete = True
 
 
 class SnapshotClient:
@@ -320,28 +373,24 @@ class SnapshotClient:
         self._closed = False
         self._lock = threading.Lock()
 
-    def _receive(self, connection):
-        response = bytearray()
-        while len(response) <= _RESPONSE_LIMIT:
-            chunk = connection.recv(min(1024, _RESPONSE_LIMIT + 1 - len(response)))
-            if not chunk:
-                break
-            response.extend(chunk)
+    def _receive(self, connection, deadline):
+        response = _receive_bounded(connection, _RESPONSE_LIMIT, deadline)
         if (len(response) > _RESPONSE_LIMIT or not response.endswith(b'\n') or
                 response.count(b'\n') != 1):
             raise ValueError('Invalid snapshot response framing')
-        return _decode_json(bytes(response[:-1]))
+        return _decode_json(response[:-1])
 
     def read(self) -> ClockSnapshot:
         with self._lock:
             if self._closed:
                 raise RuntimeError('Snapshot client is closed')
+            deadline = time.monotonic() + self._timeout_s
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(self._timeout_s)
+                connection.settimeout(_remaining(deadline))
                 connection.connect(str(self.path))
-                connection.sendall(_encode_json(_REQUEST))
+                _send_bounded(connection, _encode_json(_REQUEST), deadline)
                 connection.shutdown(socket.SHUT_WR)
-                payload = self._receive(connection)
+                payload = self._receive(connection, deadline)
             received_mono_ns = time.monotonic_ns()
             if type(payload) is dict and payload.get('ok') is False:
                 raise ValueError('Snapshot server rejected the request')
