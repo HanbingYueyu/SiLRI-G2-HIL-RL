@@ -51,6 +51,82 @@ ps -eo pid,ppid,pgid,user,comm,args | rg 'ptp4l|phc2sys|clock_monitor'
 
 现场停止/硬件急停验收与任务阈值批准仍是独立步骤；此监控不构成训练或运动授权。
 
+## 两终端只读负载审计（软件已实现，现场尚未执行）
+
+操作员已报告硬件急停可访问；受控急停、停止距离和固件命令过期行为仍未验收。
+本流程始终保持真实 `allow_motion=False`，不创建命令端口或运动后端，不发 hold、
+运动、夹爪或切模式指令。审计成功也不能启动真机 Gym step 或训练。
+
+终端 A：确认旧测量已退出后，启动独立监控。下面短路径是本次新会话示例，
+若已存在必须换一个新名字，不能删除旧证据后复用；不同时运行其他 PTP/校时服务。
+
+```bash
+cd /home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL
+sudo -v && bash run_g2_python.sh -m g2_local.clock_monitor \
+  --master 044052.fffe.000010 --max-seconds 120 \
+  --output /tmp/g2-clock-audit-20260921-01
+```
+
+监控预热需至少 8 个有效样本且跨度至少 10 秒，并取得健康属性；留出约 15 秒，
+以健康快照为准。审计遇到尚未预热、过期或断开的监控会失败退出，不自动重试。
+若需要较长审计，必须提前显式选择足以覆盖预热、审计和收尾的监控期限；
+监控最长 43200 秒，审计最长 1800 秒。不要通过重启监控延续同一审计。
+
+终端 B：用 A 本轮打印的 socket 路径运行以下命令；不需要 sudo。
+
+```bash
+cd /home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL
+bash run_g2_python.sh -m g2_local.freshness_audit \
+  --socket /tmp/g2-clock-audit-20260921-01/clock.sock \
+  --seconds 60 --inference-delay-s 0.02
+```
+
+`--seconds` 必须显式提供整数 30–1800；`--inference-delay-s` 必须是有限非负秒数，
+默认 0。此参数是在读取双相机/GDK 后等待，再读取映射和计算年龄，用于模拟
+推理造成的延迟；它不执行真实 Actor/GPU 推理，不能替代真实推理负载验收。
+接近截止时间时等待会缩短，实际等待时长单独记录。两次采样间额外等待最多
+50 ms，不保证固定采样频率。一次最多 36000 个成功样本、单行 16 KiB、
+JSONL 总量 64 MiB；任何上限或证据写入失败均终止并标记失败。
+
+每轮创建 `runtime/freshness_audit/<随机会话>/`；可用 `--output` 指定全新目录。
+已有输出在创建 reader/client 之前拒绝；目录 0700，证据文件 0600，拒绝符号链接
+祖先。`evidence.jsonl` 保存逐样本完整时间/双向 TF/位姿元数据、不可变时钟快照、
+采集时刻区间和模拟推理计时，不保存 RGB 图像。有效可序列化的失败输入尽可能
+保留为 `rejected` 行；不可序列化或超限输入由失败摘要说明。
+
+`summary.json` 为完成、失败或 Ctrl+C 中断保留已接受样本统计：每项包含
+`min/p50/p95/p99/max`，分位数使用线性插值。字段名明确单位：相机/状态年龄、
+相机时差、映射误差/残差/路径延迟、GDK 读取时长/间隔、快照创建间隔和实际
+模拟推理等待为 `ms`；漂移为 `ppm`，TF/motion 位置差为 `m`，旋转差为 `rad`。
+`camera_age_ms` / `state_age_ms` 使用年龄区间上界，`*_age_lower_ms` 为下界；
+`camera_skew_ms` 含映射不确定性，`source_camera_skew_ms` 是原始相机时间戳差。
+无样本时没有分布；无论状态如何，`motion_authorized=false`、
+`thresholds_approved=false`、`source_clock_identity_proven=false`。
+不会输出启用运动的布尔建议，也不会生成或修改生产阈值配置。
+
+停止顺序固定：先在 **终端 B 按 Ctrl+C**，等审计写摘要、关闭 reader/client 并退出
+（退出码 130）；再在 **终端 A 按 Ctrl+C**，等监控处理自有 PTP 子进程并退出。
+审计到期正常退出码 0，拒绝或写入/关闭失败退出码 1。关闭 client 不会停止监控。
+时长限制采样循环；厂商同步 SDK 调用若卡死，软件不能保证此期限或 Ctrl+C 立即
+返回，也不会从另一线程在卡住的 SDK 调用下释放资源。出现这种情况不启动新会话，
+保留终端状态与证据并按现场异常流程处置，不能将进程退出等同于机器人停稳。
+
+两边退出后只读检查（排除检查命令自身；不要用全局 `pkill`）：
+
+```bash
+ps -eo pid,ppid,pgid,user,comm,args | rg 'ptp4l|phc2sys|clock_monitor|freshness_audit'
+```
+
+若监控报告 `cleanup_pending`，按前文等待其固定期限及 kill-after 余量，复查自有
+会话进程已退出后再运行。现场验收还须核对证据：快照 sequence 递增；同一最后 PTP
+样本不能延长 `valid_until_ns`；无残留进程；摘要始终未授权运动。
+本轮仅完成离线软件验证，上述 120 秒监控 + 60 秒现场审计尚未执行。
+
+后续阈值批准是单独流程：在双相机、GDK 与真实 Actor 推理同时运行的只读条件下
+收集分布和异常证据，结合任务误差预算逐项审查并显式提供六个 FreshnessLimits。
+当前模拟等待统计不批准任何候选阈值；仍需独立完成硬件急停/停止距离、运动空间、
+尺度、模式及其他控制安全门槛，才能另行评估运动或训练许可。
+
 ## 一次并行采集
 
 先结束之前手动运行的 PTP 测量，保持机器人网线连接；不要同时启动其他校时服务。
