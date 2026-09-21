@@ -1,9 +1,10 @@
 """Real-inference audit orchestration with offline reader, clock and probe."""
-import builtins
 from dataclasses import replace
-import importlib
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -209,17 +210,148 @@ def test_invalid_probe_diagnostics_never_publish_nonfinite_json(audit, tmp_path,
     assert 'Infinity' not in (tmp_path/'audit'/'evidence.jsonl').read_text()
 
 
-def test_actor_mode_never_imports_motion_gym_or_learner(audit, tmp_path, monkeypatch):
-    original = builtins.__import__
-    def guarded(name, globals=None, locals=None, fromlist=(), level=0):
-        assert not set(fromlist or ()) & {'GdkCommandPort', 'MotionBackend',
-                                          'G2LocalEnv', 'LearnerServiceStub'}
-        assert not any(part in name for part in ('motion_backend', 'gymnasium', 'learner_client'))
-        return original(name, globals, locals, fromlist, level)
-    monkeypatch.setattr(builtins, '__import__', guarded)
-    importlib.reload(audit)
-    importlib.reload(importlib.import_module('g2_local.actor_inference'))
-    assert ActorRig().run_actor(audit, tmp_path/'audit')['motion_authorized'] is False
+_ISOLATED_IMPORT_GUARD = r'''
+import ast
+import builtins
+import importlib.abc
+import importlib.util
+from pathlib import Path
+import sys
+
+FORBIDDEN = {
+    'gym', 'gymnasium', 'actor', 'learner', 'make_env', 'rl_envs', 'rl_envs_sim',
+    'g2_local.command_port', 'g2_local.command_stream', 'g2_local.motion_backend',
+    'g2_local.env', 'g2_local.episode', 'g2_local.motion', 'g2_local.runtime',
+    'g2_local.learner_client', 'lerobot.transport', 'lerobot.scripts.rl.learner_service',
+}
+SYMBOLS = {'GdkCommandPort', 'MotionBackend', 'CommandStream', 'G2LocalEnv',
+           'LearnerServiceStub'}
+
+def check_name(name):
+    assert not any(name == banned or name.startswith(banned + '.')
+                   for banned in FORBIDDEN), 'forbidden import: ' + name
+
+def check_loaded():
+    for name in tuple(sys.modules):
+        check_name(name)
+    assert 'agibot_gdk' not in sys.modules
+
+class Guard(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        check_name(fullname)
+        assert fullname != 'agibot_gdk', 'offline test must not load GDK'
+
+original_import = builtins.__import__
+def guarded(name, globals=None, locals=None, fromlist=(), level=0):
+    resolved = (importlib.util.resolve_name('.' * level + name, globals['__package__'])
+                if level else name)
+    check_name(resolved)
+    assert not set(fromlist or ()) & SYMBOLS, 'forbidden imported symbol'
+    for item in fromlist or ():
+        check_name(resolved + '.' + item)
+    return original_import(name, globals, locals, fromlist, level)
+
+check_loaded()  # Also reject forbidden dependencies cached before guard setup.
+sys.meta_path.insert(0, Guard())
+builtins.__import__ = guarded
+
+# Inspect every import in reachable local modules, including function bodies.
+# This covers the real lazy reader factory without constructing GDK resources.
+pending = ['g2_local.freshness_audit']
+visited = set()
+while pending:
+    module = pending.pop()
+    if module in visited:
+        continue
+    visited.add(module)
+    source = Path(*module.split('.')).with_suffix('.py')
+    if not source.is_file():
+        continue
+    package = module.rpartition('.')[0]
+    for node in ast.walk(ast.parse(source.read_text())):
+        if isinstance(node, ast.Import):
+            names = [item.name for item in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            assert not {item.name for item in node.names} & SYMBOLS
+            base = (importlib.util.resolve_name('.' * node.level + (node.module or ''), package)
+                    if node.level else node.module)
+            names = [base] + [base + '.' + item.name for item in node.names]
+        else:
+            continue
+        for name in names:
+            check_name(name)
+            if name.startswith('g2_local.'):
+                pending.append(name)
+assert {'g2_local.gdk_backend', 'g2_local.actor_inference'} <= visited
+'''
+
+
+def _isolated_actor_check(source):
+    result = subprocess.run(
+        [sys.executable, '-c', _ISOLATED_IMPORT_GUARD + source],
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
+        timeout=120, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout
+
+
+def test_actor_mode_never_imports_motion_gym_or_learner():
+    _isolated_actor_check('''
+import g2_local.freshness_audit
+import g2_local.actor_inference
+import g2_local.gdk_backend
+check_loaded()
+''')
+
+
+@pytest.mark.skipif(os.environ.get('RUN_G2_CUDA_SMOKE') != '1',
+                    reason='explicit offline RTX 3090/checkpoint smoke opt-in')
+def test_real_checkpoint_cuda_smoke_discards_synthetic_actions():
+    stdout = _isolated_actor_check('''
+import json
+import numpy as np
+from g2_local.freshness_audit import _actor_probe, _inference_metrics, summarize_audit
+
+checkpoint = Path('/home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL/runtime/software_loop/checkpoint.pt')
+obs = {'state': np.array([0., 0., 0., 0., 0., 0., 1.], dtype=np.float32),
+       'left_wrist': np.zeros((1056, 1280, 3), dtype=np.uint8),
+       'right_aux': np.full((1056, 1280, 3), 127, dtype=np.uint8)}
+probe = _actor_probe(checkpoint, device='cuda', warmup_steps=3)
+try:
+    probe.warmup(obs)
+    result = probe.infer(obs)
+    diagnostic, metrics = _inference_metrics(result)
+    report = dict(checkpoint=str(checkpoint), metadata=probe.metadata(),
+                  diagnostic=diagnostic, summary=summarize_audit([metrics]),
+                  synthetic_images=True, gdk_instantiated=False)
+finally:
+    probe.close()
+check_loaded()
+print(json.dumps(report, allow_nan=False))
+''')
+    report = json.loads(stdout.splitlines()[-1])
+    metadata, diagnostic, summary = (report[k] for k in ('metadata', 'diagnostic', 'summary'))
+    assert metadata['gpu_name'] == 'NVIDIA GeForce RTX 3090'
+    assert metadata['device'] == 'cuda' and metadata['checkpoint_schema'] == 1
+    assert metadata['checkpoint_version'] == 3
+    assert len(metadata['checkpoint_sha256']) == 64
+    assert metadata['warmup_steps'] == metadata['warmup_completed'] == 3
+    assert diagnostic['action_shape'] == [1, 6]
+    assert diagnostic['action_discarded'] is True
+    assert -1 + 1e-6 <= diagnostic['action_min'] <= diagnostic['action_max'] <= 1 - 1e-6
+    assert set(diagnostic) == {
+        'cpu_prepare_ns', 'h2d_resize_ns', 'forward_ns', 'total_ns',
+        'cuda_allocated_bytes', 'cuda_reserved_bytes', 'cuda_peak_allocated_bytes',
+        'action_shape', 'action_min', 'action_max', 'action_discarded'}
+    for key in ('cpu_prepare_ns', 'h2d_resize_ns', 'forward_ns', 'total_ns',
+                'cuda_allocated_bytes', 'cuda_reserved_bytes', 'cuda_peak_allocated_bytes'):
+        assert type(diagnostic[key]) is int and diagnostic[key] > 0
+    assert diagnostic['total_ns'] >= sum(diagnostic[k] for k in
+                                       ('cpu_prepare_ns', 'h2d_resize_ns', 'forward_ns'))
+    assert summary['actions_discarded'] is True
+    for key in ('motion_authorized', 'thresholds_approved', 'source_clock_identity_proven'):
+        assert summary[key] is False
+    print(json.dumps(report, sort_keys=True, allow_nan=False))
 
 
 def test_cli_routes_actor_options_after_validation(audit, tmp_path, monkeypatch):

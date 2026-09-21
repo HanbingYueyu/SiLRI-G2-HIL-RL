@@ -160,6 +160,25 @@ ValueError: Unrecognized configuration class <class 'transformers_modules.helper
 
 ## 📖 Documents
 
+For the local G2 setup, see the [real Actor read-only audit workflow](docs/g2-clock-diagnostics.md#真实-actorcuda-只读审计三轮现场流程)
+and [adaptation status](docs/g2-adaptation-status.md). The audit uses the trusted checkpoint
+`/home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL/runtime/software_loop/checkpoint.pt`
+on RTX 3090 with `allow_motion=False`; it discards every action and creates no command,
+motion, Gym, or learner components. Qualification requires three independent sessions,
+each with at least 120 seconds of observed samples and 1000 accepted samples, zero
+rejections, matching checkpoint/configuration/GPU, and recorded monitor cleanup.
+Request 125 seconds per audit, allow 300 seconds for each monitor, and stop B before A.
+The workflow includes exact monitor/audit/qualification commands, evidence copying,
+residual-process checks, and the separate six-limit approval command. No freshness
+thresholds or motion are currently authorized; the synthetic CUDA smoke is not live evidence.
+
+Run the opt-in checkpoint/CUDA smoke without GDK, PTP, or sudo:
+
+```bash
+PYTHONPATH=lerobot/src RUN_G2_CUDA_SMOKE=1 .venv/bin/python -m pytest \
+  tests/test_g2_actor_audit.py -q -s -k real_checkpoint_cuda_smoke
+```
+
 This repository is built upon a fork of [Lerobot](https://github.com/huggingface/lerobot) and [HIL-SERL](https://github.com/rail-berkeley/hil-serl). Unlike the original `hil-serl` and `ConRFT` JAX implementation, we reimplement all algorithms in PyTorch for improved usability and better compatibility with the robotics community.
 
 For common questions, please refer to `docs/` for details.

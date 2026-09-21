@@ -58,7 +58,140 @@ ps -eo pid,ppid,pgid,user,comm,args | rg 'ptp4l|phc2sys|clock_monitor'
 
 现场停止/硬件急停验收与任务阈值批准仍是独立步骤；此监控不构成训练或运动授权。
 
-## 两终端只读负载审计（2026-09-21 已执行一次现场采集）
+## 真实 Actor/CUDA 只读审计：三轮现场流程
+
+以下命令要求当前检出已包含 `actor_inference` 和 `freshness_approval`。
+真实 GdkReader 始终使用 `allow_motion=False`；不创建 GdkCommandPort、
+CommandStream、MotionBackend、Gym 或 learner，不发 hold、运动、夹爪或切模式命令。
+Actor 仅加载可信本机软件闭环 checkpoint 的 `actor.*` 权重，动作检查后立即丢弃。
+checkpoint 使用 pickle，不能替换成不可信下载文件：
+
+`/home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL/runtime/software_loop/checkpoint.pt`
+
+它应为 schema 1、version 3，GPU 必须为 `NVIDIA GeForce RTX 3090`。
+真实模式必须显式指定 `--device cuda`，不能与非零 `--inference-delay-s` 同用。
+三轮必须分别使用新的 audit/monitor 会话，同一 checkpoint SHA-256、配置和 GPU；
+每轮要求实际样本跨度 **至少 120 秒**、至少 1000 个接受样本、零拒绝、正常完成。
+建议 `--seconds 125`，因为请求 120 秒的循环可能受末次 sleep 影响，原始样本跨度
+略短于 120 秒。预热不计入正式时间，不计入正式分布；预热后重新读取观测。
+
+在普通用户终端准备全新证据父目录（以下日期/编号若已用过，三轮统一换新名称；
+不删除或覆盖旧证据）：
+
+```bash
+cd /home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL
+mkdir -m 700 runtime/real_actor_audit_20260921
+```
+
+每轮两个终端都设置同一个 `audit_run`，依次为 `01`、`02`、`03`。
+必须上一轮 B、A 都退出且 qualification 成功后，才开始下一轮；不要并行运行三轮。
+
+终端 A（监控预热、Actor 初始化/预热、125 秒正式窗口与收尾均留有余量）：
+
+```bash
+cd /home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL
+audit_run=01  # 第二轮改为 02，第三轮改为 03
+bash run_g2_python.sh -m g2_local.clock_monitor \
+  --master 044052.fffe.000010 --max-seconds 300 \
+  --output "/tmp/g2-ra-20260921-${audit_run}"
+```
+
+A 在本终端自行执行固定 `sudo -v` 认证；不要 sudo 启动 Python/GDK。
+等本轮监控健康（至少 8 样本、跨度 10 秒并通过时间属性检查），再启动 B。
+300 秒是终止上限，应在到期前手动正常停止；到期或 fail-closed 退出不能作为合格收尾。
+若初始化过慢或监控不健康，保留该轮失败证据，用新路径重新采集，不能延续旧会话。
+
+终端 B：
+
+```bash
+cd /home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL
+audit_run=01  # 与 A 本轮一致
+bash run_g2_python.sh -m g2_local.freshness_audit \
+  --socket "/tmp/g2-ra-20260921-${audit_run}/clock.sock" \
+  --seconds 125 --warmup-steps 10 --device cuda \
+  --actor-checkpoint /home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL/runtime/software_loop/checkpoint.pt \
+  --output "runtime/real_actor_audit_20260921/session-${audit_run}"
+```
+
+合格采集让 B 到期正常完成（退出码 0、`status=completed`），然后在 A 按 Ctrl+C。
+需提前停止时固定 **B→A**：先 B Ctrl+C，等摘要写完且 reader/client/probe 关闭，
+再 A Ctrl+C，等监控收尾退出。B 中断为退出码 130，不能拿来凑合格三轮；
+同步 SDK 若阻塞，期限或 Ctrl+C 不保证立即返回，不得在旧资源未关闭时另开一轮。
+
+两终端完全退出后，在普通用户终端只读检查残留（本命令不会停止进程）：
+
+```bash
+ps -eo pid,ppid,pgid,stat,user,comm,args | rg '[p]tp4l|[p]mc|[p]hc2sys|[c]lock_monitor|[f]reshness_audit'
+```
+
+核对输出与本轮终端状态；`cleanup_pending`、僵尸/不确定的 Python 残留、任何
+monitor/audit/PTP 残留都不能签发 qualification。不要全局 pkill，按前文等待自有
+timeout 回收并复查。监控在正式窗口中 fail-closed、证据/版本/配置/GPU 不一致、
+重复会话、计数或时长不足均拒绝批准，不能改摘要、拼接会话或排除坏样本后继续。
+
+每轮复制完整 monitor 原始证据，再生成绑定哈希与收尾扫描结果的 qualification。
+下面沿用本轮 B 的 `audit_run`；目标文件必须不存在，复制后不能再移动 monitor
+证据或改写文件，因为 qualification 保存其绝对路径和 SHA-256：
+
+```bash
+cp -n "/tmp/g2-ra-20260921-${audit_run}/evidence.jsonl" \
+  "runtime/real_actor_audit_20260921/session-${audit_run}/monitor-evidence.jsonl"
+PYTHONPATH=lerobot/src .venv/bin/python -m g2_local.freshness_approval qualify \
+  --audit-dir "runtime/real_actor_audit_20260921/session-${audit_run}" \
+  --monitor-evidence "runtime/real_actor_audit_20260921/session-${audit_run}/monitor-evidence.jsonl" \
+  --output "runtime/real_actor_audit_20260921/session-${audit_run}/qualification.json"
+```
+
+每轮保留 `evidence.jsonl`、`summary.json`、`monitor-evidence.jsonl`、
+`qualification.json`，以及 `/tmp/g2-ra-20260921-01`、`-02`、`-03` 的原始目录。
+qualification 只证明已记录的收尾/文件绑定，不代表三轮完整验证或阈值批准。
+审计及 qualification 的 `motion_authorized`、`thresholds_approved` 始终为 false；
+审计还固定 `source_clock_identity_proven=false`、`actions_discarded=true`。
+
+三轮齐备后，可用纯离线 API 重算并检查原始数据（不创建批准文件）：
+
+```bash
+PYTHONPATH=lerobot/src .venv/bin/python -c 'from pathlib import Path; from g2_local.freshness_approval import validate_sessions; e = validate_sessions([Path("runtime/real_actor_audit_20260921") / f"session-{i:02d}" for i in (1, 2, 3)]); print(e.worst_case)'
+```
+
+人工结合任务误差预算选择六项显式值后，才单独运行下列批准命令。四个环境变量
+必须填写已审查的秒数，无默认值、无自动建议；相机/状态年龄、相机时差、映射误差
+须严格大于三轮观测最坏上界。TF 上限固定 0.005 m 与 0.02 rad，观测也须满足。
+以下是后续操作模板，本次文档及合成 smoke **没有批准任何阈值或运动**：
+
+```bash
+PYTHONPATH=lerobot/src .venv/bin/python -m g2_local.freshness_approval approve \
+  --sessions runtime/real_actor_audit_20260921/session-01 \
+             runtime/real_actor_audit_20260921/session-02 \
+             runtime/real_actor_audit_20260921/session-03 \
+  --camera-age-s "${G2_CAMERA_AGE_S:?填写已审查秒数}" \
+  --state-age-s "${G2_STATE_AGE_S:?填写已审查秒数}" \
+  --camera-skew-s "${G2_CAMERA_SKEW_S:?填写已审查秒数}" \
+  --mapping-error-s "${G2_MAPPING_ERROR_S:?填写已审查秒数}" \
+  --tf-position-error-m 0.005 --tf-rotation-error-rad 0.02 \
+  --output runtime/real_actor_audit_20260921/approved-limits.json
+```
+
+批准文件只以独占方式新建，模式 0400，记录三轮来源、哈希、GPU、配置、最坏值与
+各项 margin。仅该文件可有 `thresholds_approved=true`，仍固定
+`motion_authorized=false` 和 `source_clock_identity_proven=false`，不改生产配置，
+不解除现场急停/停止距离、空间、尺度、模式等独立运动门槛。
+
+### 无 GDK 的真实 CUDA smoke
+
+```bash
+PYTHONPATH=lerobot/src RUN_G2_CUDA_SMOKE=1 .venv/bin/python -m pytest \
+  tests/test_g2_actor_audit.py -q -s -k real_checkpoint_cuda_smoke
+```
+
+仅使用上述可信 checkpoint、RTX 3090、两个合成连续 uint8 `(1056, 1280, 3)`
+RGB 和 float32 七维状态；三次预热后真实推理，动作仅留下形状/极值/丢弃标记。
+隔离子进程在导入前设置保护并检查已加载模块，静态检查本地传递/惰性导入；
+不实例化 GDK，不启动 PTP/sudo、command、motion、Gym 或 learner。
+检查非零同步耗时、有限六维动作、CUDA 内存与固定 false 许可；stdout 输出 JSON
+诊断，默认回归跳过这一显式选择的 GPU 测试。它不是任何现场会话的替代证据。
+
+## 历史：模拟等待只读审计（2026-09-21 已执行一次现场采集）
 
 操作员已报告硬件急停可访问；受控急停、停止距离和固件命令过期行为仍未验收。
 本流程始终保持真实 `allow_motion=False`，不创建命令端口或运动后端，不发 hold、

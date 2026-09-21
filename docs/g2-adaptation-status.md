@@ -1,5 +1,31 @@
 # G2 局部插入适配记录
 
+## 真实 Actor 只读审计工具（2026-09-21，尚待三轮现场验收）
+
+已增加可信本机 checkpoint 的 Actor-only 加载和 RTX 3090 同步计时；检查完整
+配置、权重与 SHA-256，双腕 RGB 全帧转入 CUDA 后缩至 128×128，推理动作仅
+记录形状/极值并丢弃。真实 GdkReader 保持 `allow_motion=False`；不创建 command、
+motion、Gym 或 learner，不发保持、运动、夹爪或切模式指令。
+checkpoint 固定为 `/home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL/runtime/software_loop/checkpoint.pt`。
+
+合成 uint8 `(1056, 1280, 3)` 双图像的真实 CUDA smoke 已通过：schema 1、
+version 3、RTX 3090、三次预热、有限 `(1, 6)` 丢弃动作和非零同步计时。
+该测试没有实例化 GDK 或启动 PTP，不能证明真实双相机/GDK 下的年龄分布。
+checkpoint SHA-256 为 `aa9bb8ad3b271745855d06d231db349b91f79a7750fbf59889353e1f7cf16f19`。
+
+正式批准仍须 **3 个独立会话 × 至少 120 秒实际样本跨度**，每轮至少 1000
+接受样本、零拒绝、同一 checkpoint/配置/GPU、健康且正常结束的独立 monitor。
+建议每轮请求 125 秒正式采样（Actor 预热另外计算），监控上限 300 秒；
+正常让 B 完成后 A Ctrl+C，提前停止时 B→A Ctrl+C，该轮中断不能 qualify。
+每轮保留 audit JSONL/摘要、复制后的 monitor 原始证据和 `qualify` 生成的
+`qualification.json`；三轮重算通过后，另行人工审查六项显式阈值才能 `approve`。
+完整命令、全新证据路径、残留检查、收尾与批准模板见
+[真实 Actor 三轮只读流程](g2-clock-diagnostics.md#真实-actorcuda-只读审计三轮现场流程)。
+
+目前没有完成这三轮现场验收，没有批准阈值或运动；历史模拟等待数据不能补足。
+审计/qualification 的许可字段固定 false；未来单独批准文件也仍然
+`motion_authorized=false`，不修改生产配置、不解除其他现场门槛。
+
 ## 持续时间映射与只读负载审计（2026-09-21，覆盖下方历史状态）
 
 已实现独立前台 `clock_monitor`、只读短租约快照 IPC、GDK 四源时间戳/双向 TF
