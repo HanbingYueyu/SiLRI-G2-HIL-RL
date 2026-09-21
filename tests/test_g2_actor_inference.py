@@ -3,6 +3,8 @@ from copy import deepcopy
 from dataclasses import FrozenInstanceError, asdict
 from hashlib import sha256
 from types import SimpleNamespace
+import gc
+import weakref
 
 import draccus
 import numpy as np
@@ -425,3 +427,112 @@ def test_actual_silri_actor_load_and_forward_on_cpu_with_simulated_cuda(
         assert -1 < result.action_min <= result.action_max < 1
     finally:
         probe.close()
+
+
+@pytest.mark.parametrize('phase', ['validation', 'factory'])
+def test_constructor_failure_releases_tensors_with_exception_retained(rig, monkeypatch, phase):
+    refs = []
+    released_before_cache = []
+    original_empty_cache = torch.cuda.empty_cache
+
+    def empty_cache():
+        released_before_cache.append(all(reference() is None for reference in refs))
+        original_empty_cache()
+
+    monkeypatch.setattr(torch.cuda, 'empty_cache', empty_cache)
+
+    class TrackingLinear(torch.nn.Linear):
+        def state_dict(self):
+            state = super().state_dict()
+            refs.extend(weakref.ref(tensor) for tensor in state.values())
+            return state
+
+    def factory(device):
+        policy = FakePolicy()
+        policy.actor = TrackingLinear(7, 6)
+        refs.append(weakref.ref(policy))
+        refs.extend(weakref.ref(parameter) for parameter in policy.parameters())
+        if phase == 'factory':
+            temporary = torch.zeros(8)
+            refs.append(weakref.ref(temporary))
+            raise KeyboardInterrupt('construction interrupted')
+        return policy
+
+    monkeypatch.setattr(actor_inference, 'create_policy', factory)
+    rig.snapshot['policy']['actor.bias'][0] = float('nan')
+    with pytest.raises(BaseException) as retained:
+        rig.build()
+    expected = ValueError if phase == 'validation' else KeyboardInterrupt
+    assert type(retained.value) is expected
+    assert retained.value.__traceback__ is not None
+    # Keep the caller's exception and its traceback intact throughout the check.
+    gc.collect()
+    assert refs and all(reference() is None for reference in refs)
+    assert released_before_cache == [True]
+    assert rig.cuda.releases == 1
+
+
+@pytest.mark.parametrize('phase', ['preprocessing', 'forward', 'action', 'chained_forward'])
+def test_inference_failure_releases_tensors_with_exception_retained(
+        inference, observation, monkeypatch, phase):
+    refs = []
+    original_resize = torch.nn.functional.interpolate
+    original_cpu = torch.Tensor.cpu
+    original_empty_cache = torch.cuda.empty_cache
+    released_before_cache = []
+
+    def cpu(tensor, *args, **kwargs):
+        diagnostic = original_cpu(tensor, *args, **kwargs)
+        refs.append(weakref.ref(diagnostic))
+        return diagnostic
+
+    def empty_cache():
+        released_before_cache.append(all(reference() is None for reference in refs))
+        original_empty_cache()
+
+    def resize(tensor, **kwargs):
+        refs.append(weakref.ref(tensor))
+        if phase == 'preprocessing':
+            temporary = tensor.clone()
+            refs.append(weakref.ref(temporary))
+            raise KeyboardInterrupt('resize interrupted')
+        result = original_resize(tensor, **kwargs)
+        refs.append(weakref.ref(result))
+        return result
+
+    def chained_failure(batch):
+        temporary = batch['observation.state'].clone()
+        refs.append(weakref.ref(temporary))
+        raise RuntimeError('underlying CUDA error')
+
+    def forward(batch):
+        refs.extend(weakref.ref(tensor) for tensor in batch.values())
+        action = torch.full((1, 6), float('nan'))
+        refs.append(weakref.ref(action))
+        if phase == 'forward':
+            raise RuntimeError('forward failed')
+        if phase == 'chained_forward':
+            try:
+                chained_failure(batch)
+            except RuntimeError as error:
+                raise ValueError('forward context') from error
+        return action, {}
+
+    monkeypatch.setattr(torch.nn.functional, 'interpolate', resize)
+    monkeypatch.setattr(torch.Tensor, 'cpu', cpu)
+    monkeypatch.setattr(torch.cuda, 'empty_cache', empty_cache)
+    monkeypatch.setattr(inference.rig.policy, 'select_action', forward)
+    with pytest.raises(BaseException) as retained:
+        inference.probe.infer(observation)
+    expected = {'preprocessing': KeyboardInterrupt, 'forward': RuntimeError,
+                'action': ValueError, 'chained_forward': ValueError}[phase]
+    assert type(retained.value) is expected
+    assert retained.value.__traceback__ is not None
+    if phase == 'chained_forward':
+        assert type(retained.value.__cause__) is RuntimeError
+        assert str(retained.value.__cause__) == 'underlying CUDA error'
+    gc.collect()
+    assert refs and all(reference() is None for reference in refs)
+    assert released_before_cache == [True]
+    assert inference.probe.policy is None
+    assert inference.rig.cuda.releases == 1
