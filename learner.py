@@ -1628,7 +1628,11 @@ def process_interaction_messages(
 
 if __name__ == "__main__":
     try:
-        train_cli()
+        if '--g2-software' in sys.argv:
+            from g2_local.runtime import main
+            main('learner', [arg for arg in sys.argv[1:] if arg != '--g2-software'])
+        else:
+            train_cli()
         logging.info("[LEARNER] main finished")
     except Exception as e:
         print(f"[{type(e).__name__}] {e!r}")

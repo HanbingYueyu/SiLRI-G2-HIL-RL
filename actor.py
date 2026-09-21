@@ -1055,7 +1055,11 @@ def load_hydra_yaml(path):
 if __name__ == "__main__":
 
     try:
-        actor_cli()
+        if '--g2-software' in sys.argv:
+            from g2_local.runtime import main
+            main('actor', [arg for arg in sys.argv[1:] if arg != '--g2-software'])
+        else:
+            actor_cli()
     except Exception as e:
         print(f"In actor.py: [{type(e).__name__}] {e!r}")
         traceback.print_exc()          # full stacktrace

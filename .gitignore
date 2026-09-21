@@ -15,4 +15,7 @@ scripts
 .DS_Store
 */.DS_Store
 expert/
-
+.venv/
+runtime/
+.worktrees/
+.superpowers/
