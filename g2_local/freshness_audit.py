@@ -36,6 +36,32 @@ def _reader():
     return GdkReader()
 
 
+def _actor_probe(checkpoint, *, device, warmup_steps):
+    # Keep torch/checkpoint/CUDA work behind argument and output preflight.
+    from .actor_inference import ActorInferenceProbe
+    return ActorInferenceProbe(checkpoint, device=device, warmup_steps=warmup_steps)
+
+
+def _inference_metrics(result):
+    diagnostic = asdict(result)
+    if diagnostic['action_discarded'] is not True:
+        raise ValueError('Actor actions must be discarded')
+    timing = {'cpu_prepare_ns': 'cpu_prepare_ms', 'h2d_resize_ns': 'h2d_resize_ms',
+              'forward_ns': 'actor_forward_ms', 'total_ns': 'actor_inference_ms'}
+    memory = ('cuda_allocated_bytes', 'cuda_reserved_bytes', 'cuda_peak_allocated_bytes')
+    metrics = {}
+    for key, metric in timing.items():
+        metrics[metric] = _finite(diagnostic[key], key)/1e6
+    for key in memory:
+        metrics[key.removesuffix('_bytes')+'_mib'] = _finite(diagnostic[key], key)/1024**2
+    low, high = diagnostic['action_min'], diagnostic['action_max']
+    if (diagnostic['action_shape'] != (1, 6) or
+            any(type(value) not in (int, float) or not math.isfinite(value)
+                for value in (low, high)) or not -1+1e-6 <= low <= high <= 1-1e-6):
+        raise ValueError('Invalid discarded action diagnostics')
+    return diagnostic, metrics
+
+
 def _mapping(client, now_fn, previous):
     snapshot = client.read()
     now = _timestamp(now_fn(), 'local monotonic time')
@@ -114,7 +140,8 @@ def summarize_audit(rows):
     are literal in every metric name; empty sessions have no distributions.
     """
     result = dict(motion_authorized=False, thresholds_approved=False,
-                  source_clock_identity_proven=False, sample_count=len(rows),
+                  source_clock_identity_proven=False, actions_discarded=True,
+                  sample_count=len(rows),
                   percentile_method='linear interpolation', age_statistic='upper interval bound')
     for key in sorted({key for row in rows for key in row}):
         values = [row[key] for row in rows if key in row]
@@ -126,15 +153,31 @@ def summarize_audit(rows):
 
 
 def run_audit(*, output, duration_s, socket_path=None, inference_delay_s=0.,
+              actor_checkpoint=None, device=None, warmup_steps=0, probe_factory=None,
               client_factory=None, reader_factory=None, monotonic_ns=None, sleep=None):
     """Collect bounded evidence, closing owned read resources on every exit.
 
     Factories allow offline tests; returned resources belong to this run.
     Duration bounds the sampling loop, not an uninterruptible vendor call.
     No timeout thread releases SDK resources underneath a blocked SDK call.
+    Accepted samples have a flushed evidence record; rejected_count counts
+    attempted formal observations that did not commit, including interrupts.
+    Preflight/warm-up/cleanup failures are session failures, not formal samples.
     """
     validate_audit_duration(duration_s)
     _finite(inference_delay_s, 'inference_delay_s')
+    actor_mode = actor_checkpoint is not None
+    if type(warmup_steps) is not int or warmup_steps < 0:
+        raise ValueError('warmup_steps must be a nonnegative integer')
+    if actor_mode:
+        if not isinstance(actor_checkpoint, Path):
+            raise ValueError('actor_checkpoint must be a trusted-local Path')
+        if type(device) is not str or device != 'cuda':
+            raise ValueError('Actor mode requires explicit device=cuda')
+        if inference_delay_s:
+            raise ValueError('Actor mode and simulated inference delay are mutually exclusive')
+    elif device is not None or warmup_steps or probe_factory is not None:
+        raise ValueError('Actor options require actor_checkpoint')
     if client_factory is None and socket_path is None:
         raise ValueError('An explicit monitor socket is required')
     output = Path(output)
@@ -143,20 +186,46 @@ def run_audit(*, output, duration_s, socket_path=None, inference_delay_s=0.,
     directory_fd = _create_session_directory(output)
     now_fn = time.monotonic_ns if monotonic_ns is None else monotonic_ns
     sleep_fn = time.sleep if sleep is None else sleep
-    client = reader = stream = None
+    client = reader = probe = stream = None
     rows, previous_info, previous_snapshot = [], None, None
     status, reason, failure = 'completed', '', None
     written = 0
     raw = {}
+    attempted = 0
+    actor_metadata = None
+    action_min = action_max = None
+    warmup_start = None
+    warmup_recorded = False
+
+    def encode_record(record):
+        encoded = (json.dumps(record, allow_nan=False, separators=(',', ':'))+'\n').encode()
+        if len(encoded) > _MAX_ROW_BYTES:
+            raise ValueError('Audit evidence limit exceeded')
+        return encoded
 
     def write_record(record):
         nonlocal written
-        encoded = (json.dumps(record, allow_nan=False, separators=(',', ':'))+'\n').encode()
-        if len(encoded) > _MAX_ROW_BYTES or written+len(encoded) > _MAX_LOG_BYTES:
+        encoded = encode_record(record)
+        if written+len(encoded) > _MAX_LOG_BYTES:
             raise ValueError('Audit evidence limit exceeded')
         stream.write(encoded)
         stream.flush()
         written += len(encoded)
+
+    def record_warmup():
+        nonlocal actor_metadata, warmup_recorded
+        metadata = deepcopy(probe.metadata())
+        record = dict(event='warmup', warmup_steps=warmup_steps,
+                      warmup_completed=metadata['warmup_completed'],
+                      start_mono_ns=warmup_start,
+                      end_mono_ns=_timestamp(now_fn(), 'warmup end'),
+                      metadata=metadata)
+        # Preserve valid completion counts even if persistence fails; reject
+        # nonfinite/oversized metadata before it can contaminate the summary.
+        encode_record(record)
+        actor_metadata = metadata
+        write_record(record)
+        warmup_recorded = True
 
     try:
         fd = os.open('evidence.jsonl', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -164,24 +233,47 @@ def run_audit(*, output, duration_s, socket_path=None, inference_delay_s=0.,
         stream = os.fdopen(fd, 'wb')
         write_record(dict(event='session', duration_s=duration_s,
                           inference_delay_s=inference_delay_s, motion_authorized=False,
-                          thresholds_approved=False))
+                          thresholds_approved=False, actions_discarded=True,
+                          actor_mode=actor_mode, warmup_steps=warmup_steps))
         client = (client_factory() if client_factory else SnapshotClient(
             Path(socket_path), timeout_s=.25, expected_master=EXPECTED_MASTER))
         previous_snapshot, _ = _mapping(client, now_fn, None)
+        if actor_mode:
+            probe = (probe_factory or _actor_probe)(actor_checkpoint, device=device,
+                                                    warmup_steps=warmup_steps)
+            metadata = deepcopy(probe.metadata())
+            write_record(dict(event='actor_metadata', metadata=metadata))
+            actor_metadata = metadata
         reader = (reader_factory or _reader)()
+        if probe is not None:
+            warmup_observation = reader.observe()
+            warmup_start = _timestamp(now_fn(), 'warmup start')
+            try:
+                probe.warmup(warmup_observation)
+            finally:
+                del warmup_observation
+            record_warmup()
         start = _timestamp(now_fn(), 'audit start')
         deadline = start+duration_s*1_000_000_000
         while now_fn() < deadline:
             if len(rows) >= _MAX_SAMPLES:
                 raise ValueError('Audit sample limit exceeded')
             raw = {}
-            reader.observe()
+            attempted += 1
+            observation = reader.observe()
             # Freeze metadata before another observe can replace it; no images.
             raw['info'] = deepcopy(reader.last_info)
             inference_start = now_fn()
-            delay = min(inference_delay_s, max(0., (deadline-inference_start)/1e9))
-            if delay:
-                sleep_fn(delay)
+            actor_metrics = {}
+            try:
+                if probe is not None:
+                    raw['inference'], actor_metrics = _inference_metrics(probe.infer(observation))
+                else:
+                    delay = min(inference_delay_s, max(0., (deadline-inference_start)/1e9))
+                    if delay:
+                        sleep_fn(delay)
+            finally:
+                del observation
             inference_end = now_fn()
             if inference_end < inference_start:
                 raise ValueError('Inference monotonic time reversed')
@@ -189,11 +281,16 @@ def run_audit(*, output, duration_s, socket_path=None, inference_delay_s=0.,
             raw['snapshot'] = asdict(snapshot)
             metrics, intervals = _measure(raw['info'], snapshot, now, previous_info,
                                           previous_snapshot, inference_end-inference_start)
+            metrics.update(actor_metrics)
             write_record(dict(event='sample', **raw, received_mono_ns=now,
                               inference_start_mono_ns=inference_start,
                               inference_end_mono_ns=inference_end,
                               source_intervals_ns=intervals, metrics=metrics))
             rows.append(metrics)
+            if probe is not None:
+                low, high = raw['inference']['action_min'], raw['inference']['action_max']
+                action_min = low if action_min is None else min(action_min, low)
+                action_max = high if action_max is None else max(action_max, high)
             previous_info, previous_snapshot = raw['info'], snapshot
             remaining = (deadline-now_fn())/1e9
             if remaining > 0:
@@ -213,7 +310,15 @@ def run_audit(*, output, duration_s, socket_path=None, inference_delay_s=0.,
                 pass
     finally:
         try:
-            for resource in (reader, client):
+            if warmup_start is not None and not warmup_recorded:
+                try:
+                    record_warmup()
+                except BaseException as error:
+                    status = 'failed'
+                    reason = f'warmup_evidence_failed: {type(error).__name__}: {error}'
+                    if failure is None:
+                        failure = RuntimeError(reason)
+            for resource in (reader, probe, client):
                 if resource is not None:
                     try:
                         resource.close()
@@ -234,7 +339,13 @@ def run_audit(*, output, duration_s, socket_path=None, inference_delay_s=0.,
                             failure = RuntimeError(reason)
             result = summarize_audit(rows)
             result.update(status=status, reason=reason, duration_s=duration_s,
-                          inference_delay_s=inference_delay_s)
+                          inference_delay_s=inference_delay_s, actor_mode=actor_mode,
+                          accepted_count=len(rows), rejected_count=attempted-len(rows),
+                          warmup_steps=warmup_steps,
+                          warmup_completed=0 if actor_metadata is None else actor_metadata['warmup_completed'])
+            if actor_mode:
+                result.update(actor_metadata=actor_metadata, action_min=action_min,
+                              action_max=action_max)
             fd = os.open('summary.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                          0o600, dir_fd=directory_fd)
             with os.fdopen(fd, 'w') as summary:
@@ -252,12 +363,18 @@ def main(argv=None):
     parser.add_argument('--socket', type=Path, required=True)
     parser.add_argument('--seconds', type=int, required=True)
     parser.add_argument('--inference-delay-s', type=float, default=0.)
+    parser.add_argument('--actor-checkpoint', type=Path,
+                        help='Trusted local checkpoint; actions are always discarded')
+    parser.add_argument('--device', choices=['cuda'])
+    parser.add_argument('--warmup-steps', type=int, default=0)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args(argv)
     output = args.output or Path('runtime/freshness_audit')/uuid.uuid4().hex
     try:
         report = run_audit(output=output, duration_s=args.seconds, socket_path=args.socket,
-                           inference_delay_s=args.inference_delay_s)
+                           inference_delay_s=args.inference_delay_s,
+                           actor_checkpoint=args.actor_checkpoint, device=args.device,
+                           warmup_steps=args.warmup_steps)
     except Exception as error:
         print(f'Audit failed: {error}; evidence directory: {output}', file=sys.stderr)
         return 1

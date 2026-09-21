@@ -123,6 +123,9 @@ def test_summary_has_literal_units_and_intervals_without_threshold_approval(audi
     output = tmp_path/'audit'
     result = rig.run(audit, output, inference_delay_s=.02)
     assert result['status'] == 'completed'
+    assert result['actor_mode'] is False
+    assert result['accepted_count'] == result['sample_count']
+    assert result['rejected_count'] == 0
     assert result['motion_authorized'] is False
     assert result['thresholds_approved'] is False
     assert result['camera_age_ms']['left_wrist'] == dict(min=32., p50=32., p95=32., p99=32., max=32.)
@@ -232,6 +235,7 @@ def test_frozen_or_reversed_sources_fail_and_preserve_rejected_raw_evidence(audi
         rig.run(audit, tmp_path/'audit')
     result = json.loads((tmp_path/'audit'/'summary.json').read_text())
     assert result['status'] == 'failed' and result['sample_count'] == 1
+    assert result['accepted_count'] == 1 and result['rejected_count'] == 1
     rows = [json.loads(line) for line in (tmp_path/'audit'/'evidence.jsonl').read_text().splitlines()]
     assert rows[-1]['event'] == 'rejected'
     assert rows[-1]['info']['source_timestamp_ns'][source] == first[source]+delta
