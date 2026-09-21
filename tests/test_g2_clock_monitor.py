@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -61,7 +62,7 @@ def launch(monkeypatch):
         calls.append((argv, kwargs))
         assert kwargs.get('shell', False) is False
         script = scripts['ptp' if argv[0] == '/usr/bin/sudo' else 'pmc']
-        child = original([PYTHON, '-c', script], **kwargs)
+        child = original([PYTHON, '-c', script, *argv], **kwargs)
         children.append(child)
         return child
 
@@ -151,7 +152,8 @@ def test_properties_failures_stop_monitor_and_publish_unhealthy(tmp_path, launch
     assert item.provider().healthy is False
     argv = launch[1][1][0]
     assert argv == ['/usr/sbin/pmc', '-u', '-b', '0', '-s', item.uds_ro,
-                    '-i', str(item.output/'pmc.sock'), 'GET TIME_PROPERTIES_DATA_SET']
+                    '-i', item._pmc_address, 'GET TIME_PROPERTIES_DATA_SET']
+    assert item._pmc_address.startswith(f'/proc/{os.getpid()}/fd/')
     assert all(child.poll() is not None for child in launch[2])
 
 
@@ -328,3 +330,138 @@ def test_exited_leader_revokes_snapshot_without_waiting_for_descendant_pipe(tmp_
     assert item.run() == 7
     assert time.monotonic()-start < .5
     assert item.provider().reason == 'ptp_child_exit:7'
+
+
+def test_signal_during_window_update_cannot_deadlock_with_ipc_provider(tmp_path):
+    script = '''
+import os, signal, sys, threading
+from g2_local.clock_monitor import MonitorRuntime
+item = MonitorRuntime(max_seconds=60, master='044052.fffe.000010', output=sys.argv[1])
+acquired = threading.Event()
+def ipc_read():
+    with item._lock:
+        acquired.set()
+        item.provider()
+item.window._lock.acquire()
+worker = threading.Thread(target=ipc_read)
+worker.start()
+assert acquired.wait(1)
+signal.signal(signal.SIGTERM, item.request_stop)
+os.kill(os.getpid(), signal.SIGTERM)
+assert item._failure is None, 'Signal handler must only defer shutdown'
+item.window._lock.release()
+worker.join(1)
+assert not worker.is_alive()
+print('signal returned without locks')
+'''
+    try:
+        result = subprocess.run([PYTHON, '-c', script, str(tmp_path/'run')],
+                                capture_output=True, text=True, timeout=2)
+    except subprocess.TimeoutExpired:
+        pytest.fail('Signal handler deadlocked while the IPC read waited for the window lock')
+    assert result.returncode == 0, result.stderr
+    assert 'signal returned without locks' in result.stdout
+
+
+def test_listener_failure_with_intact_path_revokes_monitor(tmp_path, launch):
+    item = runtime(tmp_path)
+    seen = []
+    def close_listener():
+        item._server._listener.close()
+        seen.append(item.socket_path.exists())
+    timer = threading.Timer(.15, close_listener)
+    deadline = threading.Timer(.4, item.request_stop)
+    timer.start()
+    deadline.start()
+    try:
+        assert item.run() == 2
+        assert seen == [True]
+        assert item.provider().healthy is False
+        assert item.provider().reason == 'snapshot_server_unavailable'
+        assert launch[2][0].poll() is not None
+    finally:
+        timer.cancel()
+        timer.join()
+        deadline.cancel()
+        deadline.join()
+
+
+def test_output_replaced_by_symlink_after_mkdir_cannot_modify_existing_target(tmp_path, launch, monkeypatch):
+    item = runtime(tmp_path)
+    victim = tmp_path/'existing'
+    victim.mkdir(mode=0o755)
+    original = os.mkdir
+    path_mkdir = Path.mkdir
+
+    def swap(actual):
+        if actual == item.output and not (tmp_path/'detached').exists():
+            actual.rename(tmp_path/'detached')
+            actual.symlink_to(victim, target_is_directory=True)
+
+    def replace_created(path, mode=0o777, *, dir_fd=None):
+        original(path, mode, dir_fd=dir_fd)
+        actual = Path(path) if dir_fd is None else Path(f'/proc/self/fd/{dir_fd}').resolve()/path
+        swap(actual)
+
+    def replace_created_path(path, *args, **kwargs):
+        path_mkdir(path, *args, **kwargs)
+        swap(path)
+
+    monkeypatch.setattr(os, 'mkdir', replace_created)
+    monkeypatch.setattr(Path, 'mkdir', replace_created_path)
+    assert item.run() == 2
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o755
+    assert list(victim.iterdir()) == []
+    assert launch[1] == []
+
+
+@pytest.mark.parametrize('ancestor', ['symlink', 'world_writable'])
+def test_unsafe_output_ancestor_is_rejected_without_creating_external_session(tmp_path, launch, ancestor):
+    launch[0]['ptp'] = 'raise SystemExit(7)'
+    parent = tmp_path/'parent'
+    if ancestor == 'symlink':
+        victim = tmp_path/'existing'
+        victim.mkdir(mode=0o755)
+        parent.symlink_to(victim, target_is_directory=True)
+    else:
+        parent.mkdir()
+        parent.chmod(0o777)
+    item = monitor().MonitorRuntime(max_seconds=60, master=MASTER, output=parent/'run')
+    assert item.run() == 2
+    assert not item.output.exists()
+    assert launch[1] == []
+
+
+def test_pmc_anchored_datagram_address_can_receive_reply_from_another_process(tmp_path, launch, monkeypatch):
+    item = runtime(tmp_path)
+    remote = tmp_path/'remote.sock'
+    raw = 'currentUtcOffset 37\ncurrentUtcOffsetValid 0\nleap61 0\nleap59 0\nptpTimescale 1\n'
+    responder = POPEN([PYTHON, '-c',
+        'import socket,sys; s=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM); '
+        's.bind(sys.argv[1]); print("ready",flush=True); data,peer=s.recvfrom(256); '
+        's.sendto(sys.argv[2].encode(),peer)', str(remote), raw],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert responder.stdout.readline() == 'ready\n'
+        launch[0]['pmc'] = (
+            'import socket,sys; s=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM); '
+            's.settimeout(.2); s.bind(sys.argv[sys.argv.index("-i")+1]); '
+            f's.sendto(b"GET TIME_PROPERTIES_DATA_SET",{str(remote)!r}); '
+            'print(s.recv(8192).decode(),flush=True)')
+        monkeypatch.setattr(monitor(), '_FIRST_PROPERTIES_S', 0)
+        timer = threading.Timer(.4, item.request_stop)
+        timer.start()
+        try:
+            assert item.run() == 0
+        finally:
+            timer.cancel()
+            timer.join()
+        assert responder.wait(timeout=.5) == 0
+        events = [json.loads(line) for line in (item.output/'evidence.jsonl').read_text().splitlines()]
+        assert any(e['kind'] == 'properties' and e['returncode'] == 0 for e in events)
+    finally:
+        if responder.poll() is None:
+            responder.kill()
+        responder.wait(timeout=1)
+        responder.stdout.close()
+        responder.stderr.close()

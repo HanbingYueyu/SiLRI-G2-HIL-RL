@@ -31,6 +31,44 @@ _MAX_PROPERTIES_BYTES = 8192
 _MAX_LOG_BYTES = 64 * 1024 * 1024
 
 
+def _create_session_directory(path):
+    """Walk without symlinks and create a private directory under pinned parents."""
+    if '..' in path.parts:
+        raise ValueError('Session output cannot contain parent traversal')
+    parts = path.absolute().parts
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    current = os.open(parts[0], flags)
+    try:
+        for part in parts[1:-1]:
+            try:
+                child = os.open(part, flags, dir_fd=current)
+            except FileNotFoundError:
+                os.mkdir(part, 0o700, dir_fd=current)
+                child = os.open(part, flags, dir_fd=current)
+            os.close(current)
+            current = child
+            metadata = os.fstat(current)
+            root_sticky = metadata.st_uid == 0 and metadata.st_mode & stat.S_ISVTX
+            if (metadata.st_uid not in (0, os.getuid()) or
+                    (metadata.st_mode & 0o002 and not root_sticky) or
+                    (metadata.st_mode & 0o020 and metadata.st_gid != os.getgid() and
+                     not root_sticky)):
+                raise PermissionError('Session output ancestor is not trusted')
+        os.mkdir(parts[-1], 0o700, dir_fd=current)
+        created = os.stat(parts[-1], dir_fd=current, follow_symlinks=False)
+        if not stat.S_ISDIR(created.st_mode):
+            raise PermissionError('New session directory was replaced')
+        result = os.open(parts[-1], flags, dir_fd=current)
+        opened = os.fstat(result)
+        if (opened.st_uid != os.getuid() or stat.S_IMODE(opened.st_mode) != 0o700 or
+                (created.st_dev, created.st_ino) != (opened.st_dev, opened.st_ino)):
+            os.close(result)
+            raise PermissionError('New session directory was replaced or is not private')
+        return result
+    finally:
+        os.close(current)
+
+
 def ptp_monitor_command(max_seconds, uds, uds_ro) -> list[str]:
     if type(max_seconds) is not int or not 60 <= max_seconds <= 43200:
         raise ValueError('PTP duration must be 60..43200 seconds')
@@ -63,12 +101,14 @@ class MonitorRuntime:
         self.window = ClockWindow(master, boot, self.session_id)
         self._lock = threading.RLock()
         self._failure = None
-        self._stop = threading.Event()
+        self._stop_signal = None
         self._used = False
         self.process = self._pmc = self._server = self._log = None
         self._log_bytes = 0
         self._last_state = None
         self._socket_identity = None
+        self._directory_fd = None
+        self._pmc_address = None
 
     def provider(self):
         with self._lock:
@@ -84,8 +124,17 @@ class MonitorRuntime:
             return self.provider()
 
     def request_stop(self, signum=None, _frame=None):
-        self._fail('stop_requested' if signum is None else f'signal:{signum}')
-        self._stop.set()
+        # Python may invoke this while the main thread holds the window lock
+        # and the IPC thread holds the runtime lock. Even Event.set takes a
+        # lock: the handler must only store a scalar for the main loop.
+        self._stop_signal = 0 if signum is None else signum
+
+    def _apply_stop(self):
+        signum = self._stop_signal
+        if signum is None:
+            return False
+        self._fail('stop_requested' if signum == 0 else f'signal:{signum}')
+        return True
 
     def _record(self, kind, **fields):
         data = (json.dumps(dict(kind=kind, mono_ns=time.monotonic_ns(), **fields),
@@ -113,21 +162,38 @@ class MonitorRuntime:
         for path in (self.output, self.socket_path, self._pmc_path, self.uds, self.uds_ro):
             if os.path.lexists(path):
                 raise FileExistsError(f'Clock session resource already exists: {path}')
-        self.output.mkdir(mode=0o700, parents=True, exist_ok=False)
-        self.output.chmod(0o700)
-        self._log = (self.output/'evidence.jsonl').open('xb')
-        self._server = SnapshotServer(self.socket_path, self.provider)
-        metadata = self.socket_path.lstat()
+        self._directory_fd = _create_session_directory(self.output)
+        if not self._directory_valid():
+            raise PermissionError('Session output pathname was replaced')
+        log_fd = os.open('evidence.jsonl', os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                         os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=self._directory_fd)
+        self._log = os.fdopen(log_fd, 'wb')
+        self._server = SnapshotServer(self.socket_path, self.provider,
+                                      directory_fd=self._directory_fd)
+        metadata = os.stat('clock.sock', dir_fd=self._directory_fd, follow_symlinks=False)
         self._socket_identity = (metadata.st_dev, metadata.st_ino)
+        # PMC uses datagrams: the peer resolves the return address in its own
+        # process, so /proc/self would refer to ptp4l instead of this owner.
+        self._pmc_address = f'/proc/{os.getpid()}/fd/{self._directory_fd}/pmc.sock'
+
+    def _directory_valid(self):
+        try:
+            if self._directory_fd is None:
+                return False
+            opened = os.fstat(self._directory_fd)
+            named = self.output.lstat()
+            return (stat.S_ISDIR(named.st_mode) and opened.st_uid == os.getuid() and
+                    stat.S_IMODE(opened.st_mode) == 0o700 and
+                    (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino))
+        except OSError:
+            return False
 
     def _socket_valid(self):
         try:
-            metadata = self.socket_path.lstat()
-            parent = self.socket_path.parent.lstat()
-            return (stat.S_ISDIR(parent.st_mode) and
-                    parent.st_uid == os.getuid() and
-                    stat.S_IMODE(parent.st_mode) == 0o700 and
-                    stat.S_ISSOCK(metadata.st_mode) and
+            if not self._directory_valid():
+                return False
+            metadata = os.stat('clock.sock', dir_fd=self._directory_fd, follow_symlinks=False)
+            return (stat.S_ISSOCK(metadata.st_mode) and
                     (metadata.st_dev, metadata.st_ino) == self._socket_identity and
                     metadata.st_uid == os.getuid() and
                     stat.S_IMODE(metadata.st_mode) == 0o600)
@@ -136,7 +202,7 @@ class MonitorRuntime:
 
     def _start_pmc(self, selector):
         command = ['/usr/sbin/pmc', '-u', '-b', '0', '-s', self.uds_ro,
-                   '-i', str(self._pmc_path), 'GET TIME_PROPERTIES_DATA_SET']
+                   '-i', self._pmc_address, 'GET TIME_PROPERTIES_DATA_SET']
         self._pmc = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      start_new_session=True, shell=False)
@@ -148,7 +214,12 @@ class MonitorRuntime:
         pmc_deadline = None
         ptp_buffer, pmc_buffer = b'', b''
         pmc_eof = False
-        while not self._stop.is_set():
+        while True:
+            if self._apply_stop():
+                return 0
+            if not self._server.is_serving():
+                self._fail('snapshot_server_unavailable')
+                return 2
             if not self._socket_valid():
                 self._fail('snapshot_socket_invalid')
                 return 2
@@ -191,8 +262,10 @@ class MonitorRuntime:
                         self.window.feed_ptp(raw, mono, wall)
                     if len(ptp_buffer) > _MAX_LINE_BYTES:
                         self._fail('ptp_line_too_large')
+            if self._apply_stop():
+                return 0
             if self._failure is not None:
-                return 0 if self._stop.is_set() else 2
+                return 2
             # An inherited pipe must not hide the owned leader's exit.
             code = self.process.poll()
             if code is not None:
@@ -218,8 +291,7 @@ class MonitorRuntime:
                     self._fail('properties_query_timeout')
             self._state()
             if self._failure is not None:
-                return 0 if self._stop.is_set() else 2
-        return 0
+                return 2
 
     def _stop_children(self):
         # Child leaders remain unreaped until poll/wait, so their PID cannot be
@@ -265,7 +337,7 @@ class MonitorRuntime:
             if threading.current_thread() is threading.main_thread():
                 for sig in (signal.SIGINT, signal.SIGTERM):
                     handlers[sig] = signal.signal(sig, self.request_stop)
-            if self._stop.is_set():
+            if self._apply_stop():
                 code = 0
                 return code
             self.process = subprocess.Popen(self.command, stdin=subprocess.DEVNULL,
@@ -285,6 +357,7 @@ class MonitorRuntime:
             return 2
         finally:
             # Publish failure before signalling any process or closing IPC.
+            self._apply_stop()
             snapshot = self._fail('monitor_shutdown')
             try:
                 if self._log is not None:
@@ -298,6 +371,9 @@ class MonitorRuntime:
                     self._server.close()
                 if self._log is not None:
                     self._log.close()
+                if self._directory_fd is not None:
+                    os.close(self._directory_fd)
+                    self._directory_fd = None
                 for sig, handler in handlers.items():
                     signal.signal(sig, handler)
 

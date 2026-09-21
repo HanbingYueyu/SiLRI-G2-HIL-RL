@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 from dataclasses import asdict, replace
 import json
+import os
 from pathlib import Path
 import socket
 import stat
@@ -440,3 +441,85 @@ def test_close_is_idempotent_and_disables_future_use(tmp_path, server_factory):
     server.close()
     server.close()
     assert not server.path.exists()
+
+
+def test_server_liveness_detects_closed_listener_with_socket_inode_intact(tmp_path, server_factory):
+    server = server_factory(tmp_path/'clock.sock')
+    assert server.is_serving() is True
+    server._listener.close()
+    server._thread.join(timeout=.5)
+    assert server.path.exists()
+    assert server.is_serving() is False
+
+
+def test_server_liveness_detects_stopped_worker_with_open_listener(tmp_path, monkeypatch):
+    monkeypatch.setattr(SnapshotServer, '_serve', lambda self: None)
+    server = SnapshotServer(tmp_path/'clock.sock', healthy_snapshot)
+    try:
+        server._thread.join(timeout=.5)
+        assert server._listener.fileno() >= 0
+        assert server.path.exists()
+        assert server.is_serving() is False
+    finally:
+        server.close()
+
+
+def test_server_accepts_private_directory_descriptor_without_changing_protocol(tmp_path):
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        server = SnapshotServer(tmp_path/'clock.sock', healthy_snapshot, directory_fd=fd)
+        try:
+            client = SnapshotClient(server.path, timeout_s=.1, expected_master=MASTER)
+            assert client.read().healthy is True
+            assert stat.S_IMODE(server.path.stat().st_mode) == 0o600
+        finally:
+            server.close()
+        # The supplied descriptor is borrowed, not consumed.
+        assert stat.S_ISDIR(os.fstat(fd).st_mode)
+    finally:
+        os.close(fd)
+
+
+def test_server_rejects_descriptor_path_mismatch_without_writing_external_target(tmp_path):
+    parent = tmp_path/'private'
+    parent.mkdir(mode=0o700)
+    fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    victim = tmp_path/'existing'
+    victim.mkdir(mode=0o755)
+    parent.rename(tmp_path/'detached')
+    parent.symlink_to(victim, target_is_directory=True)
+    try:
+        with pytest.raises(PermissionError):
+            SnapshotServer(parent/'clock.sock', healthy_snapshot, directory_fd=fd)
+        assert stat.S_IMODE(victim.stat().st_mode) == 0o755
+        assert list(victim.iterdir()) == []
+    finally:
+        os.close(fd)
+
+
+def test_parent_replacement_after_socket_bind_cannot_chmod_external_target(tmp_path, monkeypatch):
+    parent = tmp_path/'private'
+    parent.mkdir(mode=0o700)
+    victim = tmp_path/'existing'
+    victim.mkdir(mode=0o755)
+    target = victim/'clock.sock'
+    target.write_text('keep me')
+    target.chmod(0o644)
+    original = socket.socket.bind
+
+    def replace_after_bind(listener, address):
+        original(listener, address)
+        parent.rename(tmp_path/'detached')
+        parent.symlink_to(victim, target_is_directory=True)
+
+    monkeypatch.setattr(socket.socket, 'bind', replace_after_bind)
+    server = None
+    try:
+        with pytest.raises(PermissionError):
+            server = SnapshotServer(parent/'clock.sock', healthy_snapshot)
+    finally:
+        if server is not None:
+            server.close()
+    assert target.read_text() == 'keep me'
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+    assert not (tmp_path/'detached'/'clock.sock').exists()

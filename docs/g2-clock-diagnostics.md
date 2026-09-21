@@ -16,6 +16,8 @@ sudo -v && bash run_g2_python.sh -m g2_local.clock_monitor \
 `--max-seconds` 必须显式提供，范围为 60–43200 秒，到期退出且不会自动重启。
 每轮创建 `runtime/clock_monitor/<随机会话>/`，终端打印本轮 `clock.sock` 地址。
 也可以用 `--output` 指定全新的输出目录；已有目录或 socket 会在启动 sudo 前拒绝。
+输出路径不接受符号链接或不可信的可写祖先；目录身份若被替换会拒绝或停止本轮，
+不会通过替换后的路径修改已有目录或证据。
 使用较短路径，Unix socket 地址必须适合系统的路径长度上限。
 目录权限为 0700、快照 socket 为 0600。普通用户 Actor/Gym 在另一终端独立启动，
 只读取本轮 socket；不调用 sudo，不启动或停止 PTP。此次真实 `allow_motion=False`
@@ -30,7 +32,8 @@ sudo -v && bash run_g2_python.sh -m g2_local.clock_monitor \
 至少 8 个有效 PTP 样本、覆盖 10 秒且属性通过后才可发布健康映射。租约固定截止
 最后有效样本后 2.5 秒；读取快照不会延长租约。PTP 退出、属性查询失败、数据损坏、
 socket 丢失或证据写入失败均进入不健康状态并退出。`evidence.jsonl` 记录原始 PTP
-行、属性响应、映射变化和退出原因；单行 PTP 上限 4096 字节、属性响应上限
+行、属性响应、映射变化和退出原因；IPC 服务线程停止或监听器失效同样会停止本轮。
+单行 PTP 上限 4096 字节、属性响应上限
 8192 字节、证据文件上限 64 MiB，达到限制停止本次会话，不覆盖已有证据。
 
 停止时先结束独立 Actor/只读消费进程，再在终端 A 按 **Ctrl+C**。

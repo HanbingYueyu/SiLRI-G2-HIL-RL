@@ -189,24 +189,34 @@ def _secure_parent(path):
     parent = path.parent
     try:
         parent.mkdir(mode=0o700)
-        parent.chmod(0o700)
     except FileExistsError:
-        metadata = parent.lstat()
-        if (not stat.S_ISDIR(metadata.st_mode) or
-                metadata.st_uid != os.getuid() or
-                stat.S_IMODE(metadata.st_mode) != 0o700):
-            raise PermissionError('Snapshot socket parent must be private')
-    metadata = parent.lstat()
-    if (not stat.S_ISDIR(metadata.st_mode) or
+        pass
+    try:
+        return os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as error:
+        raise PermissionError('Snapshot socket parent must be a real private directory') from error
+
+
+def _validate_directory_fd(fd, parent):
+    metadata = os.fstat(fd)
+    named = parent.lstat()
+    if (not stat.S_ISDIR(metadata.st_mode) or not stat.S_ISDIR(named.st_mode) or
             metadata.st_uid != os.getuid() or
-            stat.S_IMODE(metadata.st_mode) != 0o700):
-        raise PermissionError('Snapshot socket parent must be private')
+            stat.S_IMODE(metadata.st_mode) != 0o700 or
+            (metadata.st_dev, metadata.st_ino) != (named.st_dev, named.st_ino)):
+        raise PermissionError('Snapshot socket parent must be the same private directory')
 
 
 class SnapshotServer:
     """Serve exactly one read-only snapshot request per Unix connection."""
 
-    def __init__(self, path: Path, provider, *, request_limit=256):
+    def __init__(self, path: Path, provider, *, request_limit=256, directory_fd=None):
+        """Borrow a private directory descriptor to anchor filesystem writes.
+
+        When supplied, directory_fd must name path.parent. The server owns a
+        duplicate until close, so caller lifetime and pathname replacement
+        cannot redirect bind/chmod/unlink to a different directory.
+        """
         self.path = Path(path)
         if not callable(provider):
             raise TypeError('Snapshot provider must be callable')
@@ -223,38 +233,59 @@ class SnapshotServer:
         self._socket_identity = None
         self._listener = None
         self._thread = None
-
-        _secure_parent(self.path)
-        if self.path.exists() or self.path.is_symlink():
-            raise FileExistsError(self.path)
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._directory_fd = None
+        listener = None
         try:
-            listener.bind(str(self.path))
-            self.path.chmod(0o600)
-            metadata = self.path.lstat()
-            self._socket_identity = (metadata.st_dev, metadata.st_ino)
+            self._directory_fd = (_secure_parent(self.path) if directory_fd is None
+                                  else os.dup(directory_fd))
+            _validate_directory_fd(self._directory_fd, self.path.parent)
+            try:
+                os.stat(self.path.name, dir_fd=self._directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileExistsError(self.path)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(f'/proc/self/fd/{self._directory_fd}/{self.path.name}')
+            # Pin the socket inode before chmod. O_PATH opens a socket without
+            # connecting, and O_NOFOLLOW prevents a substituted symlink.
+            socket_fd = os.open(self.path.name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                dir_fd=self._directory_fd)
+            try:
+                metadata = os.fstat(socket_fd)
+                if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.getuid():
+                    raise PermissionError('Snapshot socket was replaced')
+                self._socket_identity = (metadata.st_dev, metadata.st_ino)
+                _validate_directory_fd(self._directory_fd, self.path.parent)
+                os.chmod(f'/proc/self/fd/{socket_fd}', 0o600)
+            finally:
+                os.close(socket_fd)
             listener.listen()
             listener.settimeout(0.05)
+            self._listener = listener
+            self._thread = threading.Thread(
+                target=self._serve,
+                name=f'clock-snapshot:{self.path.name}',
+                daemon=True,
+            )
+            self._thread.start()
         except Exception:
-            listener.close()
+            if listener is not None:
+                listener.close()
             self._unlink_owned_socket()
+            if self._directory_fd is not None:
+                os.close(self._directory_fd)
+                self._directory_fd = None
             raise
-        self._listener = listener
-        self._thread = threading.Thread(
-            target=self._serve,
-            name=f'clock-snapshot:{self.path.name}',
-            daemon=True,
-        )
-        self._thread.start()
 
     def _unlink_owned_socket(self):
-        if self._socket_identity is None:
+        if self._socket_identity is None or self._directory_fd is None:
             return
         try:
-            metadata = self.path.lstat()
+            metadata = os.stat(self.path.name, dir_fd=self._directory_fd, follow_symlinks=False)
             if ((metadata.st_dev, metadata.st_ino) == self._socket_identity and
                     stat.S_ISSOCK(metadata.st_mode)):
-                self.path.unlink()
+                os.unlink(self.path.name, dir_fd=self._directory_fd)
         except FileNotFoundError:
             pass
 
@@ -331,6 +362,20 @@ class SnapshotServer:
                     if self._active_connection is connection:
                         self._active_connection = None
 
+    def is_serving(self):
+        """Whether the worker and listening socket are still live.
+
+        This checks service resources, not just the persistent socket inode.
+        Owners must treat False as terminal for this server instance.
+        """
+        if (self._closed.is_set() or self._thread is None or
+                not self._thread.is_alive() or self._listener is None):
+            return False
+        try:
+            return self._listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 1
+        except OSError:
+            return False
+
     def close(self):
         with self._close_lock:
             if self._close_complete:
@@ -353,6 +398,9 @@ class SnapshotServer:
             if thread is not None:
                 thread.join()
             self._unlink_owned_socket()
+            if self._directory_fd is not None:
+                os.close(self._directory_fd)
+                self._directory_fd = None
             self._close_complete = True
 
 
