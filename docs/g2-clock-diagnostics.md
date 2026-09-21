@@ -30,12 +30,8 @@ bash run_g2_python.sh -m g2_local.clock_monitor \
 只读取本轮 socket；不调用 sudo，不启动或停止 PTP。此次真实 `allow_motion=False`
 保持不变，监控健康也不代表运动获准。
 
-启动前和 sudo 认证后，监控都以固定绝对路径只读执行
-`/usr/sbin/ethtool -T enp3s0`，要求同时报告 `hardware-transmit`、
-`hardware-receive`、`hardware-raw-clock` 与可用 PTP Hardware Clock；任一项缺失、
-查询失败或输出异常都会在启动 `ptp4l` 前拒绝本轮，绝不回退软件时间戳。
 完成上述凭据验证后，监控以固定绝对路径启动 `sudo -n → timeout → stdbuf → ptp4l`，
-接口固定 `enp3s0`，二层 E2E、硬件时间戳（`-H`）、client-only、`free_running=1`，
+接口固定 `enp3s0`，二层 E2E、软件时间戳、client-only、`free_running=1`，
 不会改变系统时间或 PHC，也不调用 `phc2sys`。PMC 以普通用户运行，仅向会话专属
 只读 UDS 发出 `GET TIME_PROPERTIES_DATA_SET`；可写管理 UDS 权限为 0600，
 只读 UDS 为 0666。初次属性查询在启动后 8 秒开始，之后约每 5 秒查询一次。

@@ -30,32 +30,14 @@ def timestamp_context():
     return ('tty', os.getsid(0), tty) if tty else ('ppid', os.getpid())
 
 
-def test_fixed_command_requires_hardware_timestamping_and_is_finitely_bounded():
+def test_fixed_command_is_non_adjusting_get_only_and_finitely_bounded():
     cmd = monitor().ptp_monitor_command(3600, '/var/run/g2-live-a', '/var/run/g2-live-a-ro')
     assert cmd == ['/usr/bin/sudo', '-n', '/usr/bin/timeout', '--signal=INT',
                    '--kill-after=3s', '3600s', '/usr/bin/stdbuf', '-oL', '-eL',
-                   '/usr/sbin/ptp4l', '-i', 'enp3s0', '-2', '-E', '-H', '-s', '-m', '-q',
+                   '/usr/sbin/ptp4l', '-i', 'enp3s0', '-2', '-E', '-S', '-s', '-m', '-q',
                    '--free_running=1', '--utc_offset=37', '--uds_file_mode=0600',
                    '--uds_ro_file_mode=0666', '--uds_address=/var/run/g2-live-a',
                    '--uds_ro_address=/var/run/g2-live-a-ro']
-
-
-def test_preflight_rejects_interface_without_hardware_tx_rx_and_phc(tmp_path, monkeypatch):
-    """A missing capability must stop before credentials or ptp4l launch."""
-    calls = []
-
-    def ethtool(argv, **kwargs):
-        calls.append((argv, kwargs))
-        return subprocess.CompletedProcess(argv, 0, stdout=(
-            'Time stamping parameters for enp3s0:\nCapabilities:\n'
-            ' software-transmit\n software-receive\nPTP Hardware Clock: none\n'))
-
-    monkeypatch.setattr(monitor().subprocess, 'run', ethtool)
-    with pytest.raises(RuntimeError, match='hardware transmit/receive timestamps and a PHC'):
-        runtime(tmp_path)._preflight()
-    assert calls == [(['/usr/sbin/ethtool', '-T', 'enp3s0'], dict(
-        check=True, shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, text=True, timeout=3))]
 
 
 @pytest.mark.parametrize('seconds', [True, 59, 43201, 60.0, '60'])
@@ -79,13 +61,6 @@ def credentials(monkeypatch):
     state = {'calls': [], 'ticket_context': None, 'returncode': 0, 'inspect': None}
 
     def validate(argv, **kwargs):
-        if argv == ['/usr/sbin/ethtool', '-T', 'enp3s0']:
-            assert kwargs == dict(check=True, shell=False, stdin=subprocess.DEVNULL,
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                  text=True, timeout=3)
-            return subprocess.CompletedProcess(argv, 0, stdout=(
-                'Capabilities:\n hardware-transmit\n hardware-receive\n'
-                ' hardware-raw-clock\nPTP Hardware Clock: 1\n'))
         assert argv == ['/usr/bin/sudo', '-v']
         assert kwargs == dict(check=True, shell=False, stdin=None, stdout=None, stderr=None)
         state['calls'].append((argv, kwargs))
@@ -593,8 +568,6 @@ probe = "import json,os; f=open('/proc/self/stat').read().rsplit(') ',1)[1].spli
 authenticated = None
 def validate(argv, **kwargs):
     global authenticated
-    if argv == ['/usr/sbin/ethtool','-T','enp3s0']:
-        return subprocess.CompletedProcess(argv,0,stdout='Capabilities\n hardware-transmit\n hardware-receive\n hardware-raw-clock\nPTP Hardware Clock: 1\n')
     assert argv == ['/usr/bin/sudo','-v']
     child = original_popen([sys.executable,'-c',probe], stdout=subprocess.PIPE, text=True)
     authenticated = json.loads(child.communicate(timeout=1)[0])

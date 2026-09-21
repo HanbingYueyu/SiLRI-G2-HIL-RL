@@ -30,9 +30,7 @@ checkpoint SHA-256 为 `aa9bb8ad3b271745855d06d231db349b91f79a7750fbf59889353e1f
 
 已实现独立前台 `clock_monitor`、只读短租约快照 IPC、GDK 四源时间戳/双向 TF
 证据、有状态 freshness guard，以及 MotionBackend/Gym 的失败原因传递和永久锁止。
-监控使用不校时、强制硬件时间戳的固定 PTP 命令（启动前验证 `enp3s0` 的硬件
-TX/RX/raw-clock 与 PHC，缺失即拒绝且绝不回退软件时间戳），Actor 不控制 PTP；
-健康快照不能提升运动许可。
+监控使用不校时的固定 PTP 命令，Actor 不控制 PTP；健康快照不能提升运动许可。
 GdkReader 保持 `allow_motion=False`，运动后端尚未接入正式真机 Actor。
 
 新增 `freshness_audit`：显式 30–1800 秒，只读采集双相机/GDK 和持续映射，

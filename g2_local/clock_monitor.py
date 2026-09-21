@@ -30,10 +30,6 @@ _PMC_TIMEOUT_S = 3
 _MAX_LINE_BYTES = 4096
 _MAX_PROPERTIES_BYTES = 8192
 _MAX_LOG_BYTES = 64 * 1024 * 1024
-_PTP_INTERFACE = 'enp3s0'
-_ETHTOOL = '/usr/sbin/ethtool'
-_HARDWARE_TIMESTAMP_CAPABILITIES = frozenset((
-    'hardware-transmit', 'hardware-receive', 'hardware-raw-clock'))
 
 
 def _create_session_directory(path, *, create=True):
@@ -78,34 +74,6 @@ def _create_session_directory(path, *, create=True):
         os.close(current)
 
 
-def _has_required_hardware_timestamping(report):
-    """Accept only an ethtool report with hardware TX/RX timestamps and PHC."""
-    if type(report) is not str:
-        return False
-    capabilities = set()
-    phc = False
-    for line in report.splitlines():
-        field = line.strip()
-        if field in _HARDWARE_TIMESTAMP_CAPABILITIES:
-            capabilities.add(field)
-        if re.fullmatch(r'PTP Hardware Clock:\s+\d+', field):
-            phc = True
-    return capabilities == _HARDWARE_TIMESTAMP_CAPABILITIES and phc
-
-
-def _require_hardware_timestamping():
-    """Read and validate fixed-interface timestamp capabilities before launch."""
-    try:
-        result = subprocess.run(
-            [_ETHTOOL, '-T', _PTP_INTERFACE], check=True, shell=False,
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=3)
-    except (OSError, subprocess.SubprocessError) as error:
-        raise RuntimeError('Cannot verify enp3s0 hardware timestamp capability') from error
-    if not _has_required_hardware_timestamping(result.stdout):
-        raise RuntimeError('enp3s0 requires hardware transmit/receive timestamps and a PHC')
-
-
 def ptp_monitor_command(max_seconds, uds, uds_ro) -> list[str]:
     if type(max_seconds) is not int or not 60 <= max_seconds <= 43200:
         raise ValueError('PTP duration must be 60..43200 seconds')
@@ -115,7 +83,7 @@ def ptp_monitor_command(max_seconds, uds, uds_ro) -> list[str]:
         raise ValueError('Session-specific PTP UDS pair required')
     return ['/usr/bin/sudo', '-n', '/usr/bin/timeout', '--signal=INT',
             '--kill-after=3s', f'{max_seconds}s', '/usr/bin/stdbuf', '-oL', '-eL',
-            '/usr/sbin/ptp4l', '-i', _PTP_INTERFACE, '-2', '-E', '-H', '-s', '-m', '-q',
+            '/usr/sbin/ptp4l', '-i', 'enp3s0', '-2', '-E', '-S', '-s', '-m', '-q',
             '--free_running=1', '--utc_offset=37', '--uds_file_mode=0600',
             '--uds_ro_file_mode=0666', f'--uds_address={uds}', f'--uds_ro_address={uds_ro}']
 
@@ -263,7 +231,6 @@ class MonitorRuntime:
             if os.path.lexists(path):
                 raise FileExistsError(f'Clock session resource already exists: {path}')
         _create_session_directory(self.output, create=False)
-        _require_hardware_timestamping()
 
     def _prepare(self):
         # Authentication may wait for operator input. Check paths again before
