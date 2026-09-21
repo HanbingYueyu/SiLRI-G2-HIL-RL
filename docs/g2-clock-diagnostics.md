@@ -9,11 +9,16 @@
 
 ```bash
 cd /home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL
-sudo -v && bash run_g2_python.sh -m g2_local.clock_monitor \
+bash run_g2_python.sh -m g2_local.clock_monitor \
   --master 044052.fffe.000010 --max-seconds 43200
 ```
 
 `--max-seconds` 必须显式提供，范围为 60–43200 秒，到期退出且不会自动重启。
+监控在完成路径安全预检后，由普通用户 Python 主进程执行一次固定的
+`/usr/bin/sudo -v`，需要密码时直接在当前终端输入。认证通过后才创建会话证据并
+启动固定的 `sudo -n` PTP 子会话；认证失败不创建输出、不启动 PTP。外层 shell
+预先 `sudo -v` 在本机票据策略下不足以代替这一步，无需额外执行。不要用 sudo
+启动 Python/GDK；程序不读取、转存或记录密码。
 每轮创建 `runtime/clock_monitor/<随机会话>/`，终端打印本轮 `clock.sock` 地址。
 也可以用 `--output` 指定全新的输出目录；已有目录或 socket 会在启动 sudo 前拒绝。
 输出路径不接受符号链接或不可信的可写祖先；目录身份若被替换会拒绝或停止本轮，
@@ -23,7 +28,7 @@ sudo -v && bash run_g2_python.sh -m g2_local.clock_monitor \
 只读取本轮 socket；不调用 sudo，不启动或停止 PTP。此次真实 `allow_motion=False`
 保持不变，监控健康也不代表运动获准。
 
-监控仅以固定绝对路径启动 `sudo -n → timeout → stdbuf → ptp4l`，
+完成上述凭据验证后，监控以固定绝对路径启动 `sudo -n → timeout → stdbuf → ptp4l`，
 接口固定 `enp3s0`，二层 E2E、软件时间戳、client-only、`free_running=1`，
 不会改变系统时间或 PHC，也不调用 `phc2sys`。PMC 以普通用户运行，仅向会话专属
 只读 UDS 发出 `GET TIME_PROPERTIES_DATA_SET`；可写管理 UDS 权限为 0600，
@@ -62,10 +67,12 @@ ps -eo pid,ppid,pgid,user,comm,args | rg 'ptp4l|phc2sys|clock_monitor'
 
 ```bash
 cd /home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL
-sudo -v && bash run_g2_python.sh -m g2_local.clock_monitor \
+bash run_g2_python.sh -m g2_local.clock_monitor \
   --master 044052.fffe.000010 --max-seconds 120 \
-  --output /tmp/g2-clock-audit-20260921-01
+  --output /tmp/g2-clock-audit-20260921-02
 ```
+
+保留 `/tmp/g2-clock-audit-20260921-01` 的原始认证失败证据；本轮使用新的 `-02`。
 
 监控预热需至少 8 个有效样本且跨度至少 10 秒，并取得健康属性；留出约 15 秒，
 以健康快照为准。审计遇到尚未预热、过期或断开的监控会失败退出，不自动重试。
@@ -77,7 +84,7 @@ sudo -v && bash run_g2_python.sh -m g2_local.clock_monitor \
 ```bash
 cd /home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL
 bash run_g2_python.sh -m g2_local.freshness_audit \
-  --socket /tmp/g2-clock-audit-20260921-01/clock.sock \
+  --socket /tmp/g2-clock-audit-20260921-02/clock.sock \
   --seconds 60 --inference-delay-s 0.02
 ```
 

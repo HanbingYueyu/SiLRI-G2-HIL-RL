@@ -49,7 +49,27 @@ def test_command_rejects_non_session_socket_paths(uds, ro):
 
 
 @pytest.fixture
-def launch(monkeypatch):
+def credentials(monkeypatch):
+    """Inject the sole interactive subprocess boundary without executing sudo."""
+    state = {'calls': [], 'authenticated': False, 'returncode': 0, 'inspect': None}
+
+    def validate(argv, **kwargs):
+        assert argv == ['/usr/bin/sudo', '-v']
+        assert kwargs == dict(check=True, shell=False, stdin=None, stdout=None, stderr=None)
+        state['calls'].append((argv, kwargs))
+        if state['inspect'] is not None:
+            state['inspect']()
+        if state['returncode']:
+            raise subprocess.CalledProcessError(state['returncode'], argv)
+        state['authenticated'] = True
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(monitor().subprocess, 'run', validate)
+    return state
+
+
+@pytest.fixture
+def launch(monkeypatch, credentials):
     """Run harmless real pipes/processes instead of either external executable."""
     module = monitor()
     original = subprocess.Popen
@@ -62,6 +82,8 @@ def launch(monkeypatch):
         calls.append((argv, kwargs))
         assert kwargs.get('shell', False) is False
         script = scripts['ptp' if argv[0] == '/usr/bin/sudo' else 'pmc']
+        if argv[0] == '/usr/bin/sudo' and not credentials['authenticated']:
+            script = 'print("sudo: 需要密码"); raise SystemExit(1)'
         child = original([PYTHON, '-c', script, *argv], **kwargs)
         children.append(child)
         return child
@@ -117,7 +139,7 @@ def test_stop_publishes_unhealthy_before_signalling_only_owned_group(tmp_path, l
 
 
 @pytest.mark.parametrize('existing', ['output', 'socket', 'uds', 'uds_ro', 'symlink'])
-def test_existing_resources_rejected_before_sudo(tmp_path, launch, monkeypatch, existing):
+def test_existing_resources_rejected_before_sudo(tmp_path, launch, credentials, monkeypatch, existing):
     item = runtime(tmp_path)
     if existing == 'output':
         item.output.mkdir()
@@ -133,6 +155,7 @@ def test_existing_resources_rejected_before_sudo(tmp_path, launch, monkeypatch, 
     with pytest.raises(FileExistsError):
         item.run()
     assert launch[1] == []
+    assert credentials['calls'] == []
 
 
 @pytest.mark.parametrize('script,reason', [
@@ -312,11 +335,12 @@ def test_monitor_deadline_stops_owned_child_even_if_timeout_wrapper_misbehaves(t
     assert launch[2][0].poll() is not None
 
 
-def test_running_python_as_root_is_rejected_before_sudo(tmp_path, launch, monkeypatch, capsys):
+def test_running_python_as_root_is_rejected_before_sudo(tmp_path, launch, credentials, monkeypatch, capsys):
     monkeypatch.setattr(monitor().os, 'geteuid', lambda: 0)
     item = runtime(tmp_path)
     assert item.run() == 2
     assert launch[1] == []
+    assert credentials['calls'] == []
     assert not item.output.exists()
     assert 'ordinary operator' in capsys.readouterr().err
 
@@ -416,7 +440,7 @@ def test_output_replaced_by_symlink_after_mkdir_cannot_modify_existing_target(tm
 
 
 @pytest.mark.parametrize('ancestor', ['symlink', 'world_writable'])
-def test_unsafe_output_ancestor_is_rejected_without_creating_external_session(tmp_path, launch, ancestor):
+def test_unsafe_output_ancestor_is_rejected_without_creating_external_session(tmp_path, launch, credentials, ancestor):
     launch[0]['ptp'] = 'raise SystemExit(7)'
     parent = tmp_path/'parent'
     if ancestor == 'symlink':
@@ -430,6 +454,7 @@ def test_unsafe_output_ancestor_is_rejected_without_creating_external_session(tm
     assert item.run() == 2
     assert not item.output.exists()
     assert launch[1] == []
+    assert credentials['calls'] == []
 
 
 def test_pmc_anchored_datagram_address_can_receive_reply_from_another_process(tmp_path, launch, monkeypatch):
@@ -465,3 +490,40 @@ def test_pmc_anchored_datagram_address_can_receive_reply_from_another_process(tm
         responder.wait(timeout=1)
         responder.stdout.close()
         responder.stderr.close()
+
+
+def test_monitor_authenticates_itself_before_evidence_and_detached_sudo(tmp_path, launch, credentials):
+    item = runtime(tmp_path)
+    launch[0]['ptp'] = 'raise SystemExit(0)'
+
+    def before_authentication():
+        assert not item.output.exists()
+        assert launch[1] == []
+
+    credentials['inspect'] = before_authentication
+    # An external shell ticket intentionally does not set this Python
+    # parent's authentication state. Detached sudo -n rejects it in launch.
+    assert item.run() == 0
+    assert len(credentials['calls']) == 1
+    assert launch[1][0][0][:2] == ['/usr/bin/sudo', '-n']
+    assert launch[1][0][1]['start_new_session'] is True
+    assert (item.output/'evidence.jsonl').exists()
+
+
+def test_failed_interactive_authentication_creates_no_output_or_ptp_child(tmp_path, launch, credentials):
+    item = runtime(tmp_path)
+    credentials['returncode'] = 1
+    assert item.run() == 2
+    assert len(credentials['calls']) == 1
+    assert not item.output.exists()
+    assert launch[1] == []
+
+
+def test_path_created_during_authentication_is_not_overwritten(tmp_path, launch, credentials):
+    item = runtime(tmp_path)
+    credentials['inspect'] = lambda: item.output.mkdir()
+    with pytest.raises(FileExistsError):
+        item.run()
+    assert len(credentials['calls']) == 1
+    assert list(item.output.iterdir()) == []
+    assert launch[1] == []

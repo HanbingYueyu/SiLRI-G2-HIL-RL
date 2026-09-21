@@ -1,7 +1,8 @@
 """Operator-owned foreground PTP measurement; never adjusts a clock or robot.
 
-Only the fixed, time-bounded ptp4l command uses sudo. IPC and PMC run as the
-operator; neither accepts a command from an Actor.
+Sudo is limited to interactive credential validation and the fixed,
+time-bounded ptp4l command. IPC and PMC run as the operator; neither accepts
+a command from an Actor.
 """
 import argparse
 from dataclasses import asdict, replace
@@ -31,8 +32,8 @@ _MAX_PROPERTIES_BYTES = 8192
 _MAX_LOG_BYTES = 64 * 1024 * 1024
 
 
-def _create_session_directory(path):
-    """Walk without symlinks and create a private directory under pinned parents."""
+def _create_session_directory(path, *, create=True):
+    """Validate existing ancestors read-only, or create under pinned parents."""
     if '..' in path.parts:
         raise ValueError('Session output cannot contain parent traversal')
     parts = path.absolute().parts
@@ -43,6 +44,8 @@ def _create_session_directory(path):
             try:
                 child = os.open(part, flags, dir_fd=current)
             except FileNotFoundError:
+                if not create:
+                    return None
                 os.mkdir(part, 0o700, dir_fd=current)
                 child = os.open(part, flags, dir_fd=current)
             os.close(current)
@@ -54,6 +57,8 @@ def _create_session_directory(path):
                     (metadata.st_mode & 0o020 and metadata.st_gid != os.getgid() and
                      not root_sticky)):
                 raise PermissionError('Session output ancestor is not trusted')
+        if not create:
+            return None
         os.mkdir(parts[-1], 0o700, dir_fd=current)
         created = os.stat(parts[-1], dir_fd=current, follow_symlinks=False)
         if not stat.S_ISDIR(created.st_mode):
@@ -155,13 +160,19 @@ class MonitorRuntime:
             self._fail(snapshot.reason)
         return snapshot
 
-    def _prepare(self):
+    def _preflight(self):
         if os.geteuid() == 0:
             raise PermissionError('Run the Python monitor as the ordinary operator, not root')
         # Reject every pre-existing resource before any sudo invocation.
         for path in (self.output, self.socket_path, self._pmc_path, self.uds, self.uds_ro):
             if os.path.lexists(path):
                 raise FileExistsError(f'Clock session resource already exists: {path}')
+        _create_session_directory(self.output, create=False)
+
+    def _prepare(self):
+        # Authentication may wait for operator input. Check paths again before
+        # creating evidence in case anything changed during that interval.
+        self._preflight()
         self._directory_fd = _create_session_directory(self.output)
         if not self._directory_valid():
             raise PermissionError('Session output pathname was replaced')
@@ -330,6 +341,13 @@ class MonitorRuntime:
         handlers = {}
         code = 2
         try:
+            self._preflight()
+            # Both sudo invocations have this ordinary Python process as their
+            # parent. A ticket obtained by an outer shell is not sufficient on
+            # all sudo policies once the measurement starts its own session.
+            # Inherit the terminal; never read, pipe, capture, or save passwords.
+            subprocess.run(['/usr/bin/sudo', '-v'], check=True, shell=False,
+                           stdin=None, stdout=None, stderr=None)
             self._prepare()
             self._record('session', session_id=self.session_id,
                          expected_master=EXPECTED_MASTER, command=self.command,
