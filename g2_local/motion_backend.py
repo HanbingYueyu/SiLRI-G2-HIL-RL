@@ -14,6 +14,7 @@ from .command_stream import CommandStream
 from .contract import CAMERA_KEYS, vector
 from .episode import StepResult
 from .motion import plan_target
+from .outcome import coerce_outcome
 
 
 @dataclass(frozen=True)
@@ -104,11 +105,10 @@ class MotionBackend:
             self.stream.halt.wait(max(0., sent_at+self.step_period-time.monotonic()))
             self.stream.check()
             after = self._read(after=sent_at)
-            reward, terminated = self.outcome(after)
-            if not math.isfinite(float(reward)) or type(terminated) is not bool:
-                raise ValueError('Finite reward and boolean terminal required')
+            decision = coerce_outcome(self.outcome(after))
             self.stream.check()
-            return StepResult(after, effective, float(reward), terminated)
+            return StepResult(after, effective, decision.reward, decision.terminated,
+                              decision.reward_source, decision.success_label)
         except Exception:
             self._abort()
             raise

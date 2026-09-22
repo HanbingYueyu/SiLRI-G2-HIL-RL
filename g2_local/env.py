@@ -90,10 +90,15 @@ class G2LocalEnv(gym.Env):
         except Exception:
             self.runner.close()
             raise
+        success_label = row['complementary_info']['success_label']
+        succeed = (success_label if success_label is not None else
+                    bool(row['done'] and row['reward'] > 0))
         info = dict(row['complementary_info'],
                     executed_action=np.asarray(row['action'], dtype=np.float32),
                     intervene_action=np.asarray(row['action'], dtype=np.float32),
-                    succeed=bool(row['done'] and row['reward'] > 0),
+                    reward_source=row['complementary_info']['reward_source'],
+                    success_label=success_label,
+                    succeed=succeed,
                     backend=getattr(self.backend, 'name', 'gdk'))
         return obs, row['reward'], row['done'], row['truncated'], info
 

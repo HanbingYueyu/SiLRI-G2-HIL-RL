@@ -41,6 +41,22 @@ checkpoint SHA-256 为 `aa9bb8ad3b271745855d06d231db349b91f79a7750fbf59889353e1f
 （Actor/Learner/Critic/双 replay/checkpoint 已通）、只读 GDK/真实 Actor 审计、以及
 尚未启用的受控真机 MotionBackend；三者不混用。
 
+## 已完成：奖励与成功判定的可审计适配（2026-09-22，提交 `119cbc3`）
+
+- 新增 `g2_local.outcome.OutcomeDecision` 和 `HumanBinaryOutcome`：人工/后续
+  分类器只能显式返回 `None`（继续）、`True`（成功终止）或 `False`（失败终止），
+  非布尔标签不会被悄悄当成成功。
+- `MotionBackend` 兼容原有 `(reward, terminated)` 回调，同时接受带有
+  `reward_source`、`success_label` 的结果；这些字段随 `StepResult`、Gym `info`
+  和 transition 一起保留，Critic 仍只使用已确认的执行动作。
+- `HingeInsertTaskConfig.success_reward/step_reward` 现在可通过该适配器进入
+  执行链；失败标签使用显式 step reward 并立即终止，后续可在不改 transition
+  契约的前提下替换为二值 classifier。
+- Gym `succeed` 字段优先采用显式 `success_label`，只有旧回调没有标签时才按
+  `done && reward > 0` 兼容推断，避免调高失败惩罚后误标成功。
+- 定向回归 `39 passed`（含既有 Gym 的 2 条无限 Box warning）；未创建 GDK
+  command port，未发送机器人命令，未改变 `allow_motion=False`。
+
 ## 持续时间映射与只读负载审计（2026-09-21，覆盖下方历史状态）
 
 已实现独立前台 `clock_monitor`、只读短租约快照 IPC、GDK 四源时间戳/双向 TF
@@ -459,5 +475,6 @@ stop、使回合失效，禁止下一次 step；停止失败记录日志并保�
 
 下一步真机门槛：确认 base_link 工作空间 XYZ 上下限、单步平移/旋转尺度、
 统一模式（1 位控或 3 阻抗）、暂停/保持和硬件急停操作；随后实现受控运动后端。
-SpaceMouse 轴向/按钮/失联、奖励/成功判据、只读相机时钟校验、无接管独立评估
-仍需完成。没有发送真实动作，不宣称完成正式真机 Actor–Learner 或插入训练。
+SpaceMouse 真实失联、最终 ROI/任务成功现场判据、只读相机时钟校验和无接管独立
+评估仍需完成；软件奖励/成功标签契约已接入。没有发送真实动作，不宣称完成正式
+真机 Actor–Learner 或插入训练。
