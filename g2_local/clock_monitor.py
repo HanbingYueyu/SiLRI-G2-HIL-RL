@@ -219,7 +219,12 @@ class MonitorRuntime:
         if state != self._last_state:
             self._record('mapping', snapshot=asdict(snapshot))
             self._last_state = state
-        if snapshot.reason not in ('ok', 'warming_up'):
+        # An expired lease is already unhealthy at the IPC boundary, so every
+        # consumer rejects it immediately.  Keep the measurement process alive
+        # to allow a later clean PTP report to publish a new lease; latching the
+        # runtime here would close the socket before the next 2 s PTP report.
+        # All structural faults remain terminal.
+        if snapshot.reason not in ('ok', 'warming_up', 'lease_expired'):
             self._fail(snapshot.reason)
         return snapshot
 

@@ -1,4 +1,5 @@
 """External process boundaries are replaced; no sudo/PTP/GDK is executed."""
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -123,6 +124,40 @@ def launch(monkeypatch, credentials):
 
 def runtime(tmp_path):
     return monitor().MonitorRuntime(max_seconds=60, master=MASTER, output=tmp_path/'run')
+
+
+def test_lease_expiry_stays_unhealthy_but_does_not_kill_recovery(tmp_path, monkeypatch):
+    item = runtime(tmp_path)
+    base = item.provider()
+    snapshots = [
+        replace(base, healthy=False, reason='lease_expired', last_sample_mono_ns=16),
+        replace(base, healthy=True, reason='ok', last_sample_mono_ns=20),
+    ]
+    events = []
+    monkeypatch.setattr(item, 'provider', lambda: snapshots.pop(0))
+    monkeypatch.setattr(item, '_record', lambda kind, **fields: events.append((kind, fields)))
+
+    expired = item._state()
+    assert expired.healthy is False
+    assert expired.reason == 'lease_expired'
+    assert item._failure is None
+
+    recovered = item._state()
+    assert recovered.healthy is True
+    assert recovered.reason == 'ok'
+    assert item._failure is None
+    assert [fields['snapshot']['reason'] for _, fields in events] == ['lease_expired', 'ok']
+
+
+def test_nonlease_unhealthy_state_still_latches_monitor_failure(tmp_path, monkeypatch):
+    item = runtime(tmp_path)
+    snapshot = replace(item.provider(), healthy=False, reason='mapping_invalid',
+                       last_sample_mono_ns=16)
+    monkeypatch.setattr(item, 'provider', lambda: snapshot)
+    monkeypatch.setattr(item, '_record', lambda *_args, **_kwargs: None)
+
+    item._state()
+    assert item._failure == 'mapping_invalid'
 
 
 def test_child_exit_publishes_unhealthy_and_never_restarts(tmp_path, launch):

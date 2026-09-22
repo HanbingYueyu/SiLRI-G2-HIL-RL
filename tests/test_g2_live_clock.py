@@ -146,9 +146,9 @@ def inject_fault(window, fault):
     return now_ns, wall_ns
 
 
-@pytest.mark.parametrize('fault', ['master', 'gap', 'drift', 'residual',
-                                    'delay', 'properties', 'wall_jump', 'malformed'])
-def test_any_clock_fault_latches_unhealthy(fault):
+@pytest.mark.parametrize('fault', ['master', 'gap', 'delay', 'properties',
+                                    'wall_jump', 'malformed'])
+def test_structural_clock_fault_latches_unhealthy(fault):
     window = healthy_window()
     now_ns, wall_ns = inject_fault(window, fault)
     failed = window.snapshot(now_ns, wall_ns)
@@ -159,6 +159,62 @@ def test_any_clock_fault_latches_unhealthy(fault):
     window.feed_properties(properties(), now_ns + 1)
     assert window.snapshot(now_ns + 2, wall_ns + 2).healthy is False
     assert window.snapshot(now_ns + 2, wall_ns + 2).reason == failed.reason
+
+
+def test_post_mapping_transient_spike_is_quarantined_without_lease_extension():
+    window = healthy_window()
+    first = window.snapshot(16_100_000_000, wall(16_100_000_000))
+
+    # A syntactically valid but transient residual spike must not revoke the
+    # already published lease or make the monitor exit.  It is not evidence
+    # that can extend the lease either.
+    window.feed_ptp(offset_line(18, 55_002_160_000),
+                    18_010_000_000, wall(18_010_000_000))
+    held = window.snapshot(18_100_000_000, wall(18_100_000_000))
+    assert held.healthy is True
+    assert held.reason == 'ok'
+    assert held.reference_mono_ns == first.reference_mono_ns
+    assert held.valid_until_ns == first.valid_until_ns
+
+    # A later clean report may refit and advance the lease.  The discarded
+    # outlier cannot contaminate this fit; the separate expiry test proves
+    # consumers reject the interval after the old lease expires.
+    window.feed_ptp(offset_line(20, 55_000_180_000),
+                    20_010_000_000, wall(20_010_000_000))
+    recovered = window.snapshot(20_100_000_000, wall(20_100_000_000))
+    assert recovered.healthy is True
+    assert recovered.reason == 'ok'
+    assert recovered.reference_mono_ns == 20_000_000_000
+    assert recovered.valid_until_ns > first.valid_until_ns
+
+
+def test_post_mapping_transient_spike_expires_without_clean_recovery():
+    window = healthy_window()
+    first = window.snapshot(16_100_000_000, wall(16_100_000_000))
+    window.feed_ptp(offset_line(18, 55_002_160_000),
+                    18_010_000_000, wall(18_010_000_000))
+
+    expired = window.snapshot(first.valid_until_ns + 1,
+                              wall(first.valid_until_ns + 1))
+    assert expired.healthy is False
+    assert expired.reason == 'lease_expired'
+    assert expired.valid_until_ns == first.valid_until_ns
+
+
+@pytest.mark.parametrize('fault', ['drift', 'residual'])
+def test_transient_mapping_fault_does_not_latch_before_lease_expiry(fault):
+    window = healthy_window()
+    first = window.snapshot(16_100_000_000, wall(16_100_000_000))
+    now_ns, wall_ns = inject_fault(window, fault)
+    held = window.snapshot(now_ns + 100_000_000, wall_ns + 100_000_000)
+    assert held.healthy is True
+    assert held.reason == 'ok'
+    assert held.valid_until_ns == first.valid_until_ns
+
+    expired = window.snapshot(first.valid_until_ns + 1,
+                              wall(first.valid_until_ns + 1))
+    assert expired.healthy is False
+    assert expired.reason == 'lease_expired'
 
 
 def test_late_delivery_and_explicit_ptp_fault_are_latched():

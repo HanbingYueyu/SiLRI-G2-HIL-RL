@@ -195,13 +195,16 @@ class ClockWindow:
                     # well-formed report can be a transient startup residual
                     # outlier.  It cannot seed the next fit, but there is no
                     # lease yet to revoke: begin a wholly fresh candidate
-                    # window.  Structural fit failures (for example integer
-                    # range/lease overflow) and every post-publication
-                    # failure remain fail-closed.
+                    # window.  After publication, quarantine only this
+                    # transient outlier and retain the existing mapping and
+                    # its unchanged lease.  A later clean report may refit;
+                    # consumers reject snapshots during any intervening lease
+                    # expiry.  Repeated anomalies therefore remain unhealthy
+                    # through the normal lease-expiry path.  Do not renew a
+                    # lease from the rejected sample.
                     if self._mapping is None:
                         self._samples.clear()
                         return
-                    self._latch('mapping_invalid')
                     return
                 except Exception:
                     self._latch('mapping_invalid')
