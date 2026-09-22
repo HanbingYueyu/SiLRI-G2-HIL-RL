@@ -1,5 +1,6 @@
 """Explicit local task configuration, with no inherited robot motion limits."""
 from dataclasses import dataclass
+import math
 from .contract import CAMERA_KEYS, vector
 
 
@@ -37,3 +38,49 @@ class LocalTaskConfig:
         if any(low >= high for low, high in
                zip(self.workspace_low, self.workspace_high)):
             raise ValueError('Workspace lower bounds must be below upper bounds')
+
+
+@dataclass(frozen=True)
+class HingeInsertTaskConfig:
+    """MVP algorithm defaults for the final local hinge-insertion phase.
+
+    These are policy/reward starting points from the deployment guide, not
+    robot safety limits. Absolute workspace bounds remain mandatory and must be
+    supplied by the operator before constructing a motion configuration.
+    """
+    control_hz: float = 10.
+    max_episode_steps: int = 80
+    fix_gripper: bool = True
+    action_scale: tuple[float, ...] = (.0015, .0015, .0015, .026, .026, .026)
+    success_reward: float = 10.
+    step_reward: float = -.05
+    reward_source: str = 'human'
+    target_xy_range_m: float = 0.
+    ee_xyz_range_m: float = .003
+    ee_rpy_range_rad: float = .008726646259971648
+
+    def __post_init__(self):
+        if not isinstance(self.fix_gripper, bool) or not self.fix_gripper:
+            raise ValueError('Hinge MVP requires a fixed closed gripper')
+        if type(self.control_hz) not in (int, float) or not math.isfinite(self.control_hz) or self.control_hz <= 0:
+            raise ValueError('control_hz must be positive and finite')
+        if type(self.max_episode_steps) is not int or self.max_episode_steps <= 0:
+            raise ValueError('max_episode_steps must be a positive integer')
+        object.__setattr__(self, 'action_scale', vector(self.action_scale, 6))
+        if any(value <= 0 for value in self.action_scale):
+            raise ValueError('Hinge action scales must be positive')
+        for name in ('success_reward', 'step_reward', 'target_xy_range_m',
+                     'ee_xyz_range_m', 'ee_rpy_range_rad'):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError(f'{name} must be finite')
+        if self.target_xy_range_m < 0 or self.ee_xyz_range_m < 0 or self.ee_rpy_range_rad < 0:
+            raise ValueError('Randomization ranges must be nonnegative')
+        if self.reward_source not in ('human', 'classifier'):
+            raise ValueError('reward_source must be human or classifier')
+
+    def motion_config(self, *, workspace_low=None, workspace_high=None):
+        """Build the low-level config without silently inventing workspace bounds."""
+        return LocalTaskConfig(action_scale=self.action_scale,
+                               workspace_low=workspace_low,
+                               workspace_high=workspace_high)
