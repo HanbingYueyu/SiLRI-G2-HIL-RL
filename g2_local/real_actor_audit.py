@@ -183,8 +183,12 @@ def main(argv=None):
     except (FileExistsError, FileNotFoundError, RuntimeError, TimeoutError, ValueError) as error:
         print(f'Read-only Actor audit launcher failed: {error}', file=sys.stderr)
         return 1
-    print('Read-only Actor audit finished; qualify separately; '
-          'motion_authorized=false; thresholds_approved=false')
+    if code == 0:
+        print('Read-only Actor audit completed; qualify separately; '
+              'motion_authorized=false; thresholds_approved=false')
+    else:
+        print(f'Read-only Actor audit failed (exit={code}); evidence retained; '
+              'motion_authorized=false; thresholds_approved=false', file=sys.stderr)
     return code
 
 

@@ -2,6 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import signal
 
+from g2_local import real_actor_audit
 from g2_local.real_actor_audit import run_session
 
 
@@ -141,3 +142,15 @@ def test_run_session_allows_long_ptp_warmup_before_starting_actor(tmp_path):
     assert result == 0
     assert len(commands) == 2
     assert processes[0].signals == [signal.SIGINT]
+
+
+def test_main_does_not_call_failed_audit_finished(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(real_actor_audit, 'run_session', lambda **kwargs: 1)
+    checkpoint = tmp_path / 'checkpoint.pt'
+    checkpoint.write_bytes(b'fixture')
+    code = real_actor_audit.main([
+        '--actor-checkpoint', str(checkpoint), '--output', str(tmp_path/'session')])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert 'failed' in captured.err
+    assert 'finished' not in captured.out
