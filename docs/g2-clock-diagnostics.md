@@ -60,6 +60,26 @@ ps -eo pid,ppid,pgid,user,comm,args | rg 'ptp4l|phc2sys|clock_monitor'
 
 ## 真实 Actor/CUDA 只读审计：三轮现场流程
 
+现在可用单命令编排一轮只读审计，避免手工启动两个终端造成 socket 尚未创建或
+监控提前退出后仍启动 B。它会要求全新输出根目录，等待 monitor 发布健康快照后
+才启动真实 CUDA Actor；审计结束后自动按 B→A 顺序收尾。它不创建 command port、
+MotionBackend 或 Gym step，也不会自动执行 `qualify`：
+
+```bash
+cd /home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL
+source /home/flyfuture/.cache/agibot/app/env.sh /home/flyfuture/.cache/agibot/app
+export PYTHONPATH="$PWD/lerobot/src:$PWD:/home/flyfuture/.cache/agibot/app/gdk/lib"
+sudo -v && "$PWD/.venv/bin/python" -m g2_local.real_actor_audit \
+  --master 044052.fffe.000010 \
+  --monitor-seconds 300 --audit-seconds 125 --warmup-steps 10 \
+  --actor-checkpoint "$PWD/runtime/software_loop/checkpoint.pt" \
+  --output "$PWD/runtime/real_actor_audit_20260922/session-05"
+```
+
+输出根目录必须不存在；每轮完成后再分别核对 `monitor/evidence.jsonl`、
+`audit/summary.json` 和残留进程，确认审计成功后才手工运行 `freshness_approval`
+的 qualification 命令。三轮证据仍是阈值批准的最低要求。
+
 以下命令要求当前检出已包含 `actor_inference` 和 `freshness_approval`。
 真实 GdkReader 始终使用 `allow_motion=False`；不创建 GdkCommandPort、
 CommandStream、MotionBackend、Gym 或 learner，不发 hold、运动、夹爪或切模式命令。
