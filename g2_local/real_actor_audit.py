@@ -5,6 +5,7 @@ This module only coordinates the existing ``clock_monitor`` and
 environment, or motion backend, and it never runs ``qualify`` automatically.
 """
 import argparse
+import json
 import os
 from pathlib import Path
 import signal
@@ -65,7 +66,23 @@ def _wait_for_healthy_monitor(process, socket_path, *, master, timeout_s,
     finally:
         if client is not None:
             client.close()
-    raise TimeoutError('clock monitor did not publish a healthy snapshot before timeout')
+    reason = 'unknown'
+    evidence = socket_path.parent/'evidence.jsonl'
+    try:
+        raw = evidence.read_bytes()[-64 * 1024:]
+        for line in reversed(raw.splitlines()):
+            try:
+                record = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if record.get('kind') == 'mapping':
+                reason = record.get('snapshot', {}).get('reason', reason)
+                break
+    except OSError:
+        pass
+    raise TimeoutError(
+        f'clock monitor did not publish a healthy snapshot before timeout '
+        f'(last_reason={reason}; evidence={evidence})')
 
 
 def _stop_monitor(process):
@@ -96,7 +113,7 @@ def _stop_audit(process):
 
 def run_session(*, output, master=EXPECTED_MASTER, monitor_seconds=300,
                 audit_seconds=125, checkpoint, warmup_steps=10,
-                startup_timeout_s=45., python=None, popen_factory=None,
+                startup_timeout_s=120., python=None, popen_factory=None,
                 client_factory=None, now_fn=None, sleep_fn=None):
     """Run one safely ordered real-Actor read-only audit session.
 
@@ -155,7 +172,7 @@ def main(argv=None):
     parser.add_argument('--warmup-steps', type=int, default=10)
     parser.add_argument('--actor-checkpoint', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--startup-timeout-s', type=float, default=45.)
+    parser.add_argument('--startup-timeout-s', type=float, default=120.)
     args = parser.parse_args(argv)
     try:
         code = run_session(

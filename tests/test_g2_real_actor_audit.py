@@ -102,3 +102,42 @@ def test_run_session_does_not_start_audit_when_monitor_never_becomes_healthy(tmp
     else:
         raise AssertionError('expected monitor preflight failure')
     assert len(commands) == 1
+
+
+def test_run_session_allows_long_ptp_warmup_before_starting_actor(tmp_path):
+    commands = []
+    processes = []
+    monitor_output = tmp_path / 'session' / 'monitor'
+    checkpoint = tmp_path / 'checkpoint.pt'
+    checkpoint.write_bytes(b'fixture')
+    clock = [0.]
+
+    def popen(command, **kwargs):
+        del kwargs
+        commands.append(command)
+        process = FakeProcess(command, output=monitor_output if any(
+            'clock_monitor' in item for item in command) else None)
+        processes.append(process)
+        return process
+
+    class DelayedClient(FakeClient):
+        reads = 0
+
+        def read(self):
+            type(self).reads += 1
+            if type(self).reads <= 200:
+                raise ValueError('warming_up')
+            return SimpleNamespace(healthy=True, reason='ok')
+
+    def advance(seconds):
+        clock[0] += seconds
+
+    result = run_session(
+        output=tmp_path / 'session', master='044052.fffe.000010',
+        monitor_seconds=300, audit_seconds=120, checkpoint=checkpoint,
+        popen_factory=popen, client_factory=lambda **kwargs: DelayedClient(),
+        now_fn=lambda: clock[0], sleep_fn=advance)
+
+    assert result == 0
+    assert len(commands) == 2
+    assert processes[0].signals == [signal.SIGINT]
