@@ -32,6 +32,14 @@ def test_actor_learner_exchange_saves_checkpoint(tmp_path):
         assert len(snapshot['optimizers']) >= 4
         for row in snapshot['records']:
             assert row['complementary_info']['synthetic']
+            provenance = row['provenance']
+            assert set(provenance) == {'policy_action', 'human_action',
+                                       'executed_action', 'reward_source',
+                                       'success_label', 'target_offset_m',
+                                       'ee_reset_offset'}
+            assert len(provenance['policy_action']) == 6
+            assert len(provenance['executed_action']) == 6
+            assert provenance['reward_source'] == 'unknown'
             if row['complementary_info']['is_intervention']:
                 assert torch.equal(row['action'], torch.zeros(6))
         resume_args = ['--g2-software', '--port', str(port), '--updates', '3',

@@ -35,7 +35,8 @@ checkpoint SHA-256 为 `aa9bb8ad3b271745855d06d231db349b91f79a7750fbf59889353e1f
 `reward_source` 与 `success_label`。Critic 的 `action` 仍只使用已确认的实际执行动作，
 不会把 policy 原始提案误当成执行结果。
 
-这项改动已合并到 `main`（`f8a208a` 之后的工作区改动待提交），不会创建 GDK
+这项改动已合并到 `main`（transition 契约提交 `eb9b2af`，Actor–Learner provenance
+提交待完成），不会创建 GDK
 命令端口，也不会改变 `allow_motion=False`。训练入口仍分为：现有无运动软件闭环
 （Actor/Learner/Critic/双 replay/checkpoint 已通）、只读 GDK/真实 Actor 审计、以及
 尚未启用的受控真机 MotionBackend；三者不混用。

@@ -55,6 +55,18 @@ def train_batch(policy, optimizers, data, names):
     return metrics
 
 
+def _buffer_transition(row):
+    """Drop audit-only provenance before inserting into ReplayBuffer.
+
+    ReplayBuffer intentionally stores tensor/scalar training fields only. The
+    complete policy-vs-human-vs-executed action record remains in the learner
+    checkpoint's ``records`` list for episode auditing and replay provenance.
+    """
+    result = dict(row)
+    result.pop('provenance', None)
+    return result
+
+
 def learner(args):
     policy = create_policy(args.device)
     optimizers, _ = policy.get_optimizer_and_scheduler()
@@ -80,9 +92,10 @@ def learner(args):
             optimizer.load_state_dict(snapshot['optimizers'][name])
         records = snapshot['records']
         for row in records:
-            buffers[0].add(**row)
+            train_row = _buffer_transition(row)
+            buffers[0].add(**train_row)
             if bool(row['complementary_info']['is_intervention']):
-                buffers[1].add(**row)
+                buffers[1].add(**train_row)
         version = snapshot['version']
         if version >= args.updates:
             raise ValueError('--updates must exceed saved version when resuming')
@@ -110,9 +123,10 @@ def learner(args):
                 raise
             for row in bytes_to_transitions(packet):
                 records.append(row)
-                buffers[0].add(**row)
+                train_row = _buffer_transition(row)
+                buffers[0].add(**train_row)
                 if bool(row['complementary_info']['is_intervention']):
-                    buffers[1].add(**row)
+                    buffers[1].add(**train_row)
             if not all(len(buffer) >= 2 for buffer in buffers):
                 publish()
                 continue
@@ -180,14 +194,26 @@ def actor(args):
                 active = j % 2 == 0
                 env.intervention = lambda: (active, np.zeros(6) if active else None)
                 nxt, reward, terminated, truncated, info = env.step(action)
+                executed = np.asarray(info['executed_action'], dtype=np.float32)
+                human = info.get('human_action')
+                provenance = dict(
+                    policy_action=tuple(float(value) for value in action),
+                    human_action=None if human is None else tuple(float(value) for value in human),
+                    executed_action=tuple(float(value) for value in executed),
+                    reward_source=info.get('reward_source', 'unknown'),
+                    success_label=info.get('success_label'),
+                    target_offset_m=tuple(float(value) for value in info['target_offset_m']),
+                    ee_reset_offset=tuple(float(value) for value in info['ee_reset_offset']),
+                )
                 row = dict(state={k: v.cpu() for k, v in state.items()},
                            next_state=make_policy_obs(nxt, torch.device('cpu'), 'g2'),
-                           action=torch.tensor(info['executed_action']), reward=reward,
+                           action=torch.tensor(executed), reward=reward,
                            done=terminated, truncated=truncated,
                            complementary_info={'is_intervention': active,
                                                'actor_version': version,
                                                'step_id': step * 4 + j,
-                                               'synthetic': True})
+                                               'synthetic': True},
+                           provenance=provenance)
                 packet.append(row)
                 obs = nxt
                 if terminated or truncated:
