@@ -181,6 +181,15 @@ def test_client_reads_valid_snapshot_and_checks_boot_master_sequence(tmp_path,
     assert client.read().sequence == 4
 
 
+def test_client_reports_machine_readable_unhealthy_reason(tmp_path, server_factory):
+    snapshot = healthy_snapshot(healthy=False, reason='lease_expired')
+    server = server_factory(tmp_path / 'clock.sock', snapshot)
+    client = SnapshotClient(server.path, timeout_s=.05, expected_master=MASTER)
+
+    with pytest.raises(ValueError, match=r'^Clock snapshot is unhealthy: lease_expired$'):
+        client.read()
+
+
 @pytest.mark.parametrize('wire_request', [
     b'{}\n',
     b'{"op":"stop","schema":1}\n',

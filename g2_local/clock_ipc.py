@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import socket
 import stat
 import threading
@@ -29,6 +30,7 @@ _REQUEST = {'op': 'snapshot', 'schema': 1}
 _RESPONSE_LIMIT = 4096
 _CONNECTION_TIMEOUT_S = 0.25
 _SNAPSHOT_KEYS = frozenset(field.name for field in fields(ClockSnapshot))
+_REASON_PATTERN = re.compile(r'[a-z][a-z0-9_]{0,127}\Z')
 
 
 def _reject_constant(_token):
@@ -123,6 +125,12 @@ def _text(value):
     return value
 
 
+def _reason(value):
+    if type(value) is not str or _REASON_PATTERN.fullmatch(value) is None:
+        raise ValueError('Invalid snapshot reason')
+    return value
+
+
 def _snapshot_from_payload(payload, *, expected_master, previous_sequence,
                            previous_session, received_mono_ns):
     if type(payload) is not dict or frozenset(payload) != _SNAPSHOT_KEYS:
@@ -133,9 +141,12 @@ def _snapshot_from_payload(payload, *, expected_master, previous_sequence,
     sequence = _integer(payload['sequence'], minimum=1)
     if previous_sequence is not None and sequence <= previous_sequence:
         raise ValueError('Snapshot sequence did not advance')
-    if type(payload['healthy']) is not bool or not payload['healthy']:
-        raise ValueError('Clock snapshot is unhealthy')
-    if _text(payload['reason']) != 'ok':
+    if type(payload['healthy']) is not bool:
+        raise ValueError('Invalid snapshot health')
+    reason = _reason(payload['reason'])
+    if not payload['healthy']:
+        raise ValueError(f'Clock snapshot is unhealthy: {reason}')
+    if reason != 'ok':
         raise ValueError('Healthy snapshot has an invalid reason')
 
     boot_id = _text(payload['boot_id'])
