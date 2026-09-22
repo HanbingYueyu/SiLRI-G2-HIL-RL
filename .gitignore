@@ -19,3 +19,28 @@ expert/
 runtime/
 .worktrees/
 .superpowers/
+
+# Python caches, test/coverage output, and local packaging products.
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# AgiBot GDK/glog files emitted in the repository root.
+python*.INFO
+python*.WARNING
+python*.ERROR
+python*.FATAL
+python*.log.*
+
+# Editor backup/swap files and local crash dumps.
+*~
+*.bak
+*.swp
+*.swo
+/core
+/core.*
