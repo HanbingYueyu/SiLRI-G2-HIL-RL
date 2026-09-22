@@ -1,7 +1,7 @@
 """Explicit local task configuration, with no inherited robot motion limits."""
 from dataclasses import dataclass
 import math
-from .contract import CAMERA_KEYS, vector
+from .contract import CAMERA_KEYS, EpisodeContext, vector
 
 
 @dataclass(frozen=True)
@@ -84,3 +84,29 @@ class HingeInsertTaskConfig:
         return LocalTaskConfig(action_scale=self.action_scale,
                                workspace_low=workspace_low,
                                workspace_high=workspace_high)
+
+    def sample_episode_context(self, rng, *, episode_id, approach_source,
+                               grasp_description):
+        """Sample explicit domain-randomization metadata; never reset hardware.
+
+        ``target_xy_range_m`` describes the target/fridge perturbation while
+        ``ee_xyz_range_m`` and ``ee_rpy_range_rad`` describe the end-effector
+        reset perturbation.  Keeping the two tuples separate makes the source
+        of each variation visible in replay and evaluation records.
+        """
+        uniform = getattr(rng, 'uniform', None)
+        if not callable(uniform):
+            raise ValueError('A random generator with uniform() is required')
+
+        def draw(limit):
+            value = uniform(-limit, limit)
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError('Random generator returned a non-finite value')
+            return float(value)
+
+        target_offset = (draw(self.target_xy_range_m),
+                         draw(self.target_xy_range_m), 0.)
+        ee_reset = tuple(draw(self.ee_xyz_range_m) for _ in range(3)) + tuple(
+            draw(self.ee_rpy_range_rad) for _ in range(3))
+        return EpisodeContext(episode_id, target_offset, approach_source,
+                              grasp_description, ee_reset)

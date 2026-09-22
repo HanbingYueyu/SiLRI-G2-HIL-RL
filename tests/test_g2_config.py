@@ -1,4 +1,5 @@
 import unittest
+import random
 from g2_local.config import HingeInsertTaskConfig, LocalTaskConfig
 
 
@@ -46,3 +47,26 @@ class ConfigTests(unittest.TestCase):
                        {'reward_source': 'policy'}, {'action_scale': (0.,) * 6}):
             with self.assertRaises(ValueError):
                 HingeInsertTaskConfig(**kwargs)
+
+    def test_hinge_context_sampling_is_reproducible_and_separates_offsets(self):
+        config = HingeInsertTaskConfig(target_xy_range_m=.05,
+                                       ee_xyz_range_m=.003,
+                                       ee_rpy_range_rad=.008)
+        first = config.sample_episode_context(
+            random.Random(7), episode_id='episode-7',
+            approach_source='vision', grasp_description='fixed_gripper')
+        second = config.sample_episode_context(
+            random.Random(7), episode_id='episode-7',
+            approach_source='vision', grasp_description='fixed_gripper')
+        self.assertEqual(first, second)
+        self.assertEqual(first.target_offset_m[2], 0.)
+        self.assertTrue(all(abs(value) <= .05 for value in first.target_offset_m[:2]))
+        self.assertTrue(all(abs(value) <= .003 for value in first.ee_reset_offset[:3]))
+        self.assertTrue(all(abs(value) <= .008 for value in first.ee_reset_offset[3:]))
+
+    def test_hinge_context_sampling_requires_explicit_metadata_and_rng(self):
+        config = HingeInsertTaskConfig()
+        with self.assertRaises(ValueError):
+            config.sample_episode_context(object(), episode_id='',
+                                          approach_source='vision',
+                                          grasp_description='fixed_gripper')
