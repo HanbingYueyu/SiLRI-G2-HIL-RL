@@ -65,6 +65,9 @@ ps -eo pid,ppid,pgid,user,comm,args | rg 'ptp4l|phc2sys|clock_monitor'
 才启动真实 CUDA Actor；审计结束后自动按 B→A 顺序收尾。它不创建 command port、
 MotionBackend 或 Gym step，也不会自动执行 `qualify`：
 
+默认最多等待 120 秒让 PTP 映射进入健康状态；这段等待不计入 Actor 正式审计时长。
+若超时，终端会报告最后的 monitor 状态和 `monitor/evidence.jsonl`，不要复用该目录。
+
 ```bash
 cd /home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL
 source /home/flyfuture/.cache/agibot/app/env.sh /home/flyfuture/.cache/agibot/app
