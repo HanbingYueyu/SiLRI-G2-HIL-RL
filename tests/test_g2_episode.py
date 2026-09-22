@@ -38,6 +38,10 @@ class EpisodeTests(unittest.TestCase):
         row = self.runner.step([1] * 6)
         self.assertEqual(row['action'], (.5,) * 6)
         self.assertEqual(row['complementary_info']['target_offset_m'], (.05, 0, 0))
+        self.assertEqual(row['complementary_info']['ee_reset_offset'], (0.,) * 6)
+        self.assertEqual(row['complementary_info']['policy_action'], (1.,) * 6)
+        self.assertEqual(row['complementary_info']['executed_action'], (.5,) * 6)
+        self.assertEqual(row['complementary_info']['reward_source'], 'unknown')
         self.assertEqual(row['complementary_info']['step_id'], 0)
 
     def test_intervention_is_cumulative_and_timeout_keeps_final_obs(self):

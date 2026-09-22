@@ -13,6 +13,8 @@ class StepResult:
     executed_action: tuple[float, ...]
     reward: float
     terminated: bool
+    reward_source: str = 'unknown'
+    success_label: bool | None = None
 
 
 class Backend(Protocol):
@@ -66,7 +68,9 @@ class EpisodeRunner:
             truncated = self.steps + 1 >= self.max_steps and not result.terminated
             row = transition(self.observation, result.observation, decision,
                              result.executed_action, reward=result.reward,
-                             terminated=result.terminated, truncated=truncated)
+                             terminated=result.terminated, truncated=truncated,
+                             reward_source=result.reward_source,
+                             success_label=result.success_label)
             self.assisted = self.assisted or decision.is_intervention
             row['complementary_info'].update(asdict(self.context))
             row['complementary_info'].update(

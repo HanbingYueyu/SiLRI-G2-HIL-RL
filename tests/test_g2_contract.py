@@ -22,10 +22,17 @@ class ContractTests(unittest.TestCase):
     def test_transition_uses_acknowledged_execution(self):
         decision = select_action([.8] * 6)
         row = transition('before', 'after', decision, [0.2] * 6,
-                         reward=0, terminated=False, truncated=True)
+                         reward=0, terminated=False, truncated=True,
+                         reward_source='human', success_label=False)
         self.assertEqual(row['action'], (.2,) * 6)
         self.assertFalse(row['done'])
         self.assertTrue(row['truncated'])
+        metadata = row['complementary_info']
+        self.assertEqual(metadata['policy_action'], (.8,) * 6)
+        self.assertIsNone(metadata['human_action'])
+        self.assertEqual(metadata['executed_action'], (.2,) * 6)
+        self.assertEqual(metadata['reward_source'], 'human')
+        self.assertFalse(metadata['success_label'])
 
     def test_invalid_successor_never_becomes_training_data(self):
         with self.assertRaises(ValueError):
@@ -35,8 +42,16 @@ class ContractTests(unittest.TestCase):
     def test_episode_randomization_is_metadata(self):
         context = EpisodeContext('episode-1', (.05, 0, 0), 'visual_reapproach', 'unknown')
         self.assertEqual(context.target_offset_m, (.05, 0, 0))
+        self.assertEqual(context.ee_reset_offset, (0.,) * 6)
         with self.assertRaises(ValueError):
             EpisodeContext('', (0, 0, 0), 'visual_reapproach', 'unknown')
+
+    def test_episode_randomization_keeps_pose_offset_separate(self):
+        context = EpisodeContext('episode-2', (.005, -.002, 0), 'visual', 'unknown',
+                                (.001, -.001, .002, 0., 0., .01))
+        self.assertEqual(context.ee_reset_offset[2], .002)
+        with self.assertRaises(ValueError):
+            EpisodeContext('episode-3', (0, 0, 0), 'visual', 'unknown', (0, 0, 0))
 
 
 if __name__ == '__main__':

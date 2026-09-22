@@ -24,11 +24,16 @@ class EpisodeContext:
     target_offset_m: tuple[float, float, float]
     approach_source: str
     grasp_description: str
+    # XYZ metres + roll/pitch/yaw radians sampled for this episode reset.
+    # Keeping this separate from target_offset_m makes domain-randomization
+    # evidence unambiguous in replay and evaluation logs.
+    ee_reset_offset: tuple[float, ...] = (0., 0., 0., 0., 0., 0.)
 
     def __post_init__(self):
         if not self.episode_id or not self.approach_source or not self.grasp_description:
             raise ValueError('Episode ID, approach and grasp metadata are required')
         object.__setattr__(self, 'target_offset_m', vector(self.target_offset_m, 3))
+        object.__setattr__(self, 'ee_reset_offset', vector(self.ee_reset_offset, 6))
 
 
 @dataclass(frozen=True)
@@ -55,7 +60,7 @@ stored as an executed transition until the driver confirms the applied action.
 
 
 def transition(obs, next_obs, decision, acknowledged_action, *, reward,
-               terminated, truncated):
+               terminated, truncated, reward_source='unknown', success_label=None):
     """Build a training row only after a successful command and valid successor.
 
 The caller validates observation freshness and command acknowledgement before
@@ -67,6 +72,11 @@ including any physical safety clipping, not measured displacement.
     action = vector(acknowledged_action, 6)
     if any(abs(value) > 1 for value in action) or not math.isfinite(float(reward)):
         raise ValueError('Invalid executed action or reward')
+    if (not isinstance(reward_source, str) or not reward_source.strip() or
+            reward_source not in ('human', 'classifier', 'environment', 'unknown')):
+        raise ValueError('Unknown reward source')
+    if success_label is not None and type(success_label) is not bool:
+        raise ValueError('success_label must be bool or None')
     return {
         'state': obs, 'next_state': next_obs, 'action': action,
         'reward': float(reward), 'done': bool(terminated),
@@ -77,5 +87,10 @@ including any physical safety clipping, not measured displacement.
             'source': 'human' if decision.is_intervention else 'policy',
             'policy_proposal': decision.policy_proposal,
             'human_proposal': decision.human_proposal,
+            'policy_action': decision.policy_proposal,
+            'human_action': decision.human_proposal,
+            'executed_action': action,
+            'reward_source': reward_source,
+            'success_label': success_label,
         },
     }

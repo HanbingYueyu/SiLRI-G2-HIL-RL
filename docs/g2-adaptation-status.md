@@ -26,6 +26,20 @@ checkpoint SHA-256 为 `aa9bb8ad3b271745855d06d231db349b91f79a7750fbf59889353e1f
 审计/qualification 的许可字段固定 false；未来单独批准文件也仍然
 `motion_authorized=false`，不修改生产配置、不解除其他现场门槛。
 
+## 算法数据契约补齐（2026-09-22）
+
+参考《SiLRI 铰链插入任务完整实现与部署指南》的 MVP 建议：固定夹爪、局部
+6DoF 归一化动作、目标偏移与末端 reset 扰动分开记录，训练初期使用人工 reward，
+后续再接二值 reward classifier。`EpisodeContext` 现在记录 `ee_reset_offset`；
+每条 transition 同时保存 `policy_action`、`human_action`、`executed_action`、
+`reward_source` 与 `success_label`。Critic 的 `action` 仍只使用已确认的实际执行动作，
+不会把 policy 原始提案误当成执行结果。
+
+这项改动已合并到 `main`（`f8a208a` 之后的工作区改动待提交），不会创建 GDK
+命令端口，也不会改变 `allow_motion=False`。训练入口仍分为：现有无运动软件闭环
+（Actor/Learner/Critic/双 replay/checkpoint 已通）、只读 GDK/真实 Actor 审计、以及
+尚未启用的受控真机 MotionBackend；三者不混用。
+
 ## 持续时间映射与只读负载审计（2026-09-21，覆盖下方历史状态）
 
 已实现独立前台 `clock_monitor`、只读短租约快照 IPC、GDK 四源时间戳/双向 TF
