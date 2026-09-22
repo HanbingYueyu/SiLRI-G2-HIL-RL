@@ -205,6 +205,15 @@ class ClockWindow:
                     if self._mapping is None:
                         self._samples.clear()
                         return
+                    if sample['mono_ns'] > self._mapping.expires_ns:
+                        # More than one quarantined report can leave the last
+                        # accepted fit window too far behind the live stream.
+                        # Once its lease is already expired, discard that old
+                        # mapping and restart warm-up from the next report.
+                        # Keeping this report out prevents an outlier from
+                        # seeding the replacement mapping.
+                        self._mapping = None
+                        self._samples.clear()
                     return
                 except Exception:
                     self._latch('mapping_invalid')

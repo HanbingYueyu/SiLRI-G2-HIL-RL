@@ -201,6 +201,29 @@ def test_post_mapping_transient_spike_expires_without_clean_recovery():
     assert expired.valid_until_ns == first.valid_until_ns
 
 
+def test_repeated_transient_spikes_restart_warmup_without_gap_latch():
+    window = healthy_window()
+    window.feed_ptp(offset_line(18, 55_002_160_000),
+                    18_010_000_000, wall(18_010_000_000))
+    window.feed_ptp(offset_line(20, 55_002_180_000),
+                    20_010_000_000, wall(20_010_000_000))
+
+    warming = window.snapshot(20_100_000_000, wall(20_100_000_000))
+    assert warming.healthy is False
+    assert warming.reason == 'warming_up'
+
+    # The ordering anchor remains at 20 s, while the expired fit window has
+    # been discarded. Eight clean reports can form a wholly new mapping.
+    for index, second in enumerate(range(22, 38, 2)):
+        window.feed_ptp(offset_line(second, 55_100_000_000 + index * 20_000),
+                        second * 1_000_000_000 + 10_000_000,
+                        wall(second * 1_000_000_000 + 10_000_000))
+    recovered = window.snapshot(36_100_000_000, wall(36_100_000_000))
+    assert recovered.healthy is True
+    assert recovered.reason == 'ok'
+    assert recovered.reference_mono_ns == 36_000_000_000
+
+
 @pytest.mark.parametrize('fault', ['drift', 'residual'])
 def test_transient_mapping_fault_does_not_latch_before_lease_expiry(fault):
     window = healthy_window()
