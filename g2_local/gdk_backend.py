@@ -158,7 +158,10 @@ class GdkReader:
     before the first success. A raised read never updates it or last_stamps;
     callers must not treat retained evidence as a new observation.
     """
-    def __init__(self, adapter_root='/home/flyfuture/g2_hinge_assembly', timeout_s=2.):
+    def __init__(self, adapter_root='/home/flyfuture/g2_hinge_assembly', timeout_s=2.,
+                 *, allow_motion=False):
+        if type(allow_motion) is not bool:
+            raise ValueError('Explicit boolean GDK motion intent required')
         if not 0 < timeout_s <= 30:
             raise ValueError('Invalid reader timeout: must be in (0, 30] seconds')
         root = Path(adapter_root).resolve()
@@ -181,7 +184,7 @@ class GdkReader:
             if gdk.gdk_init() != gdk.GDKRes.kSuccess:
                 raise RuntimeError('GDK initialization failed')
             self.robot = gdk.Robot()
-            self.controller = G2Controller(gdk, self.robot, allow_motion=False)
+            self.controller = G2Controller(gdk, self.robot, allow_motion=allow_motion)
             self.streams = {'left_wrist': gdk.CameraType.kHandLeftColor,
                             'right_aux': gdk.CameraType.kHandRightColor}
             self.camera = gdk.Camera(list(self.streams.values()))

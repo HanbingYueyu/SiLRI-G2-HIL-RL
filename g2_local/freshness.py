@@ -129,6 +129,38 @@ class _Rejected(Exception):
         self.code, self.detail = code, detail
 
 
+class FreshnessLeaseGuard:
+    """Bound each command send by the last accepted observation's local lease."""
+
+    def __init__(self, observation_guard, *, feedback_lease_s, clock=time.monotonic):
+        if not callable(observation_guard) or not callable(clock):
+            raise ValueError('Freshness guard and monotonic clock are required')
+        if (type(feedback_lease_s) not in (int, float) or
+                not math.isfinite(feedback_lease_s) or feedback_lease_s <= 0):
+            raise ValueError('Positive feedback lease required')
+        self.observation_guard = observation_guard
+        self.feedback_lease_s = feedback_lease_s
+        self.clock = clock
+        self.valid_until = None
+        self.lock = threading.RLock()
+
+    @property
+    def last_decision(self):
+        return self.observation_guard.last_decision
+
+    def accept(self, obs, info, after=None):
+        with self.lock:
+            self.valid_until = None
+            accepted = self.observation_guard(obs, info, after)
+            if accepted is True:
+                self.valid_until = self.clock() + self.feedback_lease_s
+            return accepted
+
+    def __call__(self):
+        with self.lock:
+            return self.valid_until is not None and self.clock() <= self.valid_until
+
+
 class ObservationFreshnessGuard:
     """Serialize checks and commit source progress only on complete acceptance.
 

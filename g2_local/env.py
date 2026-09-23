@@ -34,10 +34,15 @@ class SyntheticBackend:
 class G2LocalEnv(gym.Env):
     metadata = {'render_modes': []}
 
-    def __init__(self, backend, *, max_steps=100, image_size=128, intervention=None):
+    def __init__(self, backend, *, max_steps=100, image_size=128, camera_rois=None,
+                 intervention=None):
         self.backend = backend
         self.runner = EpisodeRunner(backend, max_steps=max_steps)
         self.image_size = image_size
+        self.camera_rois = dict(camera_rois or {})
+        if not set(self.camera_rois) <= set(CAMERA_KEYS):
+            raise ValueError('Unknown camera ROI key')
+        self.last_crop_boxes = {}
         self.intervention = intervention
         self.action_space = gym.spaces.Box(-1., 1., (6,), dtype=np.float32)
         self.observation_space = gym.spaces.Dict({
@@ -49,13 +54,26 @@ class G2LocalEnv(gym.Env):
         if set(raw) != set(self.observation_space.spaces):
             raise ValueError('Observation keys do not match dual-camera schema')
         result = {'state': np.asarray(raw['state'], dtype=np.float32).copy()}
+        crop_boxes = {}
         for key in CAMERA_KEYS:
             image = raw[key]
             if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
                 raise ValueError(f'{key} must be HWC uint8 RGB')
+            if key in self.camera_rois:
+                box = self.camera_rois[key]
+                if (not isinstance(box, (tuple, list)) or len(box) != 4 or
+                        any(type(value) is not int for value in box)):
+                    raise ValueError(f'{key} ROI must have integer pixel bounds')
+                x0, y0, x1, y1 = box
+                if not (0 <= x0 < x1 <= image.shape[1] and
+                        0 <= y0 < y1 <= image.shape[0]):
+                    raise ValueError(f'{key} ROI is outside acquired frame')
+                crop_boxes[key] = tuple(box)
+                image = image[y0:y1, x0:x1]
             result[key] = cv2.resize(image, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
         if not np.isfinite(result['state']).all() or not self.observation_space.contains(result):
             raise ValueError('Invalid observation shape or values')
+        self.last_crop_boxes = crop_boxes
         return result
 
     def reset(self, *, seed=None, options=None):

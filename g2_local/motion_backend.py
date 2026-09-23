@@ -28,7 +28,7 @@ class MotionBackend:
 
     def __init__(self, reader, port, *, config, observation_guard, outcome,
                  command_timeout, send_timeout, step_period, allow_motion=False,
-                 stop_timeout=1.):
+                 stop_timeout=1., send_rate_hz=50.):
         config.validate_motion()
         if type(allow_motion) is not bool:
             raise ValueError('Explicit boolean motion permission required')
@@ -41,7 +41,8 @@ class MotionBackend:
         self.enabled = allow_motion
         self.step_period = step_period
         self.stream = CommandStream(port, command_timeout=command_timeout,
-                                    send_timeout=send_timeout, stop_timeout=stop_timeout)
+                                    send_timeout=send_timeout, stop_timeout=stop_timeout,
+                                    rate_hz=send_rate_hz)
         self.stopped = self.closed = False
         self.execute_lock = threading.Lock()
         self.reader_lock = threading.RLock()
