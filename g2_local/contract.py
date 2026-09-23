@@ -28,12 +28,44 @@ class EpisodeContext:
     # Keeping this separate from target_offset_m makes domain-randomization
     # evidence unambiguous in replay and evaluation logs.
     ee_reset_offset: tuple[float, ...] = (0., 0., 0., 0., 0., 0.)
+    visual_reset_monotonic_ns: int | None = None
+    visual_confidence: float | None = None
+    upstream_frame_id: str | None = None
 
     def __post_init__(self):
         if not self.episode_id or not self.approach_source or not self.grasp_description:
             raise ValueError('Episode ID, approach and grasp metadata are required')
         object.__setattr__(self, 'target_offset_m', vector(self.target_offset_m, 3))
         object.__setattr__(self, 'ee_reset_offset', vector(self.ee_reset_offset, 6))
+        if (self.visual_reset_monotonic_ns is not None and
+                (type(self.visual_reset_monotonic_ns) is not int or
+                 self.visual_reset_monotonic_ns < 0)):
+            raise ValueError('visual_reset_monotonic_ns must be nonnegative integer')
+        if self.visual_confidence is not None:
+            if (type(self.visual_confidence) not in (float, int) or
+                    not math.isfinite(self.visual_confidence) or
+                    not 0 <= self.visual_confidence <= 1):
+                raise ValueError('visual_confidence must be finite in [0,1]')
+        if (self.upstream_frame_id is not None and
+                (type(self.upstream_frame_id) is not str or
+                 not 0 < len(self.upstream_frame_id) <= 128 or
+                 not self.upstream_frame_id.isprintable())):
+            raise ValueError('upstream_frame_id must be bounded printable text')
+
+    @classmethod
+    def from_payload(cls, payload):
+        if type(payload) is not dict:
+            raise ValueError('Episode context must be a JSON object')
+        allowed = {'episode_id', 'target_offset_m', 'approach_source',
+                   'grasp_description', 'ee_reset_offset',
+                   'visual_reset_monotonic_ns', 'visual_confidence',
+                   'upstream_frame_id'}
+        if set(payload) - allowed:
+            raise ValueError('Unknown episode context field')
+        try:
+            return cls(**payload)
+        except (TypeError, KeyError) as exc:
+            raise ValueError('Invalid episode context payload') from exc
 
 
 @dataclass(frozen=True)
