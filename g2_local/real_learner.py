@@ -47,8 +47,13 @@ class LearnerSnapshot:
 
 
 def _training_row(row):
+    with np.errstate(over='ignore'):
+        stored_reward = np.float32(row['reward'])
+    if not np.isfinite(stored_reward):
+        raise ValueError('Reward cannot be represented in replay float32 storage')
     return {**{key: row[key] for key in ('state', 'next_state', 'action',
-                                        'reward', 'done', 'truncated')},
+                                        'done', 'truncated')},
+            'reward': float(stored_reward),
             'complementary_info': {
                 'is_intervention': float(row['complementary_info']['is_intervention'])}}
 
@@ -73,6 +78,8 @@ def _restore_replay(buffer, state):
             state['initialized'] != (state['size'] > 0)):
         raise ValueError('Invalid replay checkpoint')
     if not state['initialized']:
+        if state['position'] != 0:
+            raise ValueError('Empty replay has invalid insertion position')
         return
     if state['position'] != state['size'] % buffer.capacity and state['size'] < buffer.capacity:
         raise ValueError('Invalid replay insertion position')
@@ -80,14 +87,38 @@ def _restore_replay(buffer, state):
                 'truncateds', 'complementary_info', 'episode_ends'):
         if key not in state:
             raise ValueError('Incomplete replay checkpoint')
-    if (set(state['states']) != {'observation.state',
-                               *(f'observation.images.{key}' for key in CAMERA_KEYS)} or
-            state['actions'].shape != (buffer.capacity, 6) or
-            state['states']['observation.state'].shape != (buffer.capacity, 7)):
-        raise ValueError('Replay camera/action contract mismatch')
-    for key, values in state['states'].items():
-        if key.startswith('observation.images.') and values.shape != (buffer.capacity, 3, 128, 128):
+    observation_shapes = {'observation.state': (buffer.capacity, 7),
+                          **{f'observation.images.{key}': (buffer.capacity, 3, 128, 128)
+                             for key in CAMERA_KEYS}}
+    def check_tensor(value, shape, dtype, *, finite=False):
+        if (type(value) is not torch.Tensor or value.shape != shape or
+                value.dtype != dtype or value.device.type != 'cpu' or
+                value.layout != torch.strided):
+            raise ValueError('Replay tensor contract mismatch')
+        occupied = value[:state['size']]
+        if finite and not torch.isfinite(occupied).all().item():
+            raise ValueError('Nonfinite occupied replay tensor')
+    for field in ('states', 'next_states'):
+        if type(state[field]) is not dict or set(state[field]) != set(observation_shapes):
             raise ValueError('Replay camera contract mismatch')
+        for key, shape in observation_shapes.items():
+            check_tensor(state[field][key], shape, torch.float32, finite=True)
+            if key.startswith('observation.images.'):
+                occupied = state[field][key][:state['size']]
+                if bool((occupied < 0).any() or (occupied > 1).any()):
+                    raise ValueError('Replay camera value mismatch')
+    for field, shape, dtype, finite in (
+            ('actions', (buffer.capacity, 6), torch.float32, True),
+            ('rewards', (buffer.capacity,), torch.float32, True),
+            ('dones', (buffer.capacity,), torch.bool, False),
+            ('truncateds', (buffer.capacity,), torch.bool, False),
+            ('episode_ends', (buffer.capacity,), torch.bool, False)):
+        check_tensor(state[field], shape, dtype, finite=finite)
+    if (type(state['complementary_info']) is not dict or
+            set(state['complementary_info']) != {'is_intervention'}):
+        raise ValueError('Replay intervention contract mismatch')
+    check_tensor(state['complementary_info']['is_intervention'],
+                 (buffer.capacity,), torch.float32, finite=True)
     buffer.position, buffer.size, buffer.initialized = (state['position'], state['size'], True)
     for key in ('states', 'next_states', 'actions', 'rewards', 'dones',
                 'truncateds', 'complementary_info', 'episode_ends'):
@@ -106,6 +137,15 @@ def _check_replay_records(buffer, records):
         slot = index % buffer.capacity
         if not torch.equal(buffer.actions[slot].cpu(), row['action'].cpu()):
             raise ValueError('Replay executed action and provenance mismatch')
+        for field, replay_field in (('state', 'states'), ('next_state', 'next_states')):
+            for key, value in row[field].items():
+                if not torch.equal(getattr(buffer, replay_field)[key][slot].cpu(),
+                                   value.squeeze(0).cpu()):
+                    raise ValueError('Replay observation and provenance mismatch')
+        if (buffer.rewards[slot].item() != torch.tensor(row['reward'], dtype=torch.float32).item() or
+                buffer.dones[slot].item() != row['done'] or
+                buffer.truncateds[slot].item() != row['truncated']):
+            raise ValueError('Replay outcome and provenance mismatch')
         intervention = float(row['complementary_info']['is_intervention'])
         if (set(buffer.complementary_info) != {'is_intervention'} or
                 buffer.complementary_info['is_intervention'][slot].item() != intervention):
@@ -148,6 +188,10 @@ class RealLearnerRuntime:
         self.records = []
         self.version = 0
         self.message_sequence = -1
+        self._published_version = 0
+        self._published_actor_state = {
+            key: value.detach().cpu().clone()
+            for key, value in self.policy.actor.state_dict().items()}
         self.accepted_transitions = 0
         self.update_count = 0
         self._interaction_budget = 0
@@ -167,15 +211,14 @@ class RealLearnerRuntime:
     def ingest(self, rows):
         with self._lock:
             rows = tuple(rows)
-            identities = [validate_real_transition(row, self.run_id, self.config_hash).value
-                          for row in rows]
+            prepared = [(validate_real_transition(row, self.run_id, self.config_hash).value,
+                         _training_row(row)) for row in rows]
             new = set()
             accepted = duplicates = 0
-            for row, identity in zip(rows, identities):
+            for row, (identity, training) in zip(rows, prepared):
                 if identity in self.seen_transition_ids or identity in new:
                     duplicates += 1
                     continue
-                training = _training_row(row)
                 self.online_replay.add(**training)
                 if row['complementary_info']['is_intervention']:
                     self.human_replay.add(**training)
@@ -184,21 +227,37 @@ class RealLearnerRuntime:
                 self.records.append(row)
                 accepted += 1
             self.accepted_transitions += accepted
-            self._interaction_budget += accepted
+            self._interaction_budget += accepted * self.config.optimization.utd_ratio
             return IngestResult(accepted, duplicates)
 
-    def _envelope(self):
+    def _envelope(self, version, state):
         self.message_sequence += 1
-        state = {key: value.detach().cpu().clone()
-                 for key, value in self.policy.actor.state_dict().items()}
-        return ParameterEnvelope(self.run_id, self.config_hash, self.version,
+        return ParameterEnvelope(self.run_id, self.config_hash, version,
                                  self.message_sequence, state)
 
     def publish_parameters(self):
         with self._lock:
             if self.stopped.is_set():
                 raise RuntimeError('Learner stopped')
-            envelope = self._envelope()
+            state = {key: value.detach().cpu().clone()
+                     for key, value in self.policy.actor.state_dict().items()}
+            envelope = self._envelope(self.version, state)
+            if self.publish is not None:
+                try:
+                    self.publish(envelope)
+                except BaseException:
+                    self.stopped.set()
+                    raise
+            self._published_version = self.version
+            self._published_actor_state = state
+            return envelope
+
+    def heartbeat_parameters(self):
+        with self._lock:
+            if self.stopped.is_set():
+                raise RuntimeError('Learner stopped')
+            envelope = self._envelope(self._published_version,
+                                      self._published_actor_state)
             if self.publish is not None:
                 try:
                     self.publish(envelope)
@@ -225,6 +284,8 @@ class RealLearnerRuntime:
             metrics = train_batch(self.policy, self.optimizers, data, names)
             self.version += 1
             self.update_count += 1
+            if self._interaction_budget:
+                self._interaction_budget -= 1
             if self.version % opt.target_update_interval == 0:
                 self.policy.update_target_networks()
             if self.version % opt.publish_interval == 0:
@@ -235,15 +296,13 @@ class RealLearnerRuntime:
 
     def update_for_interactions(self):
         with self._lock:
-            count = self._interaction_budget
-            self._interaction_budget = 0
-        results = []
-        for _ in range(count * self.config.optimization.utd_ratio):
-            result = self.update_once()
-            if result is None:
-                break
-            results.append(result)
-        return results
+            results = []
+            while self._interaction_budget:
+                result = self.update_once()
+                if result is None:
+                    break
+                results.append(result)
+            return results
 
     def _payload(self):
         return dict(schema=1, run_id=self.run_id, config_hash=self.config_hash,
@@ -259,6 +318,8 @@ class RealLearnerRuntime:
                     seen_transition_ids=sorted(self.seen_transition_ids),
                     records=self.records, version=self.version,
                     message_sequence=self.message_sequence,
+                    published_version=self._published_version,
+                    published_actor_state=self._published_actor_state,
                     accepted_transitions=self.accepted_transitions,
                     update_count=self.update_count,
                     interaction_budget=self._interaction_budget,
@@ -336,6 +397,19 @@ def load_checkpoint(path: Path, *, expected_run_id: str, expected_config_hash: s
             raise ValueError('Invalid checkpoint counter')
     learner.version = payload['version']
     learner.message_sequence = payload['message_sequence']
+    published = payload['published_actor_state']
+    expected_actor = learner.policy.actor.state_dict()
+    if (type(payload['published_version']) is not int or
+            not 0 <= payload['published_version'] <= learner.version or
+            type(published) is not dict or set(published) != set(expected_actor) or
+            any(type(published[key]) is not torch.Tensor or
+                published[key].shape != expected_actor[key].shape or
+                published[key].dtype != expected_actor[key].dtype or
+                not torch.isfinite(published[key]).all().item()
+                for key in expected_actor)):
+        raise ValueError('Invalid published Actor checkpoint state')
+    learner._published_version = payload['published_version']
+    learner._published_actor_state = published
     learner.accepted_transitions = payload['accepted_transitions']
     learner.update_count = payload['update_count']
     learner._interaction_budget = payload['interaction_budget']
@@ -364,6 +438,11 @@ class GrpcLearnerService(rpc.LearnerServiceServicer):
             self._latest = envelope
             self._condition.notify_all()
 
+    def _stop(self):
+        self.learner.stopped.set()
+        with self._condition:
+            self._condition.notify_all()
+
     def SendTransitions(self, request_iterator, context):  # noqa: N802
         data = bytearray()
         ended = False
@@ -382,7 +461,7 @@ class GrpcLearnerService(rpc.LearnerServiceServicer):
             self.learner.ingest(rows)
             self.learner.update_for_interactions()
         except BaseException:
-            self.learner.stopped.set()
+            self._stop()
             raise
         return pb.Empty()
 
@@ -390,29 +469,38 @@ class GrpcLearnerService(rpc.LearnerServiceServicer):
         heartbeat = self.learner.config.runtime.parameter_heartbeat_s
         last_sequence = -1
         try:
+            if hasattr(context, 'add_callback'):
+                context.add_callback(self._stop)
             while context.is_active() and not self.learner.stopped.is_set():
                 with self._condition:
                     self._condition.wait_for(
-                        lambda: self._latest is not None and
-                        self._latest.message_sequence > last_sequence,
+                        lambda: self.learner.stopped.is_set() or
+                        not context.is_active() or
+                        (self._latest is not None and
+                         self._latest.message_sequence > last_sequence),
                         timeout=heartbeat)
+                    if self.learner.stopped.is_set() or not context.is_active():
+                        return
                     if self._latest is not None and self._latest.message_sequence > last_sequence:
                         envelope = self._latest
                     else:
                         envelope = None
                 if envelope is None:
-                    envelope = self.learner.publish_parameters()
+                    envelope = self.learner.heartbeat_parameters()
+                if self.learner.stopped.is_set() or not context.is_active():
+                    return
                 with self._condition:
                     last_sequence = envelope.message_sequence
                 payload = dict(run_id=envelope.run_id, config_hash=envelope.config_hash,
                                version=envelope.version,
                                message_sequence=envelope.message_sequence,
                                actor_state=envelope.actor_state)
-                yield from send_bytes_in_chunks(state_to_bytes(payload), pb.Parameters)
-        except BaseException:
-            self.learner.stopped.set()
-            raise
-        self.learner.stopped.set()
+                for chunk in send_bytes_in_chunks(state_to_bytes(payload), pb.Parameters):
+                    if self.learner.stopped.is_set() or not context.is_active():
+                        return
+                    yield chunk
+        finally:
+            self._stop()
 
     def Ready(self, request, context):  # noqa: N802
         return pb.Empty()
