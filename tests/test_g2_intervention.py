@@ -73,6 +73,32 @@ def test_stale_nonzero_aborts_and_latches():
         source()
 
 
+def test_stale_input_inside_release_deadzone_aborts():
+    source, reader, now = engaged_source()
+    reader.frame = frame(axes=(.05,0,0,0,0,0), stamps=(1.,1.))
+    now[0] = 2.
+    with pytest.raises(RuntimeError, match='stale nonzero'):
+        source()
+    with pytest.raises(RuntimeError, match='latched'):
+        source()
+
+
+def test_repeated_neutral_snapshot_cannot_accumulate_release_hold():
+    source, reader, now = engaged_source()
+    reader.frame = frame(stamps=(1.1,1.1)); now[0] = 1.1
+    assert source()[0] is True
+    reader.frame = frame(stamps=(1.2,1.2)); now[0] = 1.2
+    assert source()[0] is True
+    now[0] = 1.39  # Still age-fresh, but no new axis-channel packets.
+    assert source()[0] is True
+    reader.frame = frame(stamps=(1.5,1.2)); now[0] = 1.5
+    assert source()[0] is True
+    reader.frame = frame(stamps=(1.6,1.6)); now[0] = 1.6
+    assert source()[0] is True
+    reader.frame = frame(stamps=(1.9,1.9)); now[0] = 1.9
+    assert source() == (False, None)
+
+
 def test_malformed_report_latches_and_invalidates_last_frame():
     source, reader, now = automatic_source()
     assert source.last_frame is reader.frame

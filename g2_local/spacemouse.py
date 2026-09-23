@@ -171,6 +171,7 @@ class AutomaticIntervention:
         self.active = False
         self.neutral_since = None
         self.last_frame = None
+        self.last_stamps = None
         self.fault = None
 
     def _raw_neutral(self, frame):
@@ -189,12 +190,16 @@ class AutomaticIntervention:
                     any(t is None or not math.isfinite(t) or t < 0 or t > now
                         for t in stamps)):
                 raise ValueError('SpaceMouse report unavailable or malformed')
-            if not self.gate.fresh and not self._raw_neutral(frame):
+            new_report = (self.last_stamps is None or
+                          all(current > previous for current, previous in
+                              zip(stamps, self.last_stamps)))
+            self.last_stamps = stamps
+            if not self.gate.fresh and any(value != 0 for value in frame.axes):
                 raise RuntimeError('stale nonzero SpaceMouse input')
             moving = max(map(abs, proposal.action)) > self.config.engage_deadzone
             if moving:
                 self.active, self.neutral_since = True, None
-            elif self.active and self.gate.fresh and self._raw_neutral(frame):
+            elif self.active and self.gate.fresh and new_report and self._raw_neutral(frame):
                 self.neutral_since = now if self.neutral_since is None else self.neutral_since
                 if now - self.neutral_since >= self.config.release_hold_s:
                     self.active, self.neutral_since = False, None
@@ -206,6 +211,7 @@ class AutomaticIntervention:
             self.active = False
             self.neutral_since = None
             self.last_frame = None
+            self.last_stamps = None
             self.gate.invalidate()
             raise
 
