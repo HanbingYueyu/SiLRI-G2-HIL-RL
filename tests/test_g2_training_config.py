@@ -258,6 +258,68 @@ def test_manifest_directory_swap_cannot_write_into_existing_directory(tmp_path, 
     assert not (output / 'run_manifest.json').exists()
 
 
+def test_manifest_stage_swap_before_open_rejects_existing_directory(tmp_path, monkeypatch):
+    loaded = load_training_config(write_config(tmp_path), cli_allow_motion=False)
+    substitute = tmp_path / 'existing-stage'
+    substitute.mkdir()
+    (substitute / 'sentinel').write_text('existing')
+    original_mkdir = os.mkdir
+    stage_name = None
+
+    def replace_new_stage(name, mode=0o777, *, dir_fd=None):
+        nonlocal stage_name
+        original_mkdir(name, mode, dir_fd=dir_fd)
+        if name.startswith('.run.manifest-'):
+            stage_name = name
+            os.rename(name, 'moved-new-stage', src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            os.rename(substitute.name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, 'mkdir', replace_new_stage)
+    with pytest.raises(ValueError):
+        loaded.write_manifest(tmp_path / 'run', run_id='run-1', role='learner')
+    assert stage_name is not None
+    assert (tmp_path / stage_name / 'sentinel').read_text() == 'existing'
+    assert not (tmp_path / stage_name / 'run_manifest.json').exists()
+    assert not (tmp_path / 'run').exists()
+
+
+def test_failed_manifest_cleanup_does_not_remove_substituted_stage(tmp_path, monkeypatch):
+    loaded = load_training_config(write_config(tmp_path), cli_allow_motion=False)
+    substitute = tmp_path / 'existing-empty-stage'
+    substitute.mkdir()
+    output = tmp_path / 'run'
+    original_open = os.open
+    stage_name = None
+
+    # The stage name is resolved from the pinned descriptor; the rename is
+    # performed in the test's known parent rather than through production code.
+    def swap_with_parent(path, flags, *args, **kwargs):
+        nonlocal stage_name
+        if stage_name is None and Path(path).name == 'run_manifest.json' and flags & os.O_EXCL:
+            stage_name = Path(os.readlink(f"/proc/self/fd/{kwargs['dir_fd']}")).name
+            (tmp_path / stage_name).rename(tmp_path / 'moved-new-stage')
+            substitute.rename(tmp_path / stage_name)
+            output.mkdir()
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'open', swap_with_parent)
+    with pytest.raises(FileExistsError):
+        loaded.write_manifest(output, run_id='run-1', role='learner')
+    assert stage_name is not None
+    assert (tmp_path / stage_name).is_dir()
+    assert not (tmp_path / stage_name / 'run_manifest.json').exists()
+
+
+def test_manifest_parent_must_be_owned_and_private(tmp_path):
+    loaded = load_training_config(write_config(tmp_path), cli_allow_motion=False)
+    shared = tmp_path / 'shared'
+    shared.mkdir()
+    shared.chmod(0o777)
+    with pytest.raises(ValueError):
+        loaded.write_manifest(shared / 'run', run_id='run-1', role='learner')
+    assert not (shared / 'run').exists()
+
+
 def test_loaded_payload_cannot_be_mutated_and_hash_is_canonical(tmp_path):
     payload = valid_payload()
     loaded = load_training_config(write_config(tmp_path, payload), cli_allow_motion=False)

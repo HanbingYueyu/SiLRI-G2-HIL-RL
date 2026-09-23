@@ -338,6 +338,11 @@ class LoadedTrainingConfig:
     canonical_payload: Mapping[str, object]
 
     def write_manifest(self, output: Path, *, run_id: str, role: str) -> Path:
+        """Publish a new manifest under an owned, non-group/world-writable parent.
+
+        Linux mkdirat does not return an FD; the private parent is the trust
+        boundary until the random staging directory is opened and pinned.
+        """
         _string(run_id, 'run_id')
         _string(role, 'role')
         output = Path(output)
@@ -351,14 +356,25 @@ class LoadedTrainingConfig:
                                      os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         stage_name = f'.{output.name}.manifest-{secrets.token_hex(16)}'
         stage_fd = None
+        stage_identity = None
+        manifest_created = False
         published = False
         try:
+            parent_status = os.fstat(parent_fd)
+            if (parent_status.st_uid != os.geteuid() or
+                    parent_status.st_mode & 0o022):
+                raise ValueError('Manifest output parent must be owned and not group/world writable')
             os.mkdir(stage_name, 0o700, dir_fd=parent_fd)
             stage_fd = os.open(stage_name, os.O_RDONLY | os.O_DIRECTORY |
                                os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+            stage_status = os.fstat(stage_fd)
+            stage_identity = (stage_status.st_dev, stage_status.st_ino)
+            if stage_status.st_uid != os.geteuid() or os.listdir(stage_fd):
+                raise ValueError('New manifest staging directory must be owned and empty')
             os.fchmod(stage_fd, 0o700)
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
             fd = os.open('run_manifest.json', flags, 0o600, dir_fd=stage_fd)
+            manifest_created = True
             with os.fdopen(fd, 'wb') as stream:
                 stream.write(encoded)
                 stream.flush()
@@ -371,15 +387,19 @@ class LoadedTrainingConfig:
             return output / 'run_manifest.json'
         finally:
             if stage_fd is not None:
-                if not published:
+                if not published and manifest_created:
                     try:
-                        os.unlink('run_manifest.json', dir_fd=stage_fd)
-                    except FileNotFoundError:
-                        pass
-                    try:
-                        os.rmdir(stage_name, dir_fd=parent_fd)
-                    except (FileNotFoundError, OSError):
-                        pass
+                        current = os.stat(stage_name, dir_fd=parent_fd,
+                                          follow_symlinks=False)
+                    except OSError:
+                        current = None
+                    if (current is not None and
+                            (current.st_dev, current.st_ino) == stage_identity):
+                        try:
+                            os.unlink('run_manifest.json', dir_fd=stage_fd)
+                            os.rmdir(stage_name, dir_fd=parent_fd)
+                        except OSError:
+                            pass
                 os.close(stage_fd)
             os.close(parent_fd)
 
