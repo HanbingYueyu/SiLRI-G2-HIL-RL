@@ -332,6 +332,22 @@ def test_resume_rejects_corrupted_replay_fields(tmp_path, corrupt):
                         expected_config_hash='hash-1')
 
 
+def test_resume_rejects_corrupted_occupied_episode_end_bit(tmp_path):
+    learner = _learner()
+    terminal = _row()
+    terminal['done'] = True
+    learner.ingest([terminal])
+    checkpoint = learner.save_checkpoint(tmp_path / 'checkpoint.pt')
+    assert load_checkpoint(checkpoint, expected_run_id='run-1',
+                           expected_config_hash='hash-1').online_replay.episode_ends[0].item() is False
+    payload = torch.load(checkpoint, weights_only=False)
+    payload['online_replay']['episode_ends'][0] = True
+    torch.save(payload, checkpoint)
+    with pytest.raises(ValueError, match='episode end'):
+        load_checkpoint(checkpoint, expected_run_id='run-1',
+                        expected_config_hash='hash-1')
+
+
 def test_large_float_reward_rejects_entire_batch_before_mutation():
     learner = _learner()
     bad = _row(1)

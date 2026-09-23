@@ -146,6 +146,9 @@ def _check_replay_records(buffer, records):
                 buffer.dones[slot].item() != row['done'] or
                 buffer.truncateds[slot].item() != row['truncated']):
             raise ValueError('Replay outcome and provenance mismatch')
+        # Upstream ReplayBuffer.add never sets episode_ends when optimize_memory=False.
+        if buffer.episode_ends[slot].item():
+            raise ValueError('Replay episode end marker mismatch')
         intervention = float(row['complementary_info']['is_intervention'])
         if (set(buffer.complementary_info) != {'is_intervention'} or
                 buffer.complementary_info['is_intervention'][slot].item() != intervention):
