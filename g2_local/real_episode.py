@@ -4,8 +4,9 @@ from dataclasses import dataclass
 import math
 import time
 import uuid
+import numpy as np
 
-from .contract import EpisodeContext
+from .contract import CAMERA_KEYS, EpisodeContext, vector
 from .operator_control import StartChord, TerminalKeyReader
 from .outcome import OutcomeDecision
 
@@ -73,31 +74,20 @@ class RealEpisodeCoordinator:
             self._abort()
             raise RuntimeError('Input fault before episode start')
         gate = getattr(self.intervention, 'gate', None)
-        if gate is not None and not gate.fresh:
+        if gate is None or getattr(gate, 'fresh', None) is not True:
             self.chord.reset()
             return False
-        if self.chord.update(self.intervention.last_frame):
-            self.confirm_start_chord()
-            return True
-        return False
-
-    def confirm_start_chord(self):
-        if self.state != 'WAITING_FOR_RESET' or self.context is None:
-            raise RuntimeError('Reset context required before start chord')
+        if not self.chord.update(self.intervention.last_frame):
+            return False
         self._validate_context(self.context)
         if self.context.visual_reset_monotonic_ns is None:
             raise ValueError('stale reset context: missing visual reset time')
-        if getattr(self.intervention, 'fault', None) is not None or self.intervention.last_frame is None:
-            self._abort()
-            raise RuntimeError('Input fault before episode start')
-        gate = getattr(self.intervention, 'gate', None)
-        if gate is not None and not gate.fresh:
-            raise RuntimeError('Fresh SpaceMouse report required for start chord')
         self.keys.drain()
         self._step_id = 0
         self._pending_terminal = None
         self.chord.reset()
         self.state = 'RUNNING'
+        return True
 
     def begin_step(self):
         if not self.running:
@@ -134,7 +124,7 @@ class RealEpisodeCoordinator:
             self.chord.reset()
         return decision
 
-    def finish_step(self, token):
+    def _finish_step(self, token):
         self._validate_token(token)
         if self._pending_terminal == 'success':
             return self._finish(OutcomeDecision(self.success_reward, True, 'human', True))
@@ -142,9 +132,25 @@ class RealEpisodeCoordinator:
             return self._finish(OutcomeDecision(self.failure_reward, True, 'human', False))
         return self._finish(OutcomeDecision(self.step_reward, False, 'human', None))
 
+    @staticmethod
+    def _validate_successor(observation):
+        if not isinstance(observation, dict) or set(observation) != {'state', *CAMERA_KEYS}:
+            raise ValueError('Valid G2 successor observation required')
+        try:
+            pose = vector(observation['state'], 7)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('Invalid successor state') from exc
+        if abs(np.linalg.norm(pose[3:]) - 1.) > .01:
+            raise ValueError('Invalid successor quaternion')
+        for key in CAMERA_KEYS:
+            image = observation[key]
+            if (not isinstance(image, np.ndarray) or image.dtype != np.uint8 or
+                    image.ndim != 3 or image.shape[2] != 3 or
+                    min(image.shape[:2]) <= 0):
+                raise ValueError('Invalid successor RGB observation')
+
     def outcome(self, observation):
-        if observation is None:
-            raise ValueError('Valid successor observation required')
+        self._validate_successor(observation)
         token = self._token
         self._validate_token(token)
         if getattr(self.intervention, 'fault', None) is not None or self.intervention.last_frame is None:
@@ -154,7 +160,7 @@ class RealEpisodeCoordinator:
             label = self.keys.poll()
             if label is not None:
                 self.request_terminal(label)
-            return self.finish_step(token)
+            return self._finish_step(token)
         except Exception:
             self._abort()
             raise

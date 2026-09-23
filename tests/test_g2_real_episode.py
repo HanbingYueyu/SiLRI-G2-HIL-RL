@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from g2_local.contract import EpisodeContext
@@ -18,6 +19,7 @@ class Keys:
 class Intervention:
     def __init__(self):
         self.last_frame = SimpleNamespace(buttons=(False, False), pressed=(), ready=True)
+        self.gate = SimpleNamespace(fresh=True)
         self.fault = None
     def __call__(self): return False, None
 
@@ -39,18 +41,26 @@ def waiting_episode(*, now_ns=40_000_000_000, context_max_age_s=5.0,
 def running_episode():
     machine = waiting_episode()
     machine.offer_context(context())
-    machine.confirm_start_chord()
+    machine.intervention.last_frame = SimpleNamespace(buttons=(True, True),
+                                                       pressed=(0, 1), ready=True)
+    assert machine.observe_start_frame() is False
+    machine.intervention.last_frame = SimpleNamespace(buttons=(False, False),
+                                                       pressed=(), ready=True)
+    assert machine.observe_start_frame() is True
     return machine
 
 
-def valid_successor(): return {'valid': True}
+def valid_successor():
+    return dict(state=np.array((0., 0., 0., 0., 0., 0., 1.), dtype=np.float32),
+                left_wrist=np.zeros((2, 2, 3), dtype=np.uint8),
+                right_aux=np.zeros((2, 2, 3), dtype=np.uint8))
 
 
 def test_y_during_step_is_consumed_once_after_successor():
     machine = running_episode()
     token = machine.begin_step()
     machine.request_terminal('success')
-    assert machine.finish_step(token) == OutcomeDecision(10., True, 'human', True)
+    assert machine.outcome(valid_successor()) == OutcomeDecision(10., True, 'human', True)
     with pytest.raises(RuntimeError, match='not running'): machine.begin_step()
 
 
@@ -68,7 +78,12 @@ def test_stale_or_out_of_range_reset_context_cannot_start():
 def test_terminal_key_buffer_is_flushed_before_episode_start():
     machine = waiting_episode(keys=('y',))
     machine.offer_context(context())
-    machine.confirm_start_chord()
+    machine.intervention.last_frame = SimpleNamespace(buttons=(True, True),
+                                                       pressed=(0, 1), ready=True)
+    assert machine.observe_start_frame() is False
+    machine.intervention.last_frame = SimpleNamespace(buttons=(False, False),
+                                                       pressed=(), ready=True)
+    assert machine.observe_start_frame() is True
     assert machine.begin_step().step_id == 0
     assert machine.outcome(valid_successor()) == OutcomeDecision(-.05, False,
                                                                   'human', None)
@@ -79,7 +94,7 @@ def test_abort_invalidates_step_and_clears_pending_state():
     token = machine.begin_step()
     machine.request_terminal('failure')
     machine.abort_step(token)
-    with pytest.raises(RuntimeError): machine.finish_step(token)
+    with pytest.raises(RuntimeError): machine.outcome(valid_successor())
     assert machine.state == 'ABORTED'
     assert machine.context is None
 
@@ -106,8 +121,13 @@ def test_context_metadata_defaults_and_bounds():
 def test_legacy_context_parses_but_cannot_authorize_real_start():
     machine = waiting_episode()
     machine.offer_context(EpisodeContext('legacy', (0, 0, 0), 'visual', 'fixed'))
+    machine.intervention.last_frame = SimpleNamespace(buttons=(True, True),
+                                                       pressed=(0, 1), ready=True)
+    assert machine.observe_start_frame() is False
+    machine.intervention.last_frame = SimpleNamespace(buttons=(False, False),
+                                                       pressed=(), ready=True)
     with pytest.raises(ValueError, match='stale reset context'):
-        machine.confirm_start_chord()
+        machine.observe_start_frame()
 
 
 def test_ee_reset_offset_must_fit_configured_range():
@@ -137,3 +157,36 @@ def test_stale_hid_report_cannot_start_chord():
     machine.intervention.last_frame = SimpleNamespace(buttons=(False, False),
                                                        pressed=(), ready=True)
     assert machine.observe_start_frame() is False
+
+
+def test_direct_start_bypass_is_unavailable():
+    machine = waiting_episode()
+    machine.offer_context(context())
+    assert not hasattr(machine, 'confirm_start_chord')
+    with pytest.raises(RuntimeError, match='not running'): machine.begin_step()
+
+
+def test_missing_gate_cannot_start_chord():
+    machine = waiting_episode()
+    machine.offer_context(context())
+    del machine.intervention.gate
+    machine.intervention.last_frame = SimpleNamespace(buttons=(True, True),
+                                                       pressed=(0, 1), ready=True)
+    assert machine.observe_start_frame() is False
+    machine.intervention.last_frame = SimpleNamespace(buttons=(False, False),
+                                                       pressed=(), ready=True)
+    assert machine.observe_start_frame() is False
+
+
+def test_malformed_successor_cannot_seal_pending_terminal():
+    machine = running_episode()
+    machine.begin_step()
+    machine.request_terminal('success')
+    assert not hasattr(machine, 'finish_step')
+    for malformed in ({'valid': True},
+                      dict(valid_successor(), left_wrist=np.zeros((2, 2), dtype=np.uint8)),
+                      dict(valid_successor(), state=np.array((0.,) * 7))):
+        with pytest.raises(ValueError, match='successor'):
+            machine.outcome(malformed)
+        assert machine.running
+    assert machine.outcome(valid_successor()) == OutcomeDecision(10., True, 'human', True)
