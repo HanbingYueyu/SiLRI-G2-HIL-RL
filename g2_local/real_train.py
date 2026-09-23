@@ -101,54 +101,87 @@ class EvalTransitionSink:
         from .real_actor import ParameterEnvelope
         self.envelope = ParameterEnvelope(run_id, config_hash, version, 0, actor_state)
         self.evidence = evidence
-        self._delivered = False
+        self._sequence = -1
         self._episodes = {}
+        self._timing = {}
         self._clipping = 0
+        self._freshness_rejects = 0
 
     def assert_alive(self):
         return None
 
     def receive_latest_parameters(self):
-        if self._delivered:
-            return None
-        self._delivered = True
-        return self.envelope
+        from .real_actor import ParameterEnvelope
+        self._sequence += 1
+        return ParameterEnvelope(self.envelope.run_id, self.envelope.config_hash,
+                                 self.envelope.version, self._sequence,
+                                 self.envelope.actor_state)
+
+    def _episode(self, episode_id, info=None):
+        info = {} if info is None else info
+        return self._episodes.setdefault(episode_id, dict(
+            episode_id=episode_id, success=False, assisted=False, completed=False, length=0,
+            intervention_ratio=0., action_clipping_count=0,
+            freshness_rejects=0, stop_reason='', actor_latency_s=None,
+            control_period_s=None, policy_version=info.get('actor_version'),
+            target_offset_m=info.get('target_offset_m'),
+            ee_reset_offset=info.get('ee_reset_offset')))
+
+    def telemetry(self, kind, **fields):
+        if kind == 'step':
+            self._timing[(fields['episode_id'], fields['step_id'])] = fields
+            return
+        if kind == 'freshness_reject':
+            self._freshness_rejects += 1
+            episode_id = fields.get('episode_id')
+            if episode_id is not None:
+                self._episode(episode_id)['freshness_rejects'] += 1
+            self.evidence.event(kind, **fields)
+        elif kind == 'stop':
+            self.evidence.event('command_stop', **fields)
+
+    def finalize_unfinished(self, reason):
+        for item in self._episodes.values():
+            if not item['stop_reason']:
+                item['stop_reason'] = reason
+                if item['length']:
+                    item['intervention_ratio'] /= item['length']
+                self.evidence.episode(item)
 
     def send_transition_batch(self, rows):
         for row in rows:
             info = row['complementary_info']
             episode_id = info['episode_id']
-            item = self._episodes.setdefault(episode_id, dict(
-                episode_id=episode_id, success=False, assisted=False, length=0,
-                intervention_ratio=0., action_clipping_count=0,
-                freshness_rejects=0, stop_reason='', actor_latency_s=None,
-                control_period_s=None, policy_version=info['actor_version'],
-                target_offset_m=info.get('target_offset_m'),
-                ee_reset_offset=info.get('ee_reset_offset')))
+            item = self._episode(episode_id, info)
             item['length'] += 1
             item['assisted'] |= bool(info['is_intervention'])
             item['intervention_ratio'] += int(info['is_intervention'])
             clipped = tuple(info['selected_action']) != tuple(info['executed_action'])
             item['action_clipping_count'] += int(clipped)
             self._clipping += int(clipped)
-            item['freshness_rejects'] += int(info.get('freshness_rejected', False))
-            item['actor_latency_s'] = info.get('actor_latency_s')
-            item['control_period_s'] = info.get('control_period_s')
+            timing = self._timing.pop((episode_id, info['step_id']), None)
+            if timing is not None:
+                item['actor_latency_s'] = timing['inference_latency_s']
+                item['control_period_s'] = timing['control_period_s']
             if row['done'] or row['truncated']:
-                item['success'] = info.get('success_label') == 'success'
+                label = info.get('success_label')
+                item['success'] = label is True
+                item['completed'] = True
                 item['stop_reason'] = ('time_limit' if row['truncated'] else
-                                       info.get('success_label') or 'terminal')
+                                       'success' if label is True else
+                                       'failure' if label is False else 'terminal')
                 item['intervention_ratio'] /= item['length']
                 self.evidence.episode(item)
 
     def summary(self):
-        completed = [item for item in self._episodes.values() if item['stop_reason']]
+        completed = [item for item in self._episodes.values() if item['completed']]
         free = [item for item in completed if not item['assisted']]
         return {'episodes': len(completed),
                 'successes': sum(item['success'] for item in completed),
                 'intervention_free_success_rate_numerator': sum(item['success'] for item in free),
                 'intervention_free_success_rate_denominator': len(free),
-                'action_clipping_count': self._clipping}
+                'action_clipping_count': self._clipping,
+                'freshness_rejects': self._freshness_rejects}
 
     def close(self):
         return None
@@ -169,22 +202,8 @@ class EvidenceActorTransport:
         self.transport.send_transition_batch(rows)
         self.tracker.send_transition_batch(rows)
 
-
-def stop_actor(runtime, transport, evidence, reason):
-    stop_error = None
-    try:
-        runtime.stop(reason)
-    except BaseException as error:
-        stop_error = error
-    finally:
-        try:
-            runtime.close_environment()
-        finally:
-            transport.close()
-            evidence.finish('stop_unconfirmed' if stop_error else reason,
-                            error=stop_error)
-    if stop_error is not None:
-        raise stop_error
+    def telemetry(self, kind, **fields):
+        self.tracker.telemetry(kind, **fields)
 
 
 def import_gdk_runtime():
@@ -239,8 +258,8 @@ def _validate_cli(args, loaded):
         raise ValueError('Learner accepts train mode only and cannot request motion or HID')
     if args.role == 'actor' and (loaded.mode != 'train' or args.checkpoint is not None):
         raise ValueError('Actor requires train mode without a checkpoint')
-    if args.role == 'eval' and (loaded.mode != 'eval' or args.checkpoint is None):
-        raise ValueError('Eval requires eval mode and one checkpoint')
+    if args.role == 'eval' and (loaded.mode != 'train' or args.checkpoint is None):
+        raise ValueError('Eval requires the checkpoint training profile and one checkpoint')
     if loaded.runtime.learner_host != '127.0.0.1':
         raise ValueError('Loopback learner address required')
     if args.role in ('actor', 'eval') and loaded.motion_permitted:
@@ -260,10 +279,12 @@ def _run_learner(args, loaded, evidence):
         snapshot = load_checkpoint(args.checkpoint, expected_run_id=args.run_id,
                                    expected_config_hash=loaded.config_hash)
         learner = snapshot.runtime
+        learner.checkpoint_path = evidence.output / 'checkpoint.pt'
         evidence.event('resumed', physical_episode_state=snapshot.physical_episode_state)
     else:
         learner = RealLearnerRuntime(config=loaded, run_id=args.run_id,
-                                     config_hash=loaded.config_hash)
+                                     config_hash=loaded.config_hash,
+                                     checkpoint_path=evidence.output / 'checkpoint.pt')
     service = GrpcLearnerService(learner)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     rpc.add_LearnerServiceServicer_to_server(service, server)
@@ -273,7 +294,8 @@ def _run_learner(args, loaded, evidence):
     try:
         service.publish(learner.publish_parameters())
         evidence.event('ready', address=f'127.0.0.1:{loaded.runtime.learner_port}',
-                       policy_version=learner.version)
+                       policy_version=learner.version,
+                       checkpoint_path=str(learner.checkpoint_path))
         while not learner.stopped.wait(.2):
             pass
         return 0
@@ -323,17 +345,27 @@ def _run_actor_or_eval(args, loaded, evidence):
             config=loaded, run_id=args.run_id, config_hash=loaded.config_hash,
             coordinator=coordinator, context_source=context, transport=transport,
             env_factory=partial(create_motion_env, cli_allow_motion=args.allow_motion),
-            policy=policy)
+            policy=policy,
+            telemetry=transport.telemetry)
         evidence.event('ready', policy_version=runtime.parameter_version)
         try:
             summary = runtime.run()
         except BaseException as error:
             # RealActorRuntime stops the command path, then closes env and transport.
+            tracker = transport.tracker if args.role == 'actor' else transport
+            tracker.finalize_unfinished('stop_unconfirmed' if runtime.stop_confirmed is False
+                                        else 'actor_failure')
             evidence.event('actor_stopped', reason=runtime.stop_reason or 'actor_failure',
+                           stop_confirmed=runtime.stop_confirmed is True,
+                           freshness_rejects=runtime.freshness_rejects,
                            error=bounded_error(error))
+            if runtime.stop_confirmed is False:
+                error.stop_unconfirmed = True
             raise
         else:
-            evidence.event('actor_stopped', **asdict(summary))
+            evidence.event('actor_stopped', **asdict(summary),
+                           stop_confirmed=runtime.stop_confirmed is True,
+                           freshness_rejects=runtime.freshness_rejects)
             if args.role == 'eval':
                 evidence.event('eval_summary', **transport.summary())
             return 0
@@ -357,8 +389,8 @@ def main(argv=None):
             raise ValueError('Learner requires train mode')
         if args.role == 'actor' and loaded.mode != 'train':
             raise ValueError('Actor requires train mode')
-        if args.role == 'eval' and loaded.mode != 'eval':
-            raise ValueError('Eval requires eval mode')
+        if args.role == 'eval' and loaded.mode != 'train':
+            raise ValueError('Eval requires the checkpoint training profile')
         manifest = loaded.write_manifest(args.output, run_id=args.run_id, role=args.role)
         evidence = RunEvidenceWriter(args.output, manifest, role=args.role)
         if args.role in ('actor', 'eval') and not loaded.motion_permitted:
@@ -373,11 +405,15 @@ def main(argv=None):
             result = run_role(args, loaded, evidence)
             evidence.finish('completed')
             return result
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as error:
+            if getattr(error, 'stop_unconfirmed', False):
+                evidence.finish('stop_unconfirmed', error=error)
+                return 1
             evidence.finish('operator_interrupt')
             return 130
         except BaseException as error:
-            evidence.finish('failed', error=error)
+            evidence.finish('stop_unconfirmed' if getattr(error, 'stop_unconfirmed', False)
+                            else 'failed', error=error)
             return 1
     except (ValueError, PermissionError, OSError) as error:
         print(bounded_error(error), file=sys.stderr)

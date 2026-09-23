@@ -201,6 +201,63 @@ def test_actor_uploads_driver_confirmed_action_with_identity():
     assert rig.coordinator.intervention.polls >= 1
 
 
+def test_actor_emits_real_step_timing_outside_transition_payload():
+    rig = actor_rig()
+    events = []
+    rig.runtime.telemetry = lambda kind, **fields: events.append((kind, fields))
+    rig.runtime.run(max_completed_steps=2)
+    steps = [fields for kind, fields in events if kind == 'step']
+    assert len(steps) == 2
+    assert steps[0]['inference_latency_s'] >= 0
+    assert steps[1]['control_period_s'] > 0
+    assert 'inference_latency_s' not in rig.transport.sent[0]['complementary_info']
+
+
+def test_actor_reports_freshness_reject_and_unconfirmed_stop():
+    rig = actor_rig()
+    events = []
+    rig.runtime.telemetry = lambda kind, **fields: events.append((kind, fields))
+    def reject():
+        raise RuntimeError('Source observation freshness not confirmed: camera_stale')
+    rig.env.refresh_observation = reject
+    def failed_stop():
+        events.append(('command_stop', {}))
+        raise RuntimeError('physical stop unconfirmed')
+    rig.env.backend.stop = failed_stop
+    original_close = rig.env.close
+    def close_env():
+        events.append(('env_close', {}))
+        original_close()
+    rig.env.close = close_env
+    original_transport_close = rig.transport.close
+    def close_transport():
+        events.append(('transport_close', {}))
+        original_transport_close()
+    rig.transport.close = close_transport
+    with pytest.raises(RuntimeError, match='freshness not confirmed'):
+        rig.runtime.run(max_completed_steps=1)
+    assert any(kind == 'freshness_reject' and fields['code'] == 'camera_stale'
+               for kind, fields in events)
+    assert rig.runtime.freshness_rejects == 1
+    assert rig.runtime.stop_confirmed is False
+    assert rig.transport.closed
+    kinds = [kind for kind, _ in events]
+    assert kinds.index('command_stop') < kinds.index('env_close') < kinds.index('transport_close')
+
+
+def test_actor_counts_feedback_lease_reject():
+    rig = actor_rig()
+    events = []
+    rig.runtime.telemetry = lambda kind, **fields: events.append((kind, fields))
+    def reject(action):
+        raise RuntimeError('Feedback freshness not explicitly confirmed')
+    rig.env.step = reject
+    with pytest.raises(RuntimeError, match='Feedback freshness'):
+        rig.runtime.run(max_completed_steps=1)
+    assert rig.runtime.freshness_rejects == 1
+    assert ('freshness_reject', {'episode_id': 'episode-1', 'code': 'feedback_lease'}) in events
+
+
 def test_actor_rejects_rolled_back_parameters_before_loading():
     rig = actor_rig(versions=((3, 8), (2, 9)))
     rig.runtime.accept_latest_parameters()
@@ -336,6 +393,8 @@ def test_environment_factory_failure_still_closes_transport():
 
 def test_time_limit_seal_allows_fresh_next_episode():
     rig = actor_rig()
+    timings = []
+    rig.runtime.telemetry = lambda kind, **fields: timings.append(fields) if kind == 'step' else None
     rig.env.truncate_first = True
     contexts = iter((EpisodeContext('episode-1', (0., 0., 0.), 'visual', 'grasp',
                                     visual_reset_monotonic_ns=1),
@@ -349,6 +408,7 @@ def test_time_limit_seal_allows_fresh_next_episode():
     assert len(rig.envs) == 2
     assert rig.envs[0] is not rig.envs[1]
     assert all(env.closed and env.reset_calls == 1 for env in rig.envs)
+    assert [row['control_period_s'] for row in timings] == [None, None]
 
 
 def test_factory_starts_after_chord_and_refresh_precedes_each_inference():

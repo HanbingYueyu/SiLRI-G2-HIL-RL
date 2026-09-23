@@ -315,7 +315,7 @@ class GrpcActorTransport:
 class RealActorRuntime:
     def __init__(self, *, config, run_id, config_hash, coordinator,
                  context_source, transport, env_factory, policy=None,
-                 clock=time.monotonic):
+                 clock=time.monotonic, telemetry=None):
         self.config = config
         self.run_id = _identity_part(run_id, 'run_id')
         self.config_hash = _identity_part(config_hash, 'config_hash')
@@ -325,6 +325,7 @@ class RealActorRuntime:
         self.env_factory = env_factory
         self.policy = (policy or create_policy(config.runtime.device)).eval()
         self.clock = clock
+        self.telemetry = telemetry
         self.stop_event = threading.Event()
         self._env = None
         self.current_observation = None
@@ -335,7 +336,14 @@ class RealActorRuntime:
         self.episodes_completed = 0
         self.interventions = 0
         self.stop_reason = ''
+        self.stop_confirmed = None
+        self.stop_error = None
+        self.freshness_rejects = 0
         self._step_active = False
+
+    def _emit(self, kind, **fields):
+        if self.telemetry is not None:
+            self.telemetry(kind, **fields)
 
     def accept_latest_parameters(self):
         if self._step_active:
@@ -429,8 +437,19 @@ class RealActorRuntime:
             return
         self.stop_reason = reason
         self.stop_event.set()
-        if self._env is not None:
-            self._env.backend.stop()
+        try:
+            if self._env is not None:
+                self._env.backend.stop()
+        except BaseException as error:
+            self.stop_confirmed = False
+            self.stop_error = error
+            self._emit('stop', reason=reason, confirmed=False,
+                       error=f'{type(error).__name__}: {error}'[:512])
+            raise
+        else:
+            if self.stop_confirmed is not False:
+                self.stop_confirmed = True
+            self._emit('stop', reason=reason, confirmed=self.stop_confirmed)
 
     def run(self, *, max_completed_steps=None):
         if max_completed_steps is not None and (type(max_completed_steps) is not int or
@@ -438,6 +457,7 @@ class RealActorRuntime:
             raise ValueError('Positive completed-step bound required')
         env = None
         completed = 0
+        previous_step_at = None
         try:
             while not self.stop_event.is_set():
                 self.transport.assert_alive()
@@ -469,7 +489,12 @@ class RealActorRuntime:
                 before = env.refresh_observation()
                 self.current_observation = before
                 context = self.coordinator.context
+                inference_started = self.clock()
                 policy_action = self._infer(before)
+                inference_latency_s = self.clock() - inference_started
+                control_period_s = (None if previous_step_at is None else
+                                    inference_started - previous_step_at)
+                previous_step_at = inference_started
                 token = self.coordinator.begin_step()
                 self._step_active = True
                 try:
@@ -488,6 +513,9 @@ class RealActorRuntime:
                 row = self._build_confirmed_transition(
                     before, after, reward, terminated, truncated, info,
                     token, context, policy_action)
+                self._emit('step', episode_id=token.episode_id, step_id=token.step_id,
+                           inference_latency_s=inference_latency_s,
+                           control_period_s=control_period_s)
                 self.transport.send_transition_batch((row,))
                 self.transitions_sent += 1
                 self.interventions += int(row['complementary_info']['is_intervention'])
@@ -495,6 +523,7 @@ class RealActorRuntime:
                 self.current_observation = after
                 if terminated or truncated:
                     self.episodes_completed += 1
+                    previous_step_at = None
                     if truncated and self.coordinator.running:
                         self.coordinator.seal_episode(token)
                     completed_env = env
@@ -505,8 +534,26 @@ class RealActorRuntime:
                 if max_completed_steps is not None and completed >= max_completed_steps:
                     return self.summary()
             return self.summary()
-        except BaseException:
-            self.stop('actor_failure')
+        except BaseException as error:
+            message = str(error)
+            if (message.startswith('Source observation freshness not confirmed') or
+                    message.startswith('Feedback freshness not explicitly confirmed')):
+                self.freshness_rejects += 1
+                code = ('feedback_lease' if message.startswith('Feedback freshness') else
+                        message.partition(': ')[2] or 'unknown')
+                context = self.coordinator.context
+                self._emit('freshness_reject',
+                           episode_id=context.episode_id if context is not None else None,
+                           code=code[:128])
+            if message.startswith('physical stop unconfirmed'):
+                self.stop_confirmed = False
+                self.stop_error = error
+            try:
+                self.stop('actor_failure')
+            except BaseException:
+                logging.exception('Actor command stop unconfirmed')
+            if self.stop_confirmed is False:
+                error.stop_unconfirmed = True
             raise
         finally:
             try:
