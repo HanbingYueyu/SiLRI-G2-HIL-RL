@@ -37,7 +37,7 @@ def receive_parameters(stream, output, stop):
 
 
 def train_batch(policy, optimizers, data, names):
-    data['is_intervention'] = data['complementary_info']['is_intervention']
+    data = dict(data, is_intervention=data['complementary_info']['is_intervention'])
     metrics = {}
     for name in names:
         if name in ('expert', 'actor_bc') and not data['is_intervention'].any():
