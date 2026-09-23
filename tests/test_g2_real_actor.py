@@ -85,8 +85,13 @@ class FakeCoordinator:
         self.active_token = token
         return token
 
+    @property
+    def active_step_token(self):
+        return getattr(self, 'active_token', None)
+
     def abort_step(self, token):
         self.running = False
+        self.active_token = None
 
     def seal_episode(self, token):
         assert token.step_id == self.step_id - 1
@@ -100,7 +105,10 @@ class FakeEnv:
         self.completes_outcome = completes_outcome
         self.truncate_first = False
         self.step_calls = 0
+        self.refresh_calls = 0
+        self.reset_calls = 0
         self.during_step = None
+        self.close_error = None
         self.backend = SimpleNamespace(stop_calls=0)
         self.closed = False
 
@@ -109,8 +117,16 @@ class FakeEnv:
         self.backend.stop = stop
 
     def reset(self, *, options):
+        assert self.coordinator.running
+        self.reset_calls += 1
         assert isinstance(options['context'], EpisodeContext)
         return observation(), {}
+
+    def refresh_observation(self):
+        self.refresh_calls += 1
+        obs = observation()
+        obs['state'][0] = self.refresh_calls / 100.
+        return obs
 
     def step(self, action):
         self.step_calls += 1
@@ -118,6 +134,7 @@ class FakeEnv:
             self.during_step()
         if self.completes_outcome:
             self.coordinator.completed_step_token = self.coordinator.active_token
+            self.coordinator.active_token = None
         return observation(), 0., False, self.truncate_first and self.step_calls == 1, {
             'policy_action': tuple(action), 'human_action': (0., .25, 0., 0., 0., 0.),
             'selected_action': (0., .25, 0., 0., 0., 0.),
@@ -128,6 +145,8 @@ class FakeEnv:
 
     def close(self):
         self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class FakeIntervention:
@@ -143,12 +162,18 @@ class FakeIntervention:
 def actor_rig(*, versions=((3, 8),), blocked=False, capacity=1):
     policy, coordinator = FakePolicy(), FakeCoordinator()
     env = FakeEnv(coordinator)
+    envs = []
     messages = [ParameterEnvelope('run-1', 'hash-1', version, sequence,
                                   {'weight': torch.tensor([float(version)])})
                 for version, sequence in versions]
     transport = FakeTransport(messages, blocked)
     context = EpisodeContext('episode-1', (0., 0., 0.), 'visual', 'grasp',
                              visual_reset_monotonic_ns=1)
+    def env_factory(config, coordinator):
+        assert coordinator.running
+        new_env = env if not envs else FakeEnv(coordinator)
+        envs.append(new_env)
+        return new_env
     runtime = RealActorRuntime(
         config=SimpleNamespace(runtime=SimpleNamespace(queue_capacity=capacity,
             queue_put_timeout_s=.01, learner_silence_timeout_s=10.,
@@ -156,9 +181,9 @@ def actor_rig(*, versions=((3, 8),), blocked=False, capacity=1):
             observation=SimpleNamespace(image_size=128)),
         run_id='run-1', config_hash='hash-1',
         coordinator=coordinator, context_source=SimpleNamespace(read_new=lambda: context),
-        transport=transport, env_factory=lambda config, coordinator: env, policy=policy)
+        transport=transport, env_factory=env_factory, policy=policy)
     return SimpleNamespace(runtime=runtime, policy=policy, env=env,
-                           coordinator=coordinator, transport=transport)
+                           envs=envs, coordinator=coordinator, transport=transport)
 
 
 def test_actor_uploads_driver_confirmed_action_with_identity():
@@ -249,7 +274,7 @@ def test_timed_out_uplink_retries_identical_transition_ids():
             return grpc.StatusCode.DEADLINE_EXCEEDED
 
     class Stub:
-        def StreamParameters(self, request, timeout):
+        def StreamParameters(self, request):
             while not closed.wait(.01):
                 yield from ()
 
@@ -266,6 +291,25 @@ def test_timed_out_uplink_retries_identical_transition_ids():
         transport.send_transition_batch([{'complementary_info': {'transition_id':
                                                                   'run-1/episode-1/0'}}])
         assert ids == ['run-1/episode-1/0', 'run-1/episode-1/0']
+    finally:
+        transport.close()
+
+
+def test_parameter_stream_outlives_single_rpc_deadline():
+    closed = threading.Event()
+
+    class Stub:
+        def StreamParameters(self, request):
+            while not closed.wait(.005):
+                yield from ()
+
+    transport = GrpcActorTransport('127.0.0.1:9999', queue_capacity=1,
+                                   timeout_s=.02, stub=Stub(),
+                                   channel=SimpleNamespace(close=closed.set))
+    try:
+        closed.wait(.06)
+        transport.assert_alive()
+        assert transport.receive_latest_parameters() is None
     finally:
         transport.close()
 
@@ -302,6 +346,29 @@ def test_time_limit_seal_allows_fresh_next_episode():
     assert summary.episodes_completed == 1
     assert [row['complementary_info']['transition_id'] for row in rig.transport.sent] == [
         'run-1/episode-1/0', 'run-1/episode-2/0']
+    assert len(rig.envs) == 2
+    assert rig.envs[0] is not rig.envs[1]
+    assert all(env.closed and env.reset_calls == 1 for env in rig.envs)
+
+
+def test_factory_starts_after_chord_and_refresh_precedes_each_inference():
+    rig = actor_rig()
+    rig.runtime.run(max_completed_steps=2)
+    assert len(rig.envs) == 1
+    assert rig.env.reset_calls == 1
+    assert rig.env.refresh_calls == 2
+    assert [float(row['state']['observation.state'][0, 0])
+            for row in rig.transport.sent] == pytest.approx([.01, .02])
+
+
+def test_episode_close_failure_stops_before_next_factory():
+    rig = actor_rig()
+    rig.env.truncate_first = True
+    rig.env.close_error = OSError('close failed')
+    with pytest.raises(OSError, match='close failed'):
+        rig.runtime.run(max_completed_steps=2)
+    assert len(rig.envs) == 1
+    assert rig.runtime.stop_event.is_set()
 
 
 def test_parameters_cannot_load_during_in_flight_step():
@@ -328,3 +395,14 @@ def test_actor_waits_for_new_context_file_and_does_not_reuse_old_one(tmp_path):
         'visual_reset_monotonic_ns': 1}), encoding='utf-8')
     assert rig.runtime._read_context().episode_id == 'episode-1'
     assert rig.runtime._read_context() is None
+
+
+def test_step_error_preserves_original_after_coordinator_aborts_itself():
+    rig = actor_rig()
+    def fail_during_step():
+        rig.coordinator.abort_step(rig.coordinator.active_step_token)
+        raise ValueError('driver read failed')
+    rig.env.during_step = fail_during_step
+    with pytest.raises(ValueError, match='driver read failed'):
+        rig.runtime.run(max_completed_steps=1)
+    assert rig.env.backend.stop_calls >= 1

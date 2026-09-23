@@ -5,6 +5,7 @@ GDK resources itself; tests inject a fake environment and transport.
 """
 
 from dataclasses import asdict, dataclass
+import logging
 import math
 import os
 from queue import Empty, Full, Queue
@@ -224,7 +225,7 @@ class GrpcActorTransport:
         from lerobot.transport.utils import bytes_to_state_dict
         data = bytearray()
         try:
-            for chunk in self.stub.StreamParameters(pb.Empty(), timeout=self.timeout_s):
+            for chunk in self.stub.StreamParameters(pb.Empty()):
                 if self.stopped.is_set():
                     return
                 if chunk.transfer_state == pb.TransferState.TRANSFER_BEGIN:
@@ -438,8 +439,6 @@ class RealActorRuntime:
         env = None
         completed = 0
         try:
-            env = self.env_factory(self.config, self.coordinator)
-            self._env = env
             while not self.stop_event.is_set():
                 self.transport.assert_alive()
                 self.accept_latest_parameters()  # boundary: never inside env.step
@@ -453,16 +452,22 @@ class RealActorRuntime:
                             if not isinstance(context, EpisodeContext):
                                 raise ValueError('EpisodeContext required')
                             self.coordinator.offer_context(context)
-                            self.current_observation, _ = env.reset(options={'context': context})
-                            _policy_observation(self.current_observation, 'cpu',
-                                                self.config.observation.image_size)
                     if self.coordinator.context is not None:
                         # The chord reader consumes a freshly polled HID frame.
                         self.coordinator.intervention()
-                        self.coordinator.observe_start_frame()
+                        if self.coordinator.observe_start_frame():
+                            context = self.coordinator.context
+                            env = self.env_factory(self.config, self.coordinator)
+                            self._env = env
+                            self.current_observation, _ = env.reset(options={'context': context})
+                            _policy_observation(self.current_observation, 'cpu',
+                                                self.config.observation.image_size)
                     time.sleep(self.config.runtime.operator_poll_interval_s)
                     continue
-                before = self.current_observation
+                if env is None:
+                    raise RuntimeError('Running episode has no commissioned environment')
+                before = env.refresh_observation()
+                self.current_observation = before
                 context = self.coordinator.context
                 policy_action = self._infer(before)
                 token = self.coordinator.begin_step()
@@ -470,7 +475,11 @@ class RealActorRuntime:
                 try:
                     after, reward, terminated, truncated, info = env.step(policy_action)
                 except BaseException:
-                    self.coordinator.abort_step(token)
+                    if self.coordinator.active_step_token == token:
+                        try:
+                            self.coordinator.abort_step(token)
+                        except BaseException:
+                            logging.exception('Coordinator abort failed after environment step error')
                     raise
                 finally:
                     self._step_active = False
@@ -488,6 +497,11 @@ class RealActorRuntime:
                     self.episodes_completed += 1
                     if truncated and self.coordinator.running:
                         self.coordinator.seal_episode(token)
+                    completed_env = env
+                    env = None
+                    self._env = None
+                    self.current_observation = None
+                    completed_env.close()
                 if max_completed_steps is not None and completed >= max_completed_steps:
                     return self.summary()
             return self.summary()

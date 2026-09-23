@@ -195,9 +195,11 @@ def test_malformed_successor_cannot_seal_pending_terminal():
 def test_time_limit_seal_requires_completed_step_token():
     machine = running_episode()
     token = machine.begin_step()
+    assert machine.active_step_token == token
     with pytest.raises(RuntimeError, match='active step'):
         machine.seal_episode(token)
     assert machine.outcome(valid_successor()).terminated is False
+    assert machine.active_step_token is None
     with pytest.raises(RuntimeError, match='Invalid completed step token'):
         machine.seal_episode(SimpleNamespace(episode_id=token.episode_id,
                                              step_id=token.step_id, nonce='wrong'))

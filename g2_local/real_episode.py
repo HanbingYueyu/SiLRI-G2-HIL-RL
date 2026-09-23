@@ -47,6 +47,10 @@ class RealEpisodeCoordinator:
     def completed_step_token(self):
         return self._completed_token
 
+    @property
+    def active_step_token(self):
+        return self._token
+
     def _validate_context(self, context):
         if not isinstance(context, EpisodeContext):
             raise TypeError('EpisodeContext required')

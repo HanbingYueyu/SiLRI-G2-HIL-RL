@@ -125,3 +125,51 @@ def test_guard_reason_reaches_gym_and_reset_does_not_reconstruct_backend():
     finally:
         env.close()
     assert reader.closed is True
+
+
+def test_refresh_observation_updates_policy_input_and_runner_predecessor():
+    class AdvancingBackend(SyntheticBackend):
+        def observe(self):
+            self.state[0] += .01
+            return super().observe()
+
+    backend = AdvancingBackend()
+    env = G2LocalEnv(backend)
+    try:
+        first, _ = env.reset()
+        fresh = env.refresh_observation()
+        assert fresh['state'][0] > first['state'][0]
+        assert env.runner.observation['state'][0] == fresh['state'][0]
+        env.step(np.zeros(6))
+        assert env.runner.observation['state'][0] >= fresh['state'][0]
+    finally:
+        env.close()
+
+
+def test_refresh_failure_stops_and_closes_backend():
+    class FailingBackend(SyntheticBackend):
+        def __init__(self):
+            super().__init__()
+            self.fail = False
+            self.stopped = False
+            self.closed = False
+
+        def observe(self):
+            if self.fail:
+                raise OSError('freshness read failed')
+            return super().observe()
+
+        def stop(self):
+            self.stopped = True
+
+        def close(self):
+            self.closed = True
+
+    backend = FailingBackend()
+    env = G2LocalEnv(backend)
+    env.reset()
+    backend.fail = True
+    with pytest.raises(OSError, match='freshness read failed'):
+        env.refresh_observation()
+    assert backend.stopped and backend.closed
+    assert env.runner.active is False

@@ -1,6 +1,7 @@
 """Gymnasium adapter for local insertion with explicit backend selection."""
 import uuid
 import logging
+from copy import deepcopy
 import cv2
 import gymnasium as gym
 import numpy as np
@@ -119,6 +120,22 @@ class G2LocalEnv(gym.Env):
                     succeed=succeed,
                     backend=getattr(self.backend, 'name', 'gdk'))
         return obs, row['reward'], row['done'], row['truncated'], info
+
+    def refresh_observation(self):
+        """Acquire a fresh predecessor through the backend's freshness guard."""
+        if not self.runner.active:
+            raise RuntimeError('Reset required before refreshing observation')
+        try:
+            raw = self.backend.observe()
+            policy_obs = self._observation(raw)
+            self.runner.observation = deepcopy(raw)
+            return policy_obs
+        except BaseException:
+            try:
+                self.close()
+            except Exception:
+                logging.exception('Backend close failed after observation refresh error')
+            raise
 
     def close(self):
         try:
