@@ -5,6 +5,7 @@ from concurrent import futures
 from dataclasses import asdict
 from functools import partial
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -82,7 +83,10 @@ class RunEvidenceWriter:
         row = {'role': self.role, 'status': status, 'monotonic_ns': time.monotonic_ns()}
         if error is not None:
             row['error'] = bounded_error(error) if isinstance(error, BaseException) else str(error)[:512]
-        self.event('finished', status=status)
+        try:
+            self.event('finished', status=status)
+        except Exception:
+            logging.exception('Final event append failed; writing run result independently')
         path = self.output / 'run_result.json'
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                      0o600)
@@ -304,6 +308,25 @@ def _run_learner(args, loaded, evidence):
         evidence.event('learner_stopped', **learner.snapshot_counts())
 
 
+def record_actor_failure(runtime, transport, evidence, role, error):
+    """Keep physical stop outcome authoritative if evidence append fails."""
+    if runtime.stop_confirmed is False:
+        error.stop_unconfirmed = True
+    tracker = transport.tracker if role == 'actor' else transport
+    try:
+        tracker.finalize_unfinished('stop_unconfirmed' if runtime.stop_confirmed is False
+                                    else 'actor_failure')
+    except BaseException:
+        logging.exception('Actor episode evidence write failed after shutdown')
+    try:
+        evidence.event('actor_stopped', reason=runtime.stop_reason or 'actor_failure',
+                       stop_confirmed=runtime.stop_confirmed is True,
+                       freshness_rejects=runtime.freshness_rejects,
+                       error=bounded_error(error))
+    except BaseException:
+        logging.exception('Actor stop evidence write failed after shutdown')
+
+
 def _run_actor_or_eval(args, loaded, evidence):
     from .operator_control import EpisodeContextInbox
     from .real_episode import RealEpisodeCoordinator
@@ -352,15 +375,7 @@ def _run_actor_or_eval(args, loaded, evidence):
             summary = runtime.run()
         except BaseException as error:
             # RealActorRuntime stops the command path, then closes env and transport.
-            tracker = transport.tracker if args.role == 'actor' else transport
-            tracker.finalize_unfinished('stop_unconfirmed' if runtime.stop_confirmed is False
-                                        else 'actor_failure')
-            evidence.event('actor_stopped', reason=runtime.stop_reason or 'actor_failure',
-                           stop_confirmed=runtime.stop_confirmed is True,
-                           freshness_rejects=runtime.freshness_rejects,
-                           error=bounded_error(error))
-            if runtime.stop_confirmed is False:
-                error.stop_unconfirmed = True
+            record_actor_failure(runtime, transport, evidence, args.role, error)
             raise
         else:
             evidence.event('actor_stopped', **asdict(summary),

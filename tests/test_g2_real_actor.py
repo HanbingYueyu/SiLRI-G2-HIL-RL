@@ -258,6 +258,29 @@ def test_actor_counts_feedback_lease_reject():
     assert ('freshness_reject', {'episode_id': 'episode-1', 'code': 'feedback_lease'}) in events
 
 
+def test_freshness_telemetry_failure_still_attempts_stop_and_keeps_unconfirmed_result():
+    rig = actor_rig()
+    events = []
+    def telemetry(kind, **fields):
+        if kind == 'freshness_reject':
+            raise OSError('evidence write failed')
+    rig.runtime.telemetry = telemetry
+    def reject():
+        raise RuntimeError('Source observation freshness not confirmed: camera_stale')
+    rig.env.refresh_observation = reject
+    def failed_stop():
+        events.append('command_stop')
+        raise RuntimeError('physical stop unconfirmed')
+    rig.env.backend.stop = failed_stop
+    rig.env.close_error = RuntimeError('physical stop unconfirmed in cleanup')
+    with pytest.raises(RuntimeError, match='Source observation freshness not confirmed') as result:
+        rig.runtime.run(max_completed_steps=1)
+    assert events == ['command_stop']
+    assert rig.runtime.stop_confirmed is False
+    assert result.value.stop_unconfirmed is True
+    assert rig.transport.closed
+
+
 def test_actor_rejects_rolled_back_parameters_before_loading():
     rig = actor_rig(versions=((3, 8), (2, 9)))
     rig.runtime.accept_latest_parameters()

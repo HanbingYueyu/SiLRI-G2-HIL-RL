@@ -458,6 +458,7 @@ class RealActorRuntime:
         env = None
         completed = 0
         previous_step_at = None
+        primary_error = None
         try:
             while not self.stop_event.is_set():
                 self.transport.assert_alive()
@@ -535,6 +536,7 @@ class RealActorRuntime:
                     return self.summary()
             return self.summary()
         except BaseException as error:
+            primary_error = error
             message = str(error)
             if (message.startswith('Source observation freshness not confirmed') or
                     message.startswith('Feedback freshness not explicitly confirmed')):
@@ -542,9 +544,12 @@ class RealActorRuntime:
                 code = ('feedback_lease' if message.startswith('Feedback freshness') else
                         message.partition(': ')[2] or 'unknown')
                 context = self.coordinator.context
-                self._emit('freshness_reject',
-                           episode_id=context.episode_id if context is not None else None,
-                           code=code[:128])
+                try:
+                    self._emit('freshness_reject',
+                               episode_id=context.episode_id if context is not None else None,
+                               code=code[:128])
+                except BaseException:
+                    logging.exception('Freshness evidence write failed; stopping Actor')
             if message.startswith('physical stop unconfirmed'):
                 self.stop_confirmed = False
                 self.stop_error = error
@@ -556,10 +561,28 @@ class RealActorRuntime:
                 error.stop_unconfirmed = True
             raise
         finally:
+            cleanup_error = None
             try:
                 if env is not None:
                     env.close()
+            except BaseException as error:
+                cleanup_error = error
+                self.stop_confirmed = False
+                self.stop_error = error
             finally:
                 close_transport = getattr(self.transport, 'close', None)
                 if callable(close_transport):
-                    close_transport()
+                    try:
+                        close_transport()
+                    except BaseException as error:
+                        if cleanup_error is None:
+                            cleanup_error = error
+                        else:
+                            logging.exception('Transport close failed after environment close error')
+            if cleanup_error is not None:
+                if primary_error is not None:
+                    primary_error.stop_unconfirmed = self.stop_confirmed is False
+                    logging.error('Actor cleanup failed after primary error: %s', cleanup_error)
+                else:
+                    cleanup_error.stop_unconfirmed = self.stop_confirmed is False
+                    raise cleanup_error

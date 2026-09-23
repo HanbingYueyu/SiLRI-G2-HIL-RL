@@ -186,6 +186,29 @@ def test_cli_records_actual_unconfirmed_actor_stop(tmp_path, monkeypatch):
     assert json.loads((tmp_path / 'run/run_result.json').read_text())['status'] == 'stop_unconfirmed'
 
 
+def test_actor_failure_evidence_error_keeps_unconfirmed_outcome():
+    error = RuntimeError('Source observation freshness not confirmed: camera_stale')
+    def failed_write(*args, **kwargs):
+        raise OSError('evidence write failed')
+    transport = SimpleNamespace(tracker=SimpleNamespace(finalize_unfinished=failed_write))
+    runtime = SimpleNamespace(stop_confirmed=False, stop_reason='actor_failure',
+                              freshness_rejects=1)
+    evidence = SimpleNamespace(event=failed_write)
+    real_train.record_actor_failure(runtime, transport, evidence, 'actor', error)
+    assert error.stop_unconfirmed is True
+
+
+def test_result_file_records_stop_outcome_when_event_append_fails(tmp_path):
+    output = tmp_path / 'run'
+    output.mkdir(mode=0o700)
+    evidence = real_train.RunEvidenceWriter(output, output / 'run_manifest.json', role='actor')
+    def fail_event(*args, **kwargs):
+        raise OSError('events file unavailable')
+    evidence.event = fail_event
+    evidence.finish('stop_unconfirmed', error=RuntimeError('freshness failed'))
+    assert json.loads((output / 'run_result.json').read_text())['status'] == 'stop_unconfirmed'
+
+
 def test_interrupt_with_unconfirmed_stop_is_a_failure(tmp_path, monkeypatch):
     class Loaded:
         mode = 'train'
