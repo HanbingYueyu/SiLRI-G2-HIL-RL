@@ -190,3 +190,36 @@ def test_malformed_successor_cannot_seal_pending_terminal():
             machine.outcome(malformed)
         assert machine.running
     assert machine.outcome(valid_successor()) == OutcomeDecision(10., True, 'human', True)
+
+
+def test_time_limit_seal_requires_completed_step_token():
+    machine = running_episode()
+    token = machine.begin_step()
+    with pytest.raises(RuntimeError, match='active step'):
+        machine.seal_episode(token)
+    assert machine.outcome(valid_successor()).terminated is False
+    with pytest.raises(RuntimeError, match='Invalid completed step token'):
+        machine.seal_episode(SimpleNamespace(episode_id=token.episode_id,
+                                             step_id=token.step_id, nonce='wrong'))
+    machine.seal_episode(token)
+    assert machine.state == 'WAITING_FOR_RESET'
+    assert machine.context is None
+    with pytest.raises(RuntimeError):
+        machine.seal_episode(token)
+
+
+def test_prior_episode_token_cannot_seal_new_episode():
+    machine = running_episode()
+    old = machine.begin_step()
+    machine.request_terminal('success')
+    machine.outcome(valid_successor())
+    machine.offer_context(context())
+    machine.intervention.last_frame = SimpleNamespace(buttons=(True, True),
+                                                       pressed=(0, 1), ready=True)
+    assert machine.observe_start_frame() is False
+    machine.intervention.last_frame = SimpleNamespace(buttons=(False, False),
+                                                       pressed=(), ready=True)
+    assert machine.observe_start_frame() is True
+    with pytest.raises(RuntimeError, match='Invalid completed step token'):
+        machine.seal_episode(old)
+    assert machine.running

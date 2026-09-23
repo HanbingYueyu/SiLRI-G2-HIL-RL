@@ -121,6 +121,7 @@ including any physical safety clipping, not measured displacement.
             'human_proposal': decision.human_proposal,
             'policy_action': decision.policy_proposal,
             'human_action': decision.human_proposal,
+            'selected_action': decision.selected_action,
             'executed_action': action,
             'reward_source': reward_source,
             'success_label': success_label,

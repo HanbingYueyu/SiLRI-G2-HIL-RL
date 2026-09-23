@@ -32,6 +32,7 @@ class RealEpisodeCoordinator:
         self.state = 'WAITING_FOR_RESET'
         self.context = None
         self._token = None
+        self._completed_token = None
         self._pending_terminal = None
         self._step_id = 0
         self.success_reward = task.success_reward
@@ -41,6 +42,10 @@ class RealEpisodeCoordinator:
     @property
     def running(self):
         return self.state == 'RUNNING'
+
+    @property
+    def completed_step_token(self):
+        return self._completed_token
 
     def _validate_context(self, context):
         if not isinstance(context, EpisodeContext):
@@ -65,6 +70,7 @@ class RealEpisodeCoordinator:
             raise RuntimeError('Episode is not waiting for reset')
         self._validate_context(context)
         self.context = context
+        self._completed_token = None
         self.chord.reset()
 
     def observe_start_frame(self):
@@ -98,6 +104,7 @@ class RealEpisodeCoordinator:
             self._abort()
             raise RuntimeError('Input fault during episode')
         self._token = StepToken(self.context.episode_id, self._step_id, uuid.uuid4().hex)
+        self._completed_token = None
         return self._token
 
     def request_terminal(self, label):
@@ -115,6 +122,7 @@ class RealEpisodeCoordinator:
             raise RuntimeError('Invalid or inactive step token')
 
     def _finish(self, decision):
+        self._completed_token = self._token
         self._token = None
         self._pending_terminal = None
         self._step_id += 1
@@ -123,6 +131,18 @@ class RealEpisodeCoordinator:
             self.context = None
             self.chord.reset()
         return decision
+
+    def seal_episode(self, token):
+        """Seal a Gym time-limit only after its valid successor completed."""
+        if self._token is not None:
+            raise RuntimeError('Cannot seal episode with active step')
+        if (not self.running or self._completed_token is None or
+                token != self._completed_token):
+            raise RuntimeError('Invalid completed step token')
+        self.state = 'WAITING_FOR_RESET'
+        self.context = None
+        self._completed_token = None
+        self.chord.reset()
 
     def _finish_step(self, token):
         self._validate_token(token)
@@ -169,6 +189,7 @@ class RealEpisodeCoordinator:
         self.state = 'ABORTED'
         self.context = None
         self._token = None
+        self._completed_token = None
         self._pending_terminal = None
         self.chord.reset()
 
