@@ -5,11 +5,14 @@ port, and its motion permission is only one input to later live safety gates.
 """
 
 from dataclasses import dataclass, fields, replace
+import ctypes
+import errno
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import secrets
 import stat
 from types import MappingProxyType
 from typing import Mapping, Sequence
@@ -102,10 +105,57 @@ def _reject_constant(value):
     raise ValueError(f'Nonfinite JSON number: {value}')
 
 
-def _open_owned_regular(path: Path):
-    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+class _SymlinkPathError(ValueError):
+    pass
+
+
+def _open_no_symlink(path: Path, flags: int, mode: int | None = None):
+    """Walk every directory through pinned descriptors without following links."""
+    path = Path(path)
+    parts = path.parts
+    if '..' in parts:
+        raise ValueError(f'Unsafe path: {path}')
+    anchor = '/' if path.is_absolute() else '.'
+    names = parts[1:] if path.is_absolute() else parts
+    if not names:
+        return os.open(anchor, flags | os.O_NOFOLLOW)
+    directory_fd = os.open(anchor, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
-        fd = os.open(path, flags)
+        for name in names[:-1]:
+            try:
+                next_fd = os.open(name, os.O_PATH | os.O_DIRECTORY |
+                                  os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd)
+            except OSError as exc:
+                try:
+                    metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except OSError:
+                    metadata = None
+                if metadata is not None and stat.S_ISLNK(metadata.st_mode):
+                    raise _SymlinkPathError(f'Symlinked path component: {path}') from exc
+                raise
+            os.close(directory_fd)
+            directory_fd = next_fd
+        name = names[-1]
+        try:
+            if mode is None:
+                return os.open(name, flags | os.O_NOFOLLOW, dir_fd=directory_fd)
+            return os.open(name, flags | os.O_NOFOLLOW, mode, dir_fd=directory_fd)
+        except OSError as exc:
+            try:
+                metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError:
+                metadata = None
+            if metadata is not None and stat.S_ISLNK(metadata.st_mode):
+                raise _SymlinkPathError(f'Symlinked path component: {path}') from exc
+            raise
+    finally:
+        os.close(directory_fd)
+
+
+def _open_owned_regular(path: Path):
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    try:
+        fd = _open_no_symlink(path, flags)
     except OSError as exc:
         raise ValueError(f'Cannot open owned regular file: {path}') from exc
     metadata = os.fstat(fd)
@@ -116,7 +166,7 @@ def _open_owned_regular(path: Path):
 
 
 def read_owned_regular_json(path: Path, *, max_bytes: int = 131072):
-    """Read a bounded JSON file without following its final symlink."""
+    """Read a bounded JSON file without following any symlink component."""
     fd, metadata = _open_owned_regular(Path(path))
     try:
         if metadata.st_size > max_bytes:
@@ -139,6 +189,21 @@ def canonical_json(payload) -> bytes:
     """Canonical UTF-8 JSON bytes used for both identity and manifests."""
     return json.dumps(payload, ensure_ascii=False, sort_keys=True,
                       separators=(',', ':'), allow_nan=False).encode('utf-8')
+
+
+def _rename_noreplace(directory_fd: int, source: str, target: str):
+    """Atomically publish a new directory without replacing any existing name."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = libc.renameat2
+    renameat2.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                          ctypes.c_char_p, ctypes.c_uint)
+    renameat2.restype = ctypes.c_int
+    if renameat2(directory_fd, os.fsencode(source), directory_fd,
+                 os.fsencode(target), 1) != 0:  # RENAME_NOREPLACE on Linux
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), target)
+        raise OSError(error, os.strerror(error), target)
 
 
 def _freeze(value):
@@ -242,9 +307,9 @@ class CommissioningConfig:
             kinds.add(item.kind)
             try:
                 fd, _ = _open_owned_regular(item.path)
-            except ValueError as exc:
-                if item.path.is_symlink():
-                    raise ValueError(f'Symlinked commissioning evidence: {item.path}') from exc
+            except _SymlinkPathError:
+                raise
+            except ValueError:
                 valid = False
                 continue
             digest = hashlib.sha256()
@@ -276,26 +341,47 @@ class LoadedTrainingConfig:
         _string(run_id, 'run_id')
         _string(role, 'role')
         output = Path(output)
-        output.mkdir(mode=0o700)
-        os.chmod(output, 0o700)
-        manifest = output / 'run_manifest.json'
+        if output.name in ('', '.', '..'):
+            raise ValueError('A new manifest output directory is required')
         data = {'schema': self.schema, 'run_id': run_id, 'role': role,
                 'config_sha256': self.config_hash,
                 'config': _thaw(self.canonical_payload)}
         encoded = canonical_json(data) + b'\n'
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
-        fd = os.open(manifest, flags, 0o600)
-        with os.fdopen(fd, 'wb') as stream:
-            stream.write(encoded)
-            stream.flush()
-            os.fchmod(stream.fileno(), 0o400)
-            os.fsync(stream.fileno())
-        directory_fd = os.open(output, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        parent_fd = _open_no_symlink(output.parent,
+                                     os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        stage_name = f'.{output.name}.manifest-{secrets.token_hex(16)}'
+        stage_fd = None
+        published = False
         try:
-            os.fsync(directory_fd)
+            os.mkdir(stage_name, 0o700, dir_fd=parent_fd)
+            stage_fd = os.open(stage_name, os.O_RDONLY | os.O_DIRECTORY |
+                               os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+            os.fchmod(stage_fd, 0o700)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+            fd = os.open('run_manifest.json', flags, 0o600, dir_fd=stage_fd)
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fchmod(stream.fileno(), 0o400)
+                os.fsync(stream.fileno())
+            os.fsync(stage_fd)
+            _rename_noreplace(parent_fd, stage_name, output.name)
+            published = True
+            os.fsync(parent_fd)
+            return output / 'run_manifest.json'
         finally:
-            os.close(directory_fd)
-        return manifest
+            if stage_fd is not None:
+                if not published:
+                    try:
+                        os.unlink('run_manifest.json', dir_fd=stage_fd)
+                    except FileNotFoundError:
+                        pass
+                    try:
+                        os.rmdir(stage_name, dir_fd=parent_fd)
+                    except (FileNotFoundError, OSError):
+                        pass
+                os.close(stage_fd)
+            os.close(parent_fd)
 
 
 SCHEMA_ONE_KEYS = frozenset({

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 from copy import deepcopy
 from pathlib import Path
 
@@ -202,6 +203,59 @@ def test_symlinked_evidence_is_rejected(tmp_path):
                                                'sha256': hashlib.sha256(b'freshness').hexdigest()}]
     with pytest.raises(ValueError):
         load_training_config(write_config(tmp_path, payload), cli_allow_motion=False)
+
+
+def test_symlinked_parent_of_config_is_rejected(tmp_path):
+    actual = tmp_path / 'actual'
+    actual.mkdir()
+    config = write_config(actual)
+    alias = tmp_path / 'alias'
+    alias.symlink_to(actual, target_is_directory=True)
+    with pytest.raises(ValueError):
+        load_training_config(alias / config.name, cli_allow_motion=False)
+
+
+def test_symlinked_parent_of_evidence_is_rejected(tmp_path):
+    actual = tmp_path / 'actual'
+    actual.mkdir()
+    evidence = actual / 'approval.txt'
+    evidence.write_text('freshness')
+    alias = tmp_path / 'alias'
+    alias.symlink_to(actual, target_is_directory=True)
+    payload = valid_payload()
+    payload['commissioning']['evidence'] = [{
+        'kind': 'freshness_approval', 'path': str(alias / evidence.name),
+        'sha256': hashlib.sha256(b'freshness').hexdigest(),
+    }]
+    with pytest.raises(ValueError):
+        load_training_config(write_config(tmp_path, payload), cli_allow_motion=False)
+
+
+def test_manifest_directory_swap_cannot_write_into_existing_directory(tmp_path, monkeypatch):
+    loaded = load_training_config(write_config(tmp_path), cli_allow_motion=False)
+    output = tmp_path / 'run'
+    moved = tmp_path / 'moved-new-run'
+    rival = tmp_path / 'existing-run'
+    rival.mkdir()
+    (rival / 'sentinel').write_text('existing')
+    original_open = os.open
+    swapped = False
+
+    def swap_before_manifest_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and Path(path).name == 'run_manifest.json' and flags & os.O_EXCL:
+            if output.exists():
+                output.rename(moved)
+            rival.rename(output)
+            swapped = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'open', swap_before_manifest_open)
+    with pytest.raises(FileExistsError):
+        loaded.write_manifest(output, run_id='run-1', role='learner')
+    assert swapped
+    assert (output / 'sentinel').read_text() == 'existing'
+    assert not (output / 'run_manifest.json').exists()
 
 
 def test_loaded_payload_cannot_be_mutated_and_hash_is_canonical(tmp_path):
