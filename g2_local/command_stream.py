@@ -33,6 +33,9 @@ class CommandStream:
         self.in_flight = None
         self.last_send = None
         self.writer = self.watchdog = None
+        bind_cancel_event = getattr(port, 'bind_cancel_event', None)
+        if callable(bind_cancel_event):
+            bind_cancel_event(self.halt)
 
     def check(self):
         with self.condition:

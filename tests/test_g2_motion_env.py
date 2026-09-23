@@ -1,5 +1,6 @@
 """Commissioned motion assembly with isolated clock, reader, and port fakes."""
 from types import SimpleNamespace as NS
+import threading
 import time
 
 import numpy as np
@@ -8,6 +9,9 @@ import pytest
 from g2_local.config import LocalTaskConfig
 from g2_local.contract import EpisodeContext
 from g2_local.freshness import FreshnessLimits
+from g2_local.command_stream import CommandStream
+from g2_local.gdk_backend import GdkCommandPort
+from g2_local.motion_backend import PoseTarget
 from g2_local.motion_env import FreshnessLeaseGuard, MotionFactories, create_motion_env
 
 
@@ -257,3 +261,67 @@ def test_camera_roi_crops_before_resize_and_rejects_out_of_frame(monkeypatch):
     assert env.backend.stopped
     env.close()
     assert state.reader.closed and state.clock.closed
+
+
+def test_watchdog_halt_cancels_send_waiting_inside_freshness_preflight():
+    entered, release = threading.Event(), threading.Event()
+    sends = []
+
+    class Controller:
+        def checked_arm_state(self):
+            return None
+
+        def motion_status_summary(self):
+            return {'control_mode': 1, 'error_code': 0}
+
+        def _send_left_cartesian_pose(self, target, life_time_s):
+            sends.append((target, life_time_s))
+
+        def read_end_effector_pose(self, name):
+            return PoseTarget((.3, .3, .8), (0., 0., 0., 1.))
+
+    def blocked_freshness():
+        entered.set()
+        assert release.wait(1.)
+        return True
+
+    port = GdkCommandPort(Controller(), expected_mode=1, allow_motion=True,
+                          freshness_guard=blocked_freshness, life_time_s=.1)
+    stream = CommandStream(port, command_timeout=.3, send_timeout=.05,
+                           stop_timeout=.3)
+    stream.submit(PoseTarget((.3, .3, .8), (0., 0., 0., 1.)))
+    try:
+        assert entered.wait(.5)
+        assert stream.halt.wait(.5)
+        assert sends == []
+    finally:
+        release.set()
+    stop_error = None
+    try:
+        stream.stop()
+    except RuntimeError as error:
+        stop_error = error
+    assert sends == []
+    assert stop_error is not None and 'physical stop unconfirmed' in str(stop_error)
+
+
+def test_failed_sdk_send_cannot_make_stop_appear_confirmed():
+    class FailingController:
+        def checked_arm_state(self):
+            return None
+
+        def motion_status_summary(self):
+            return {'control_mode': 1, 'error_code': 0}
+
+        def _send_left_cartesian_pose(self, target, life_time_s):
+            raise OSError('SDK send failed')
+
+    port = GdkCommandPort(FailingController(), expected_mode=1, allow_motion=True,
+                          freshness_guard=lambda: True, life_time_s=.1)
+    stream = CommandStream(port, command_timeout=.3, send_timeout=.1)
+    sequence = stream.submit(PoseTarget((.3, .3, .8), (0., 0., 0., 1.)))
+    with pytest.raises(RuntimeError, match='SDK send failed'):
+        stream.wait_sent(sequence, timeout=.3)
+    with pytest.raises(RuntimeError, match='physical stop unconfirmed'):
+        stream.stop()
+    assert stream.stop_fault is not None

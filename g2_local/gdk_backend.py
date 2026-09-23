@@ -107,7 +107,21 @@ class GdkCommandPort:
         self.life_time = life_time_s
         self.stopped = False
         self.attempted = False
+        self.stop_failure = None
+        self.cancel_event = None
         self.lock = threading.RLock()
+
+    def bind_cancel_event(self, cancel_event):
+        if not callable(getattr(cancel_event, 'is_set', None)):
+            raise ValueError('A command-stream cancellation event is required')
+        with self.lock:
+            if self.cancel_event is not None and self.cancel_event is not cancel_event:
+                raise RuntimeError('Command port is already owned by another stream')
+            self.cancel_event = cancel_event
+
+    def _check_cancelled(self):
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise RuntimeError('Command stream halted before SDK target send')
 
     def _check(self):
         self.controller.checked_arm_state()
@@ -117,11 +131,13 @@ class GdkCommandPort:
         if self.guard() is not True:
             raise RuntimeError('Feedback freshness not explicitly confirmed')
 
-    def _write(self, target):
+    def _write(self, target, *, target_send=False):
         vector(target.position_m, 3)
         q = vector(target.orientation_xyzw, 4)
         if abs(np.linalg.norm(q) - 1.) > .01:
             raise ValueError('Target quaternion must be unit length')
+        if target_send:
+            self._check_cancelled()
         self.controller._send_left_cartesian_pose(target, self.life_time)
 
     def send(self, target):
@@ -132,23 +148,31 @@ class GdkCommandPort:
                 raise RuntimeError('Command port stopped; explicit reconstruction required')
             try:
                 self._check()
+                self._check_cancelled()
                 self.attempted = True
-                self._write(target)
-            except Exception:
+                self._write(target, target_send=True)
+            except Exception as error:
                 self.stopped = True
+                self.stop_failure = error
                 raise
 
     def stop(self):
         with self.lock:
             if self.stopped:
+                if self.stop_failure is not None:
+                    raise RuntimeError('physical stop unconfirmed after failed send') from self.stop_failure
                 return
             self.stopped = True
             if not self.enabled or not self.attempted:
                 return
-            self._check()
-            measured = self.controller.read_end_effector_pose('arm_l_end_link')
-            self._check()
-            self._write(measured)
+            try:
+                self._check()
+                measured = self.controller.read_end_effector_pose('arm_l_end_link')
+                self._check()
+                self._write(measured)
+            except Exception as error:
+                self.stop_failure = error
+                raise RuntimeError('physical stop unconfirmed: measured hold failed') from error
 
 
 class GdkReader:
