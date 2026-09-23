@@ -53,6 +53,7 @@ class HingeInsertTaskConfig:
     fix_gripper: bool = True
     action_scale: tuple[float, ...] = (.0015, .0015, .0015, .026, .026, .026)
     success_reward: float = 10.
+    failure_reward: float = -1.
     step_reward: float = -.05
     reward_source: str = 'human'
     target_xy_range_m: float = 0.
@@ -69,7 +70,7 @@ class HingeInsertTaskConfig:
         object.__setattr__(self, 'action_scale', vector(self.action_scale, 6))
         if any(value <= 0 for value in self.action_scale):
             raise ValueError('Hinge action scales must be positive')
-        for name in ('success_reward', 'step_reward', 'target_xy_range_m',
+        for name in ('success_reward', 'failure_reward', 'step_reward', 'target_xy_range_m',
                      'ee_xyz_range_m', 'ee_rpy_range_rad'):
             value = getattr(self, name)
             if type(value) not in (int, float) or not math.isfinite(value):
