@@ -154,6 +154,62 @@ class HumanInput:
             raise
 
 
+class AutomaticIntervention:
+    """Motion-triggered Gym intervention with a fresh-neutral release hold.
+
+    The caller owns the reader lifecycle. A fault ends this source's episode;
+    recovery requires a new source and reader.
+    """
+    def __init__(self, reader, config, *, clock=time.monotonic):
+        self.reader = reader
+        self.config = config
+        self.clock = clock
+        self.gate = LiveInputGate(axis_map=config.axis_map,
+                                  left_button=config.left_button,
+                                  max_age=config.report_max_age_s,
+                                  deadzone=config.release_deadzone)
+        self.active = False
+        self.neutral_since = None
+        self.last_frame = None
+        self.fault = None
+
+    def _raw_neutral(self, frame):
+        return all(abs(v) <= self.config.release_deadzone for v in frame.axes[:3])
+
+    def __call__(self):
+        if self.fault is not None:
+            raise RuntimeError('Input fault latched; replace source before recovery')
+        try:
+            frame = self.reader.poll()
+            now = self.clock()
+            proposal = self.gate.update(frame, now=now)
+            self.last_frame = frame
+            stamps = tuple(frame.axis_times)
+            if (frame.ready is not True or len(stamps) != 2 or
+                    any(t is None or not math.isfinite(t) or t < 0 or t > now
+                        for t in stamps)):
+                raise ValueError('SpaceMouse report unavailable or malformed')
+            if not self.gate.fresh and not self._raw_neutral(frame):
+                raise RuntimeError('stale nonzero SpaceMouse input')
+            moving = max(map(abs, proposal.action)) > self.config.engage_deadzone
+            if moving:
+                self.active, self.neutral_since = True, None
+            elif self.active and self.gate.fresh and self._raw_neutral(frame):
+                self.neutral_since = now if self.neutral_since is None else self.neutral_since
+                if now - self.neutral_since >= self.config.release_hold_s:
+                    self.active, self.neutral_since = False, None
+            elif self.active:
+                self.neutral_since = None
+            return (True, proposal.action) if self.active else (False, None)
+        except Exception as exc:
+            self.fault = str(exc)
+            self.active = False
+            self.neutral_since = None
+            self.last_frame = None
+            self.gate.invalidate()
+            raise
+
+
 class RotationCheck:
     """Event-driven read-only check, not a calibration of physical robot motion.
 

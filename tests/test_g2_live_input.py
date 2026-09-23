@@ -49,7 +49,9 @@ def test_reader_error_emits_blocked_record_and_propagates():
 def test_observed_neutral_survives_idle_but_stale_motion_does_not():
     gate = spacemouse.LiveInputGate(axis_map=(1,2,3), left_button=0)
     assert not gate.update(frame(), now=1.).blocked
+    assert gate.fresh
     assert not gate.update(frame(), now=20.).blocked
+    assert not gate.fresh  # A zero proposal from silence is not fresh release evidence.
     assert gate.update(frame(axes=(.55,0,0,0,0,0), stamps=(20.,20.)), now=20.).action[0] == pytest.approx(.5)
     assert gate.update(frame(axes=(.55,0,0,0,0,0), stamps=(20.,20.)), now=21.).blocked
 
