@@ -32,7 +32,7 @@ HID、Y/F 和 RGB provenance 四项。Task 8A 进一步以有界 FIFO ingress qu
 `close()` 等待恢复完成，生产入口在关闭后检查保存/worker 错误并仍执行 gRPC 清理和终态证据记录。
 针对 ACK 锁竞争、溢出排空/恢复和关闭等待/失败传播的定点测试分别为 `6 passed`、`4 passed`、
 `2 passed`（后续轮次有部分重叠）；两轮独立窄复核均关闭对应 Important，无新 Critical/Important。
-未执行全仓测试或任何硬件操作。Task 8 软件路径审查完成，代码仍在功能 worktree、尚未提交；
+未执行全仓测试或任何硬件操作。Task 8 软件路径审查完成，最终 Task 8A 提交 `ec907b6` 已 fast-forward 到 `main`；
 本结果不表示真实 GDK/SpaceMouse/PTP/硬件急停已验收，`motion_authorized=false`，真机训练仍禁止。
 隔离 worktree 的 `lerobot/` 为空，定向命令使用主仓库现有的 `../../lerobot/src` 和
 `../../.venv/bin/python`。本结果仅证明软件闭环与这些故障分支，不证明真实 GDK、
