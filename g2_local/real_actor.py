@@ -129,10 +129,11 @@ def validate_transition_provenance(row, run_id, config_hash):
         raise ValueError('Invalid real transition identity')
     if type(info['actor_version']) is not int or info['actor_version'] < 0:
         raise ValueError('Invalid Actor version')
-    if (type(info['is_intervention']) is not bool or
-            type(info['gate_summary']) is not dict or
-            set(info['gate_summary']) != {'fresh'} or
-            info['gate_summary']['fresh'] is not True):
+    gate = info['gate_summary']
+    fresh = type(gate) is dict and gate == {'fresh': True} and gate['fresh'] is True
+    idle = (type(gate) is dict and set(gate) == {'fresh', 'verified_neutral'} and
+            gate['fresh'] is False and gate['verified_neutral'] is True)
+    if type(info['is_intervention']) is not bool or not (fresh or idle):
         raise ValueError('Invalid intervention or freshness gate summary')
     EpisodeContext(info['episode_id'], info['target_offset_m'],
                    info['approach_source'], info['grasp_description'],
@@ -147,9 +148,14 @@ def validate_transition_provenance(row, run_id, config_hash):
         raise ValueError('Invalid reward provenance')
     executed = vector(info['executed_action'], 6)
     selected = vector(info['selected_action'], 6)
-    vector(info['policy_action'], 6)
-    if info['human_action'] is not None:
-        vector(info['human_action'], 6)
+    policy = vector(info['policy_action'], 6)
+    human = None if info['human_action'] is None else vector(info['human_action'], 6)
+    if idle and info['is_intervention'] and (human != (0.,) * 6 or selected != (0.,) * 6):
+        raise ValueError('Silent neutral cannot authorize nonzero human action')
+    if (info['is_intervention'] != (human is not None) or
+            selected != tuple(max(-1., min(1., value)) for value in
+                              (human if info['is_intervention'] else policy))):
+        raise ValueError('Inconsistent action provenance')
     if any(abs(x) > 1 for x in executed + selected):
         raise ValueError('Action outside normalized contract')
     action = row['action']
@@ -321,7 +327,7 @@ class GrpcActorTransport:
 class RealActorRuntime:
     def __init__(self, *, config, run_id, config_hash, coordinator,
                  context_source, transport, env_factory, policy=None,
-                 clock=time.monotonic, telemetry=None):
+                 clock=time.monotonic, telemetry=None, demonstration=False):
         self.config = config
         self.run_id = _identity_part(run_id, 'run_id')
         self.config_hash = _identity_part(config_hash, 'config_hash')
@@ -329,13 +335,16 @@ class RealActorRuntime:
         self.context_source = context_source
         self.transport = transport
         self.env_factory = env_factory
-        self.policy = (policy or create_policy(config.runtime.device)).eval()
+        self.demonstration = demonstration
+        if demonstration and policy is not None:
+            raise ValueError('Demonstration must not load a policy')
+        self.policy = None if demonstration else (policy or create_policy(config.runtime.device)).eval()
         self.clock = clock
         self.telemetry = telemetry
         self.stop_event = threading.Event()
         self._env = None
         self.current_observation = None
-        self.parameter_version = -1
+        self.parameter_version = 0 if demonstration else -1
         self.last_message_sequence = -1
         self.last_parameter_at = self.clock()
         self.transitions_sent = 0
@@ -352,6 +361,8 @@ class RealActorRuntime:
             self.telemetry(kind, **fields)
 
     def accept_latest_parameters(self):
+        if self.demonstration:
+            return False
         if self._step_active:
             raise RuntimeError('Cannot load parameters during in-flight step')
         envelope = self.transport.receive_latest_parameters()
@@ -381,6 +392,8 @@ class RealActorRuntime:
         return changed
 
     def _infer(self, observation):
+        if self.demonstration:
+            return (0.,) * 6
         state = _policy_observation(observation, self.config.runtime.device,
                                     self.config.observation.image_size)
         with torch.no_grad():
@@ -400,6 +413,8 @@ class RealActorRuntime:
 
     def _build_confirmed_transition(self, before, after, reward, terminated,
                                     truncated, info, token, context, policy_action):
+        if self.demonstration and info.get('is_intervention') is not True:
+            raise ValueError('Demonstration requires human control on every step')
         if type(info) is not dict or 'executed_action' not in info:
             raise ValueError('Driver-confirmed executed action required')
         executed = vector(info['executed_action'], 6)
@@ -424,7 +439,10 @@ class RealActorRuntime:
                         is_intervention=bool(info['is_intervention']),
                         reward_source=info['reward_source'],
                         success_label=info['success_label'],
-                        gate_summary={'fresh': self.coordinator.intervention.gate.fresh})
+                        gate_summary=({'fresh': True}
+                                      if self.coordinator.intervention.gate.fresh else
+                                      {'fresh': False, 'verified_neutral':
+                                       getattr(self.coordinator.intervention, 'verified_neutral', False)}))
         row = {'state': _policy_observation(before, 'cpu', self.config.observation.image_size),
                'next_state': _policy_observation(after, 'cpu', self.config.observation.image_size),
                'action': torch.tensor(executed, dtype=torch.float32),

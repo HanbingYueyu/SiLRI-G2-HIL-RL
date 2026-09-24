@@ -201,6 +201,67 @@ def test_post_mapping_transient_spike_expires_without_clean_recovery():
     assert expired.valid_until_ns == first.valid_until_ns
 
 
+def test_rolling_fit_tracks_slow_curvature_without_losing_live_mapping():
+    from g2_local.live_clock import ClockWindow
+
+    window = ClockWindow(MASTER, 'boot', 'curved-offset')
+    window.feed_ptp(
+        f'ptp4l[1.000]: selected best master clock {MASTER}',
+        1_010_000_000,
+        wall(1_010_000_000),
+    )
+    window.feed_properties(properties(), 1_100_000_000)
+
+    # This smooth, modest-rate curvature produces a just-over-1 ms residual
+    # once a 64-report (about 126 s) fit spans the whole trace. A 16-report
+    # window tracks it while keeping the same strict residual limit.
+    for second in range(2, 130, 2):
+        mono_ns = second * 1_000_000_000
+        offset_ns = 55_000_000_000 + 400 * (second - 2) ** 2
+        window.feed_ptp(
+            offset_line(second, offset_ns),
+            mono_ns + 10_000_000,
+            wall(mono_ns + 10_000_000),
+        )
+        snapshot = window.snapshot(
+            mono_ns + 100_000_000,
+            wall(mono_ns + 100_000_000),
+        )
+        if second >= 16:
+            assert snapshot.healthy, f'{second}s: {snapshot.reason}'
+            assert snapshot.last_sample_mono_ns == mono_ns
+
+
+def test_startup_high_path_delay_discards_sample_then_recovers_cleanly():
+    from g2_local.live_clock import ClockWindow
+
+    window = ClockWindow(MASTER, 'boot', 'startup-delay')
+    window.feed_ptp(
+        f'ptp4l[1.000]: selected best master clock {MASTER}',
+        1_010_000_000,
+        wall(1_010_000_000),
+    )
+    window.feed_properties(properties(), 1_100_000_000)
+
+    # PTP can report an excessive path delay while the selected master is
+    # still settling. It must not seed a mapping or permanently poison the
+    # session; only later in-range reports may establish a live lease.
+    window.feed_ptp(offset_line(2, 55_000_000_000, 1_266_651),
+                    2_010_000_000, wall(2_010_000_000))
+    warming = window.snapshot(2_100_000_000, wall(2_100_000_000))
+    assert warming.healthy is False
+    assert warming.reason == 'warming_up'
+
+    for index, second in enumerate(range(4, 20, 2)):
+        mono_ns = second * 1_000_000_000
+        window.feed_ptp(offset_line(second, 55_000_000_000 + index * 20_000),
+                        mono_ns + 10_000_000, wall(mono_ns + 10_000_000))
+    recovered = window.snapshot(18_100_000_000, wall(18_100_000_000))
+    assert recovered.healthy is True
+    assert recovered.reason == 'ok'
+    assert recovered.last_sample_mono_ns == 18_000_000_000
+
+
 def test_repeated_transient_spikes_restart_warmup_without_gap_latch():
     window = healthy_window()
     window.feed_ptp(offset_line(18, 55_002_160_000),

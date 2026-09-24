@@ -39,13 +39,14 @@ HID、Y/F 和 RGB provenance 四项。Task 8A 进一步以有界 FIFO ingress qu
 SpaceMouse、PTP、硬件急停、物理停止距离或插入效果。`motion_authorized=false`，
 真实 GDK 继续 `allow_motion=False`；配置中的请求或测试的假许可不构成现场授权。
 
-连续真机训练仍须依序完成：(1) 三轮合格的真实 Actor/freshness 会话并人工批准六项阈值；
+六项 freshness 阈值已按三轮只读审计的逐轮 P99 批准，审批文件记录超限观测并要求实时门控 fail-closed；该批准本身不授权运动。
+连续真机训练仍须依序完成：
 (2) 空夹爪 XYZ/RPY 方向、尺度及工作空间 commissioning；(3) 软件停止、租约到期和
 硬件急停的时间/距离证据；(4) 一轮低速 reset、双键 chord、Y/F 与人工接管交接；
 (5) 小批量 checkpoint/resume 与固定 checkpoint eval。上述现场门槛完成前不执行
 真实运动或真机训练。
 
-## 真实 Actor 只读审计工具（2026-09-21，尚待三轮现场验收）
+## 真实 Actor 只读审计工具（2026-09-21；2026-09-24 三轮现场采集完成）
 
 已增加可信本机 checkpoint 的 Actor-only 加载和 RTX 3090 同步计时；检查完整
 配置、权重与 SHA-256，双腕 RGB 全帧转入 CUDA 后缩至 128×128，推理动作仅
@@ -58,18 +59,20 @@ version 3、RTX 3090、三次预热、有限 `(1, 6)` 丢弃动作和非零同�
 该测试没有实例化 GDK 或启动 PTP，不能证明真实双相机/GDK 下的年龄分布。
 checkpoint SHA-256 为 `aa9bb8ad3b271745855d06d231db349b91f79a7750fbf59889353e1f7cf16f19`。
 
-正式批准仍须 **3 个独立会话 × 至少 120 秒实际样本跨度**，每轮至少 1000
-接受样本、零拒绝、同一 checkpoint/配置/GPU、健康且正常结束的独立 monitor。
-建议每轮请求 125 秒正式采样（Actor 预热另外计算），监控上限 300 秒；
-正常让 B 完成后 A Ctrl+C，提前停止时 B→A Ctrl+C，该轮中断不能 qualify。
-每轮保留 audit JSONL/摘要、复制后的 monitor 原始证据和 `qualify` 生成的
-`qualification.json`；三轮重算通过后，另行人工审查六项显式阈值才能 `approve`。
+2026-09-24 已完成 `session-03/05/06` 三个独立会话，每轮正式采样约 125 秒，
+同一 RTX 3090/checkpoint，共 5,012 个 Actor 样本、零拒绝；原始证据、monitor 正常退出
+与进程清理资格均通过离线校验。修复了同一 PTP 样本的 `wall_minus_mono_ns` 本机读值抖动
+被误当成映射变化的问题。最差 P99：相机年龄 73.27 ms、状态年龄 37.75 ms、双相机偏差
+38.29 ms、映射误差 2.74 ms。按建议阈值回放有 2/5,012 帧应由实时 freshness 门控拒绝。
+具体分布、推荐阈值及批准 CLI 限制见工作区根目录 `项目进展_CN.md`。
 完整命令、全新证据路径、残留检查、收尾与批准模板见
 [真实 Actor 三轮只读流程](g2-clock-diagnostics.md#真实-actorcuda-只读审计三轮现场流程)。
 
-目前没有完成这三轮现场验收，没有批准阈值或运动；历史模拟等待数据不能补足。
-审计/qualification 的许可字段固定 false；未来单独批准文件也仍然
-`motion_authorized=false`，不修改生产配置、不解除其他现场门槛。
+三轮现场审计已完成，旧 `session-01/02` 与本轮分开。P99 门限为相机年龄 100 ms、
+状态年龄 50 ms、双相机偏差 50 ms、映射误差 5 ms、TF 5 mm/0.02 rad；审批文件
+`runtime/real_actor_audit_20260924/freshness-threshold-approval-p99.json` 记录了
+5,012 帧中 2 帧需由运行时门控拒绝。阈值批准不证明源时钟身份，亦不授权运动：
+`source_clock_identity_proven=false`、`motion_authorized=false`；真实 GDK 仍保持只读。
 
 ## 算法数据契约补齐（2026-09-22）
 

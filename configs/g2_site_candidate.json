@@ -3,12 +3,19 @@
   "mode": "train",
   "requested_motion": false,
   "task": {
-    "control_hz": 10.0,
+    "control_hz": 10,
     "max_episode_steps": 80,
     "fix_gripper": true,
-    "action_scale": [0.0015, 0.0015, 0.0015, 0.026, 0.026, 0.026],
-    "success_reward": 10.0,
-    "failure_reward": -1.0,
+    "action_scale": [
+      0.0015,
+      0.0015,
+      0.0015,
+      0.026,
+      0.026,
+      0.026
+    ],
+    "success_reward": 10,
+    "failure_reward": -1,
     "step_reward": -0.05,
     "reward_source": "human",
     "target_xy_range_m": 0.05,
@@ -16,15 +23,28 @@
     "ee_rpy_range_rad": 0.008726646259971648
   },
   "motion": {
-    "workspace_low": [0.20, 0.20, 0.70],
-    "workspace_high": [0.40, 0.50, 1.00],
+    "local_envelope": {
+      "translation_low_m": [-0.02, -0.035, -0.09],
+      "translation_high_m": [0.07, 0.02, 0.02],
+      "rotation_max_rad": 0.4363323129985824
+    },
+    "workspace_low": [
+      0.4765,
+      0.0901,
+      0.8289
+    ],
+    "workspace_high": [
+      0.6665,
+      0.2451,
+      0.9389
+    ],
     "control_mode": 1,
     "command_timeout_s": 0.25,
     "send_timeout_s": 0.05,
-    "stop_timeout_s": 1.0,
-    "reader_timeout_s": 2.0,
+    "stop_timeout_s": 1,
+    "reader_timeout_s": 2,
     "command_lifetime_s": 0.1,
-    "send_rate_hz": 50.0,
+    "send_rate_hz": 50,
     "adapter_root": "/home/flyfuture/g2_hinge_assembly"
   },
   "freshness": {
@@ -36,16 +56,36 @@
     "mapping_error_s": 0.005
   },
   "observation": {
-    "camera_keys": ["left_wrist", "right_aux"],
+    "camera_keys": [
+      "left_wrist",
+      "right_aux"
+    ],
     "image_size": 128,
     "camera_rois": {
-      "left_wrist": [0, 0, 1280, 1056],
-      "right_aux": [0, 0, 1280, 1056]
+      "left_wrist": [
+        340,
+        200,
+        940,
+        800
+      ],
+      "right_aux": [
+        310,
+        10,
+        910,
+        610
+      ]
     },
     "raw_rgb_logging": false
   },
   "intervention": {
-    "axis_map": [-2, -1, -3, -5, -4, -6],
+    "axis_map": [
+      -2,
+      -1,
+      -3,
+      -5,
+      -4,
+      -6
+    ],
     "left_button": 0,
     "right_button": 1,
     "engage_deadzone": 0.12,
@@ -54,8 +94,8 @@
     "report_max_age_s": 0.25
   },
   "optimization": {
-    "online_capacity": 100000,
-    "human_capacity": 50000,
+    "online_capacity": 2048,
+    "human_capacity": 1024,
     "min_online_transitions": 256,
     "online_batch_size": 128,
     "human_batch_size": 128,
@@ -74,11 +114,11 @@
     "learner_host": "127.0.0.1",
     "learner_port": 50175,
     "queue_capacity": 64,
-    "queue_put_timeout_s": 1.0,
-    "transport_timeout_s": 5.0,
-    "context_max_age_s": 30.0,
-    "parameter_heartbeat_s": 1.0,
-    "learner_silence_timeout_s": 5.0,
+    "queue_put_timeout_s": 1,
+    "transport_timeout_s": 5,
+    "context_max_age_s": 30,
+    "parameter_heartbeat_s": 1,
+    "learner_silence_timeout_s": 5,
     "operator_poll_interval_s": 0.01
   },
   "commissioning": {

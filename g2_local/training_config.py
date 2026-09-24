@@ -20,6 +20,7 @@ from typing import Mapping, Sequence
 from .config import HingeInsertTaskConfig, LocalTaskConfig
 from .contract import CAMERA_KEYS
 from .freshness import FreshnessLimits
+from .local_envelope import LocalEnvelope
 
 
 _REQUIRED_EVIDENCE = frozenset({
@@ -232,7 +233,7 @@ class ObservationConfig:
 
 @dataclass(frozen=True)
 class InterventionConfig:
-    axis_map: tuple[int, int, int]
+    axis_map: tuple[int, int, int, int, int, int]
     left_button: int
     right_button: int
     engage_deadzone: float
@@ -284,6 +285,7 @@ class MotionRuntimeConfig:
     command_lifetime_s: float
     send_rate_hz: float
     adapter_root: Path
+    local_envelope: LocalEnvelope | None = None
 
 
 @dataclass(frozen=True)
@@ -449,10 +451,22 @@ def parse_schema_one(payload) -> LoadedTrainingConfig:
                        reward_source=_string(raw['reward_source'], 'reward_source'))
     task = HingeInsertTaskConfig(**task_values)
 
-    raw = _keys(payload['motion'], (
+    motion_fields = (
         'workspace_low', 'workspace_high', 'control_mode', 'command_timeout_s',
         'send_timeout_s', 'stop_timeout_s', 'reader_timeout_s',
-        'command_lifetime_s', 'send_rate_hz', 'adapter_root'), 'motion')
+        'command_lifetime_s', 'send_rate_hz', 'adapter_root')
+    if type(payload['motion']) is dict and 'local_envelope' in payload['motion']:
+        motion_fields += ('local_envelope',)
+    raw = _keys(payload['motion'], motion_fields, 'motion')
+    local_envelope = None
+    if 'local_envelope' in raw:
+        local = _keys(raw['local_envelope'],
+                      ('translation_low_m', 'translation_high_m', 'rotation_max_rad'),
+                      'local_envelope')
+        local_envelope = LocalEnvelope(
+            _numbers(local['translation_low_m'], 3, 'translation_low_m'),
+            _numbers(local['translation_high_m'], 3, 'translation_high_m'),
+            _number(local['rotation_max_rad'], 'rotation_max_rad', positive=True))
     low = _numbers(raw['workspace_low'], 3, 'workspace_low')
     high = _numbers(raw['workspace_high'], 3, 'workspace_high')
     limits = task.motion_config(workspace_low=low, workspace_high=high)
@@ -465,7 +479,8 @@ def parse_schema_one(payload) -> LoadedTrainingConfig:
         reader_timeout_s=_number(raw['reader_timeout_s'], 'reader_timeout_s', positive=True),
         command_lifetime_s=_number(raw['command_lifetime_s'], 'command_lifetime_s', positive=True),
         send_rate_hz=_number(raw['send_rate_hz'], 'send_rate_hz', positive=True),
-        adapter_root=_path(raw['adapter_root'], 'adapter_root'))
+        adapter_root=_path(raw['adapter_root'], 'adapter_root'),
+        local_envelope=local_envelope)
     if (motion.send_timeout_s > motion.command_timeout_s or
             motion.command_lifetime_s > motion.command_timeout_s or
             1 / motion.send_rate_hz > motion.command_lifetime_s):
@@ -486,16 +501,20 @@ def parse_schema_one(payload) -> LoadedTrainingConfig:
         if roi[2] <= roi[0] or roi[3] <= roi[1]:
             raise ValueError(f'camera_rois.{key}: invalid bounds')
         parsed_rois[key] = roi
+    image_size = _integer(raw['image_size'], 'image_size', minimum=1)
+    if image_size != 128:
+        raise ValueError('image_size must be 128 for the current SiLRI policy/replay contract')
     observation = ObservationConfig(
         camera_keys=tuple(camera_keys),
-        image_size=_integer(raw['image_size'], 'image_size', minimum=1),
+        image_size=image_size,
         camera_rois=MappingProxyType(parsed_rois),
         raw_rgb_logging=_boolean(raw['raw_rgb_logging'], 'raw_rgb_logging'))
 
     raw = _keys(payload['intervention'], _fields(InterventionConfig), 'intervention')
-    axis_map = _integers(raw['axis_map'], 3, 'axis_map', minimum=-3)
-    if sorted(abs(axis) for axis in axis_map) != [1, 2, 3]:
-        raise ValueError('axis_map must be a signed permutation of 1, 2, 3')
+    axis_map = _integers(raw['axis_map'], 6, 'axis_map', minimum=-6)
+    if (sorted(abs(axis) for axis in axis_map[:3]) != [1, 2, 3] or
+            sorted(abs(axis) for axis in axis_map[3:]) != [4, 5, 6]):
+        raise ValueError('axis_map must explicitly map XYZ 1..3 and rotation 4..6')
     intervention = InterventionConfig(
         axis_map=axis_map,
         left_button=_integer(raw['left_button'], 'left_button'),

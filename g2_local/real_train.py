@@ -23,7 +23,7 @@ _RUN_ID = re.compile(r'[A-Za-z0-9_.-]{1,128}\Z', re.ASCII)
 
 def parser():
     cli = argparse.ArgumentParser(description=__doc__)
-    cli.add_argument('role', choices=('learner', 'actor', 'eval'))
+    cli.add_argument('role', choices=('learner', 'actor', 'eval', 'demo'))
     cli.add_argument('--run-id', required=True)
     cli.add_argument('--config', type=Path, required=True)
     cli.add_argument('--output', type=Path, required=True)
@@ -31,6 +31,8 @@ def parser():
     cli.add_argument('--checkpoint', type=Path)
     cli.add_argument('--context', type=Path)
     cli.add_argument('--hid-device', type=Path)
+    cli.add_argument('--demonstrations', type=Path, action='append', default=[],
+                     help='Learner only: import a complete local demonstration dataset; repeatable')
     return cli
 
 
@@ -191,6 +193,21 @@ class EvalTransitionSink:
         return None
 
 
+class DemonstrationSink(EvalTransitionSink):
+    """Persist full human trajectories locally without a Learner connection."""
+
+    def __init__(self, run_id, config, evidence):
+        from .demonstrations import DemonstrationWriter
+        super().__init__(run_id, config.config_hash, 0, {}, evidence)
+        self.writer = DemonstrationWriter(evidence.output / 'demonstrations',
+                                           config=config, run_id=run_id)
+
+    def send_transition_batch(self, rows):
+        for row in rows:
+            self.writer.append(row)
+            super().send_transition_batch((row,))
+
+
 class EvidenceActorTransport:
     """Record confirmed train transitions only after the learner accepts them."""
 
@@ -274,6 +291,8 @@ class _TerminalInput:
 
 
 def _validate_cli(args, loaded):
+    if getattr(args, 'demonstrations', ()) and args.role != 'learner':
+        raise ValueError('--demonstrations is only valid for learner')
     if args.role == 'learner' and (args.allow_motion or loaded.mode != 'train' or
                                    args.context or args.hid_device):
         raise ValueError('Learner accepts train mode only and cannot request motion or HID')
@@ -281,12 +300,14 @@ def _validate_cli(args, loaded):
         raise ValueError('Actor requires train mode without a checkpoint')
     if args.role == 'eval' and (loaded.mode != 'train' or args.checkpoint is None):
         raise ValueError('Eval requires the checkpoint training profile and one checkpoint')
+    if args.role == 'demo' and (loaded.mode != 'train' or args.checkpoint is not None):
+        raise ValueError('Demo requires train task profile without a policy checkpoint')
     if loaded.runtime.learner_host != '127.0.0.1':
         raise ValueError('Loopback learner address required')
-    if args.role in ('actor', 'eval') and loaded.motion_permitted:
+    if args.role in ('actor', 'eval', 'demo') and loaded.motion_permitted:
         if args.context is None or args.hid_device is None:
             raise ValueError('Actor/eval require explicit context and HID device paths')
-    if loaded.runtime.device == 'cuda':
+    if args.role != 'demo' and loaded.runtime.device == 'cuda':
         import torch
         if not torch.cuda.is_available():
             raise ValueError('CUDA required by configuration but unavailable')
@@ -300,12 +321,18 @@ def _run_learner(args, loaded, evidence):
         snapshot = load_checkpoint(args.checkpoint, expected_run_id=args.run_id,
                                    expected_config_hash=loaded.config_hash)
         learner = snapshot.runtime
+        learner.config = loaded  # Restore task/ROI contract for optional demo import.
         learner.checkpoint_path = evidence.output / 'checkpoint.pt'
         evidence.event('resumed', physical_episode_state=snapshot.physical_episode_state)
     else:
         learner = RealLearnerRuntime(config=loaded, run_id=args.run_id,
                                      config_hash=loaded.config_hash,
                                      checkpoint_path=evidence.output / 'checkpoint.pt')
+    if getattr(args, 'demonstrations', ()):
+        from .demonstrations import import_demonstrations
+        result = import_demonstrations(learner, args.demonstrations, evidence=evidence)
+        learner.save_checkpoint(learner.checkpoint_path)
+        evidence.event('demo_import_completed', **result)
     service = GrpcLearnerService(learner)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     rpc.add_LearnerServiceServicer_to_server(service, server)
@@ -357,7 +384,7 @@ def _run_actor_or_eval(args, loaded, evidence):
     from .operator_control import EpisodeContextInbox
     from .real_episode import RealEpisodeCoordinator
     from .real_actor import GrpcActorTransport, RealActorRuntime
-    from .spacemouse import AutomaticIntervention
+    from .spacemouse import AutomaticIntervention, DemonstrationIntervention
     from .motion_env import create_motion_env
     from .policy import create_policy
     frozen = None
@@ -369,14 +396,20 @@ def _run_actor_or_eval(args, loaded, evidence):
         sys.path.insert(0, adapter_root)
     hid_type = import_gdk_runtime()
     with _TerminalInput() as terminal, hid_type(str(args.hid_device)) as reader:
-        intervention = AutomaticIntervention(reader, loaded.intervention)
+        intervention_type = DemonstrationIntervention if args.role == 'demo' else AutomaticIntervention
+        intervention = intervention_type(reader, loaded.intervention)
         coordinator = RealEpisodeCoordinator(
             intervention, terminal, loaded.task,
             context_max_age_s=loaded.runtime.context_max_age_s,
             left_button=loaded.intervention.left_button,
             right_button=loaded.intervention.right_button)
         context = EpisodeContextInbox(args.context)
-        if args.role == 'eval':
+        if args.role == 'demo':
+            policy = None
+            transport = DemonstrationSink(args.run_id, loaded, evidence)
+            evidence.event('demo_ready', policy_inference=False,
+                           dataset_path=str(transport.writer.path))
+        elif args.role == 'eval':
             policy = create_policy(loaded.runtime.device)
             policy.actor.load_state_dict(frozen.actor_state, strict=True)
             transport = EvalTransitionSink(args.run_id, loaded.config_hash,
@@ -395,7 +428,7 @@ def _run_actor_or_eval(args, loaded, evidence):
             coordinator=coordinator, context_source=context, transport=transport,
             env_factory=partial(create_motion_env, cli_allow_motion=args.allow_motion),
             policy=policy,
-            telemetry=transport.telemetry)
+            telemetry=transport.telemetry, demonstration=args.role == 'demo')
         evidence.event('ready', policy_version=runtime.parameter_version)
         try:
             summary = runtime.run()
@@ -407,8 +440,8 @@ def _run_actor_or_eval(args, loaded, evidence):
             evidence.event('actor_stopped', **asdict(summary),
                            stop_confirmed=runtime.stop_confirmed is True,
                            freshness_rejects=runtime.freshness_rejects)
-            if args.role == 'eval':
-                evidence.event('eval_summary', **transport.summary())
+            if args.role in ('eval', 'demo'):
+                evidence.event(f'{args.role}_summary', **transport.summary())
             return 0
 
 
@@ -434,7 +467,7 @@ def main(argv=None):
             raise ValueError('Eval requires the checkpoint training profile')
         manifest = loaded.write_manifest(args.output, run_id=args.run_id, role=args.role)
         evidence = RunEvidenceWriter(args.output, manifest, role=args.role)
-        if args.role in ('actor', 'eval') and not loaded.motion_permitted:
+        if args.role in ('actor', 'eval', 'demo') and not loaded.motion_permitted:
             evidence.finish('motion_not_permitted')
             return 2
         try:

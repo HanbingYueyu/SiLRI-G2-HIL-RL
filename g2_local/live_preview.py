@@ -26,7 +26,7 @@ def sample(reader, gate, emit):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--axis-map', required=True,
-                        help='Explicit signed raw axes for forward,left,up; not auto-calibrated')
+                        help='Explicit signed XYZ/RXYZ axes; three-axis XYZ shorthand appends -5,-4,-6; not auto-calibrated')
     parser.add_argument('--left-button', type=int, required=True, choices=(0, 1))
     parser.add_argument('--seconds', type=float, default=30.)
     parser.add_argument('--max-age', type=float, default=.25)

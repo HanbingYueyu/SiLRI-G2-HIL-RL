@@ -79,6 +79,55 @@ def test_replay_stores_executed_action_and_only_interventions_in_human_pool():
     assert torch.equal(learner.online_replay.actions[0], torch.zeros(6))
 
 
+@pytest.mark.parametrize('mutate', [
+    lambda info: info.update(human_action=None),
+    lambda info: info.update(selected_action=(1., 0., 0., 0., 0., 0.)),
+    lambda info: info.update(is_intervention=False),
+])
+def test_learner_rejects_inconsistent_human_action_provenance(mutate):
+    learner = _learner()
+    row = _row(human=True, executed=.4)
+    row['complementary_info']['human_action'] = (.4, 0., 0., 0., 0., 0.)
+    row['complementary_info']['selected_action'] = (.4, 0., 0., 0., 0., 0.)
+    mutate(row['complementary_info'])
+
+    with pytest.raises(ValueError, match='action provenance'):
+        learner.ingest([row])
+    assert learner.snapshot_counts()['online'] == 0
+    assert learner.snapshot_counts()['human'] == 0
+
+
+def test_learner_stores_human_executed_action_not_policy_proposal():
+    learner = _learner()
+    row = _row(human=True, executed=.4)
+    row['complementary_info']['human_action'] = (.4, 0., 0., 0., 0., 0.)
+    row['complementary_info']['selected_action'] = (.4, 0., 0., 0., 0., 0.)
+
+    assert learner.ingest([row]).accepted == 1
+    assert learner.human_replay.actions[0].tolist() == pytest.approx([.4, 0., 0., 0., 0., 0.])
+    assert learner.records[0]['complementary_info']['policy_action'][0] == 1.
+    assert learner.records[0]['complementary_info']['human_action'][0] == .4
+
+
+def test_verified_idle_provenance_accepts_policy_and_zero_human_hold_only():
+    learner = _learner()
+    policy = _row(0)
+    hold = _row(1, human=True)
+    for row in (policy, hold):
+        row['complementary_info']['gate_summary'] = {
+            'fresh': False, 'verified_neutral': True}
+    assert learner.ingest([policy, hold]).accepted == 2
+    bad = _row(2, human=True, executed=.4)
+    bad['complementary_info'].update(
+        human_action=(.4,0.,0.,0.,0.,0.), selected_action=(.4,0.,0.,0.,0.,0.),
+        gate_summary={'fresh': False, 'verified_neutral': True})
+    with pytest.raises(ValueError, match='Silent neutral'):
+        learner.ingest([bad])
+    bad['complementary_info']['gate_summary']['verified_neutral'] = False
+    with pytest.raises(ValueError, match='freshness gate'):
+        learner.ingest([bad])
+
+
 def test_resume_preserves_replay_position_and_requires_identity(tmp_path):
     learner = _learner()
     learner.ingest([_row(human=True)])

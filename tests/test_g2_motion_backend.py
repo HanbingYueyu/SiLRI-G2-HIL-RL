@@ -76,6 +76,45 @@ def test_default_denies_motion():
         driver.close()
 
 
+def test_episode_local_envelope_rejects_target_before_send():
+    from g2_local.local_envelope import LocalEnvelope
+    reader = Reader()
+    reader.state[0] = .5
+    port = Port(reader)
+    driver = backend(reader, port, allow_motion=True,
+                     local_envelope=LocalEnvelope((-.005,)*3, (.005,)*3, .1))
+    env = G2LocalEnv(driver)
+    try:
+        env.reset(options={'context': EpisodeContext('local',(0,0,0),'fixture','fixture')})
+        assert driver.episode_reference[0] == .5
+        with pytest.raises(ValueError, match='translation envelope'):
+            env.step(np.array([1,0,0,0,0,0]))
+        assert port.sent == []
+        assert driver.stopped
+    finally:
+        env.close()
+
+
+def test_episode_local_envelope_rejects_missing_reference_and_measured_escape():
+    from g2_local.local_envelope import LocalEnvelope
+    for missing in (True, False):
+        reader = Reader()
+        reader.state[0] = .5
+        port = Port(reader)
+        driver = backend(reader, port, allow_motion=True,
+                         local_envelope=LocalEnvelope((-.005,)*3, (.005,)*3, .1))
+        try:
+            if not missing:
+                driver.begin_episode(driver.observe())
+                reader.state[0] += .02
+            with pytest.raises((RuntimeError, ValueError)):
+                driver.execute((0,)*6)
+            assert port.sent == []
+            assert driver.stopped
+        finally:
+            driver.close()
+
+
 def test_gym_acknowledged_effective_action_and_terminal_stop():
     reader = Reader()
     port = Port(reader)

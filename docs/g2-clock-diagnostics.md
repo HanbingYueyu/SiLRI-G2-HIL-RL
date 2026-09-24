@@ -177,28 +177,15 @@ qualification 只证明已记录的收尾/文件绑定，不代表三轮完整�
 PYTHONPATH=lerobot/src .venv/bin/python -c 'from pathlib import Path; from g2_local.freshness_approval import validate_sessions; e = validate_sessions([Path("runtime/real_actor_audit_20260921") / f"session-{i:02d}" for i in (1, 2, 3)]); print(e.worst_case)'
 ```
 
-人工结合任务误差预算选择六项显式值后，才单独运行下列批准命令。四个环境变量
-必须填写已审查的秒数，无默认值、无自动建议；相机/状态年龄、相机时差、映射误差
-须严格大于三轮观测最坏上界。TF 上限固定 0.005 m 与 0.02 rad，观测也须满足。
-以下是后续操作模板，本次文档及合成 smoke **没有批准任何阈值或运动**：
-
-```bash
-PYTHONPATH=lerobot/src .venv/bin/python -m g2_local.freshness_approval approve \
-  --sessions runtime/real_actor_audit_20260921/session-01 \
-             runtime/real_actor_audit_20260921/session-02 \
-             runtime/real_actor_audit_20260921/session-03 \
-  --camera-age-s "${G2_CAMERA_AGE_S:?填写已审查秒数}" \
-  --state-age-s "${G2_STATE_AGE_S:?填写已审查秒数}" \
-  --camera-skew-s "${G2_CAMERA_SKEW_S:?填写已审查秒数}" \
-  --mapping-error-s "${G2_MAPPING_ERROR_S:?填写已审查秒数}" \
-  --tf-position-error-m 0.005 --tf-rotation-error-rad 0.02 \
-  --output runtime/real_actor_audit_20260921/approved-limits.json
-```
-
-批准文件只以独占方式新建，模式 0400，记录三轮来源、哈希、GPU、配置、最坏值与
-各项 margin。仅该文件可有 `thresholds_approved=true`，仍固定
-`motion_authorized=false` 和 `source_clock_identity_proven=false`，不改生产配置，
-不解除现场急停/停止距离、空间、尺度、模式等独立运动门槛。
+截至 2026-09-24，三轮新版本审计已完成，六项阈值按**逐轮 P99 + 超限 fail-closed**
+口径显式批准。批准器先验证三个完整会话，再记录 P99 参考值、实测最大值和逐项/合并
+超限帧数；P99 以上的实时观测由 freshness guard 拒绝 Gym step。阈值文件为
+`runtime/real_actor_audit_20260924/freshness-threshold-approval-p99.json`，值为相机
+100 ms、状态 50 ms、双相机偏差 50 ms、映射误差 5 ms、TF 0.005 m/0.02 rad。
+审批文件模式 0400，`thresholds_approved=true`，但仍固定
+`motion_authorized=false` 和 `source_clock_identity_proven=false`，不修改生产配置，
+不解除急停/停止距离、空间、尺度、模式等独立运动门槛。上面的 2026-09-21 示例
+目录和阈值模板已过期，不要与新 `session-03/05/06` 混用。
 
 ### 无 GDK 的真实 CUDA smoke
 
@@ -294,10 +281,10 @@ ps -eo pid,ppid,pgid,user,comm,args | rg 'ptp4l|phc2sys|clock_monitor|freshness_
 本轮已执行上述最大 120 秒监控 + 60 秒审计；审计完成后监控因映射异常提前退出，
 不能将本次结果表述为监控全程健康，详见下方现场记录。
 
-后续阈值批准是单独流程：在双相机、GDK 与真实 Actor 推理同时运行的只读条件下
-收集分布和异常证据，结合任务误差预算逐项审查并显式提供六个 FreshnessLimits。
-当前模拟等待统计不批准任何候选阈值；仍需独立完成硬件急停/停止距离、运动空间、
-尺度、模式及其他控制安全门槛，才能另行评估运动或训练许可。
+2026-09-24 后续现场审计使用双相机、GDK 与真实 RTX 3090 Actor 同时运行的只读条件；
+`session-03/05/06` 共 5,012 样本，按已批准 P99 门限回放需拒绝 2 帧（约 0.04%）。
+这不是运动验收。硬件急停/停止距离、运动空间、动作尺度、模式与其他控制安全门槛
+仍需独立完成，才可另行评估运动或训练许可。
 
 ### 2026-09-21 现场证据与结果
 

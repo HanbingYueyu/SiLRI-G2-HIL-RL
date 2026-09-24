@@ -4,7 +4,7 @@ from lerobot.policies.silri.configuration_silri import SiLRIConfig
 from lerobot.policies.silri.modeling_silri import SiLRIPolicy
 
 
-def make_policy(images=False):
+def make_policy(images=False, num_discrete_actions=None):
     features = {'observation.state': PolicyFeature(FeatureType.STATE, (7,))}
     if images:
         features.update({f'observation.images.{key}': PolicyFeature(FeatureType.VISUAL, (3, 128, 128))
@@ -13,7 +13,7 @@ def make_policy(images=False):
                       output_features={'action': PolicyFeature(FeatureType.ACTION, (6,))},
                       device='cpu', use_torch_compile=False, shared_encoder=False,
                       normalization_mapping={}, dataset_stats={}, freeze_vision_encoder=False,
-                      latent_dim=32)
+                      latent_dim=32, num_discrete_actions=num_discrete_actions)
     return SiLRIPolicy(cfg)
 
 
@@ -68,3 +68,19 @@ def test_dual_rgb_update():
         assert torch.isfinite(loss)
         loss.backward()
         optimizers[name].step()
+
+
+def test_empty_intervention_mask_has_zero_finite_discrete_actor_loss():
+    policy = make_policy(num_discrete_actions=2)
+    actions = torch.cat((torch.zeros(2, 6), torch.tensor([[0.0], [1.0]])), dim=1)
+    loss = policy.compute_loss_discrete_actor(
+        observations=batch()['state'],
+        old_actions=actions,
+        is_intervention=torch.zeros(2),
+    )['loss_actor']
+
+    assert torch.isfinite(loss)
+    assert loss.item() == 0.0
+    loss.backward()
+    assert all(parameter.grad is None or torch.isfinite(parameter.grad).all()
+               for parameter in policy.discrete_actor.parameters())

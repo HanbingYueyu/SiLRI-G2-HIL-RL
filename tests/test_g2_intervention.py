@@ -19,7 +19,7 @@ def frame(axes=(0,)*6, stamps=(1.,1.), buttons=(False,False), ready=True):
 
 
 def explicit_config():
-    return InterventionConfig(axis_map=(1,2,3), left_button=0, right_button=1,
+    return InterventionConfig(axis_map=(1,2,3,4,5,6), left_button=0, right_button=1,
                               engage_deadzone=.12, release_deadzone=.08,
                               release_hold_s=.25, report_max_age_s=.2)
 
@@ -56,7 +56,7 @@ def test_silent_neutral_never_releases_active_intervention():
         source()
 
 
-def test_stale_neutral_stops_before_policy_execution():
+def test_verified_idle_allows_policy_execution_without_faking_freshness():
     source, reader, now = automatic_source()
     class FakeCommandPort(SyntheticBackend):
         action_count = 0
@@ -67,10 +67,10 @@ def test_stale_neutral_stops_before_policy_execution():
     env = G2LocalEnv(port, intervention=source)
     env.reset()
     now[0] = 2.
-    with pytest.raises(RuntimeError, match='stale'):
-        env.step(np.ones(6))
-    assert port.action_count == 0
-    assert not env.runner.active
+    _, _, _, _, info = env.step(np.ones(6))
+    assert port.action_count == 1
+    assert not info['is_intervention']
+    assert source.verified_neutral and not source.gate.fresh
 
 
 def test_unplug_latches_fault_instead_of_policy_fallback():
@@ -101,20 +101,39 @@ def test_stale_input_inside_release_deadzone_aborts():
         source()
 
 
-def test_repeated_neutral_snapshot_cannot_accumulate_release_hold():
+def test_observed_zero_then_silence_releases_and_fresh_motion_reengages():
     source, reader, now = engaged_source()
     reader.frame = frame(stamps=(1.1,1.1)); now[0] = 1.1
     assert source()[0] is True
-    reader.frame = frame(stamps=(1.2,1.2)); now[0] = 1.2
+    now[0] = 1.2
     assert source()[0] is True
-    now[0] = 1.39  # Still age-fresh, but no new axis-channel packets.
-    assert source()[0] is True
-    reader.frame = frame(stamps=(1.39,1.2)); now[0] = 1.39
-    assert source()[0] is True
-    reader.frame = frame(stamps=(1.6,1.6)); now[0] = 1.6
-    assert source()[0] is True
-    reader.frame = frame(stamps=(1.9,1.9)); now[0] = 1.9
+    now[0] = 1.4
     assert source() == (False, None)
+    now[0] = 10.
+    assert source() == (False, None)
+    reader.frame = frame(axes=(.6,0,0,0,0,0), stamps=(10.,10.))
+    assert source()[0] is True
+    assert not source.verified_neutral
+
+
+def test_disconnect_after_verified_zero_aborts_before_policy():
+    source, reader, now = automatic_source()
+    def unplugged():
+        raise OSError('device unplugged')
+    reader.poll = unplugged
+    now[0] = 3.
+    with pytest.raises(OSError):
+        source()
+    assert not source.verified_neutral
+    with pytest.raises(RuntimeError, match='latched'):
+        source()
+
+
+def test_stale_zero_without_prior_observation_cannot_authorize_policy():
+    reader = Reader()
+    source = spacemouse.AutomaticIntervention(reader, explicit_config(), clock=lambda: 5.)
+    with pytest.raises(RuntimeError, match='stale neutral'):
+        source()
 
 
 def test_malformed_report_latches_and_invalidates_last_frame():
@@ -128,15 +147,15 @@ def test_malformed_report_latches_and_invalidates_last_frame():
         source()
 
 
-def test_left_button_selects_rotation_and_neutral_hold_resets_on_motion():
+def test_left_button_enables_six_dof_and_neutral_hold_resets_on_motion():
     source, reader, now = automatic_source()
     reader.frame = frame(stamps=(1.1,1.1), buttons=(True,False)); now[0] = 1.1
     assert source() == (False, None)
-    reader.frame = frame(axes=(.6,0,0,0,0,0), stamps=(1.2,1.2), buttons=(True,False)); now[0] = 1.2
-    assert source()[1] == pytest.approx((0,0,0,0,.5652173913,0))
+    reader.frame = frame(axes=(.6,0,0,.6,0,0), stamps=(1.2,1.2), buttons=(True,False)); now[0] = 1.2
+    assert source()[1] == pytest.approx((.5652173913,0,0,.5652173913,0,0))
     reader.frame = frame(stamps=(1.3,1.3), buttons=(True,False)); now[0] = 1.3
     assert source()[0] is True
-    reader.frame = frame(axes=(.6,0,0,0,0,0), stamps=(1.4,1.4), buttons=(True,False)); now[0] = 1.4
+    reader.frame = frame(axes=(0,0,0,.6,0,0), stamps=(1.4,1.4), buttons=(True,False)); now[0] = 1.4
     assert source()[0] is True
     reader.frame = frame(stamps=(1.5,1.5), buttons=(True,False)); now[0] = 1.5
     assert source()[0] is True
@@ -172,7 +191,7 @@ def test_explicit_takeover_and_executed_action_labels():
     _, _, _, _, info = env.step(np.ones(6))
     assert info['is_intervention']
     assert np.array_equal(info['executed_action'], np.zeros(6))
-    reader.frame.axes = (0,0,-.55,0,0,0)
+    reader.frame.axes = (0,0,0,0,0,-.55)
     _, _, _, _, info = env.step(np.ones(6))
     assert np.allclose(info['executed_action'], [0,0,0,0,0,.5])
 

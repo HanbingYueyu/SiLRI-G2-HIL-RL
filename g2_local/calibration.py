@@ -42,9 +42,9 @@ def main():
                             left_button=args.left_button)
     output = args.output or Path('runtime/calibration') / f'{uuid.uuid4().hex}.jsonl'
     output.parent.mkdir(parents=True, exist_ok=True)
-    positive, negative = {'roll': ('向左平推', '向右平推'),
-                          'pitch': ('向前平推', '向后平推'),
-                          'yaw': ('垂直上提', '垂直下压')}[args.axis]
+    positive, negative = {'roll': ('向绕 X 正方向倾斜', '向绕 X 反方向倾斜'),
+                          'pitch': ('向绕 Y 正方向倾斜', '向绕 Y 反方向倾斜'),
+                          'yaw': ('向绕 Z 正方向扭转', '向绕 Z 反方向扭转')}[args.axis]
     prompts = {'press': '按住左键，轻拨后回中，等待收到轴报告',
                'neutral': '保持左键，轻拨后松旋帽回中',
                'positive': f'保持左键，{positive}；若门控锁住，先轻拨回中再做',

@@ -28,7 +28,7 @@ class MotionBackend:
 
     def __init__(self, reader, port, *, config, observation_guard, outcome,
                  command_timeout, send_timeout, step_period, allow_motion=False,
-                 stop_timeout=1., send_rate_hz=50.):
+                 stop_timeout=1., send_rate_hz=50., local_envelope=None):
         config.validate_motion()
         if type(allow_motion) is not bool:
             raise ValueError('Explicit boolean motion permission required')
@@ -37,6 +37,8 @@ class MotionBackend:
         if not math.isfinite(step_period) or not 0 < step_period < command_timeout:
             raise ValueError('Step period must be positive and below command lease')
         self.reader, self.config = reader, config
+        self.local_envelope = local_envelope
+        self.episode_reference = None
         self.observation_guard, self.outcome = observation_guard, outcome
         self.enabled = allow_motion
         self.step_period = step_period
@@ -78,7 +80,25 @@ class MotionBackend:
                 message += f': {code}'
             raise RuntimeError(message)
         self.stream.check()  # Camera may have blocked past the target lease.
+        if self.local_envelope is not None and self.episode_reference is not None:
+            self.local_envelope.check(pose, self.episode_reference)
         return deepcopy(obs)
+
+    def begin_episode(self, observation):
+        """Latch the reset observation once; never move or re-anchor a live episode."""
+        if self.local_envelope is None:
+            return
+        try:
+            if self.episode_reference is not None or self.stopped or self.closed:
+                raise RuntimeError('Reconstruct backend before starting another episode')
+            pose = vector(observation['state'], 7)
+            # Zero-action planning also validates the fixed absolute workspace.
+            plan_target(pose, (0.,)*6, self.config)
+            self.local_envelope.check(pose, pose)
+            self.episode_reference = pose
+        except Exception:
+            self._abort()
+            raise
 
     def _abort(self):
         try:
@@ -99,8 +119,12 @@ class MotionBackend:
         if not self.execute_lock.acquire(blocking=False):
             raise RuntimeError('Concurrent execute is not supported')
         try:
+            if self.local_envelope is not None and self.episode_reference is None:
+                raise RuntimeError('Episode reference required before motion')
             before = self._read()
             pose, effective = plan_target(before['state'], action, self.config)
+            if self.local_envelope is not None:
+                self.local_envelope.check(pose, self.episode_reference)
             sequence = self.stream.submit(PoseTarget(pose[:3], pose[3:]))
             sent_at = self.stream.wait_sent(sequence, timeout=self.stream.command_timeout)
             self.stream.halt.wait(max(0., sent_at+self.step_period-time.monotonic()))

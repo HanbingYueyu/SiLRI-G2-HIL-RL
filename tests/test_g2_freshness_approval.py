@@ -79,6 +79,19 @@ def test_qualifies_real_recorder_and_recomputes_raw_upper_bounds(approval, sessi
     assert evidence.sessions[0]['observed_elapsed_s'] >= 120.
 
 
+def test_same_ptp_sample_allows_wall_monotonic_read_jitter(approval, sessions):
+    rows = [json.loads(line) for line in (sessions[0]/'evidence.jsonl').read_text().splitlines()]
+    first = next(row['snapshot'] for row in rows if row.get('event') == 'sample')
+    previous = approval._snapshot(first)
+    next_read = dict(first, sequence=first['sequence']+1,
+                     created_mono_ns=first['created_mono_ns']+1,
+                     wall_minus_mono_ns=first['wall_minus_mono_ns']+500)
+
+    current = approval._snapshot(next_read, previous)
+
+    assert current.wall_minus_mono_ns == previous.wall_minus_mono_ns+500
+
+
 @pytest.mark.parametrize('count', [0, 1, 2, 4])
 def test_requires_exactly_three(approval, sessions, count):
     with pytest.raises(ValueError, match='three independent'):
@@ -179,6 +192,47 @@ def test_approval_is_exclusive_readonly_and_never_authorizes_motion(approval, se
     with pytest.raises(FileExistsError):
         approval.approve_limits(evidence, proposed(), output)
     assert output.read_bytes() == original
+
+
+def test_p99_approval_records_fail_closed_tail_rejections(approval, sessions, tmp_path, monkeypatch):
+    base = approval.validate_sessions(qualify(approval, sessions))
+    report = json.loads(base.evidence_json)
+    report['p99_case'] = dict(camera_age_s=.032, state_age_s=.032,
+                              camera_skew_s=.004, mapping_error_s=.002,
+                              tf_position_error_m=1e-6, tf_rotation_error_rad=2e-6)
+    report['worst_case'] = dict(camera_age_s=.12, state_age_s=.06,
+                               camera_skew_s=.08, mapping_error_s=.003,
+                               tf_position_error_m=1e-6, tf_rotation_error_rad=2e-6)
+    for session, count in zip(report['sessions'], (2, 1, 1)):
+        session['sample_count'] = count
+    encoded = json.dumps(report, sort_keys=True, allow_nan=False, separators=(',', ':'))
+    sample_gate_values = (
+        ({'camera_age_s': .12, 'state_age_s': .03, 'camera_skew_s': .08,
+          'mapping_error_s': .002, 'tf_position_error_m': 1e-6,
+          'tf_rotation_error_rad': 2e-6},
+         {'camera_age_s': .04, 'state_age_s': .06, 'camera_skew_s': .004,
+          'mapping_error_s': .002, 'tf_position_error_m': 1e-6,
+          'tf_rotation_error_rad': 2e-6}),
+        ({'camera_age_s': .03, 'state_age_s': .03, 'camera_skew_s': .004,
+          'mapping_error_s': .002, 'tf_position_error_m': 1e-6,
+          'tf_rotation_error_rad': 2e-6},),
+        ({'camera_age_s': .03, 'state_age_s': .03, 'camera_skew_s': .004,
+          'mapping_error_s': .002, 'tf_position_error_m': 1e-6,
+          'tf_rotation_error_rad': 2e-6},),
+    )
+    evidence = approval.ApprovalEvidence(base.paths, encoded, sample_gate_values)
+    monkeypatch.setattr(approval, 'validate_sessions', lambda paths: evidence)
+
+    artifact = approval.approve_limits(evidence, proposed(), tmp_path/'limits.json')
+
+    assert artifact['approval_basis'] == 'per_session_p99_fail_closed_tail_rejection'
+    assert artifact['p99_case']['camera_age_s'] == .032
+    assert artifact['worst_case']['camera_age_s'] == .12
+    assert artifact['observed_exceedances']['by_limit']['camera_age_s']['total'] == 1
+    assert artifact['observed_exceedances']['by_limit']['state_age_s']['total'] == 1
+    assert artifact['observed_exceedances']['rejected_samples'] == 2
+    assert artifact['observed_exceedances']['sample_count'] == 4
+    assert artifact['motion_authorized'] is False
 
 
 @pytest.mark.parametrize('name', list(proposed()))

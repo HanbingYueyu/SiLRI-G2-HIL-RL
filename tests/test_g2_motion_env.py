@@ -34,7 +34,8 @@ def config(events, *, permitted=True, approved=True, rois=None):
                              workspace_high=(1., 1., 1.))
     motion = NS(limits=limits, control_mode=1, command_timeout_s=.2,
                 send_timeout_s=.1, stop_timeout_s=.5, reader_timeout_s=.1,
-                command_lifetime_s=.1, send_rate_hz=50., adapter_root='/fake/adapter')
+                command_lifetime_s=.1, send_rate_hz=50., adapter_root='/fake/adapter',
+                local_envelope=None)
     return NS(requested_motion=True, motion_permitted=permitted,
               commissioning=Commissioning(events, approved), motion=motion,
               freshness=FreshnessLimits(.1, .1, .1, .1, .1, .1),

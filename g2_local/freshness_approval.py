@@ -251,7 +251,10 @@ def _snapshot(payload, previous=None):
                 snap.last_sample_mono_ns < previous.last_sample_mono_ns):
             raise ValueError('Snapshot identity/time changed')
         if snap.last_sample_mono_ns == previous.last_sample_mono_ns:
-            mutable = {'sequence', 'created_mono_ns'}
+            # This is sampled from the local wall/monotonic clocks on every
+            # read; it is not part of the fitted PTP source sample and may
+            # jitter slightly while the underlying clock mapping is unchanged.
+            mutable = {'sequence', 'created_mono_ns', 'wall_minus_mono_ns'}
             if any(payload[f.name] != getattr(previous, f.name) for f in fields(snap) if f.name not in mutable):
                 raise ValueError('Same source sample changed mapping or lease')
     return snap
@@ -274,13 +277,14 @@ def _metrics(row, previous_row, previous_snapshot):
             raise ValueError('Source sequence frozen or reversed')
     error = _decimal(snap.empirical_error_ns)+Fraction(max(0, now-snap.reference_mono_ns)*MAX_DRIFT_PPM, 1_000_000)
     denominator = 1-_decimal(snap.drift_ppm)/1_000_000
-    intervals, ages, lower = {}, {}, {}
+    intervals, exact_intervals, ages, lower = {}, {}, {}, {}
     for source in SOURCES:
         delta = stamps[source]-snap.wall_minus_mono_ns-snap.reference_mono_ns
         center = snap.reference_mono_ns+(delta+_decimal(snap.offset_at_reference_ns))/denominator
         lo, hi = center-error/denominator, center+error/denominator
         if lo > now:
             raise ValueError('Future source timestamp')
+        exact_intervals[source] = (lo, hi)
         intervals[source] = [math.floor(lo), math.ceil(hi)]
         ages[source], lower[source] = float((now-lo)/1_000_000), float((now-hi)/1_000_000)
     for interval in row['source_intervals_ns'].values():
@@ -291,6 +295,7 @@ def _metrics(row, previous_row, previous_snapshot):
     if intervals != row['source_intervals_ns']:
         raise ValueError('Raw source interval mismatch')
     left, right = intervals['left_wrist'], intervals['right_aux']
+    exact_left, exact_right = exact_intervals['left_wrist'], exact_intervals['right_aux']
     metrics = dict(camera_age_ms={s: ages[s] for s in SOURCES[:2]},
                    camera_age_lower_ms={s: lower[s] for s in SOURCES[:2]},
                    state_age_ms={s: ages[s] for s in SOURCES[2:]},
@@ -301,6 +306,13 @@ def _metrics(row, previous_row, previous_snapshot):
                    mapping_drift_ppm=snap.drift_ppm, mapping_path_delay_ms=snap.path_delay_ns/1e6,
                    gdk_read_duration_ms=info['read_duration_s']*1000, inference_duration_ms=(end-start)/1e6,
                    snapshot_gap_ms=(snap.created_mono_ns-previous_snapshot.created_mono_ns)/1e6)
+    gate_values = dict(
+        camera_age_s=max(now-exact_intervals[s][0] for s in SOURCES[:2])/1_000_000_000,
+        state_age_s=max(now-exact_intervals[s][0] for s in SOURCES[2:])/1_000_000_000,
+        camera_skew_s=max(exact_left[1]-exact_right[0], exact_right[1]-exact_left[0])/1_000_000_000,
+        mapping_error_s=error/1_000_000_000,
+        tf_position_error_m=info['tf_position_error_m'],
+        tf_rotation_error_rad=info['tf_rotation_error_rad'])
     if previous_row is not None:
         metrics['gdk_read_gap_ms'] = (info['read_start_monotonic_ns']-previous_row['info']['read_end_monotonic_ns'])/1e6
     candidate, pose = info['tf_queries'][1]['pose'], info['motion_pose']
@@ -329,7 +341,7 @@ def _metrics(row, previous_row, previous_snapshot):
         raise ValueError('Raw metric mismatch')
     # Use the more conservative reconstructed TF value, including roundoff.
     metrics.update({key: max(value, info[key]) for key, value in tf.items()})
-    return metrics, snap
+    return metrics, snap, gate_values
 
 
 def _distribution(values):
@@ -446,10 +458,11 @@ def _validate(path):
     if qualification['monitor_session_id'] != monitor_id:
         raise ValueError('Monitor session mismatch')
     _monitor(monitor_raw, monitor_id, previous.created_mono_ns, end)
-    metrics, old = [], None
+    metrics, sample_gate_values, old = [], [], None
     for row in samples:
-        metric, previous = _metrics(row, old, previous)
+        metric, previous, gate_values = _metrics(row, old, previous)
         metrics.append(metric)
+        sample_gate_values.append(gate_values)
         old = row
     distributions = _summarize(metrics)
     for key, value in distributions.items():
@@ -464,13 +477,15 @@ def _validate(path):
     return dict(path=str(path), audit_session_id=session_id, monitor_session_id=monitor_id,
                 hashes={name: digest for name, (_, digest) in blobs.items()},
                 monitor_evidence=qualification['monitor_evidence'], monitor_sha256=qualification['monitor_sha256'],
-                actor_metadata=metadata, observed_elapsed_s=observed, sample_count=len(samples), metrics=distributions)
+                actor_metadata=metadata, observed_elapsed_s=observed, sample_count=len(samples),
+                metrics=distributions, sample_gate_values=sample_gate_values)
 
 
 @dataclass(frozen=True)
 class ApprovalEvidence:
     paths: tuple[str, ...]
     evidence_json: str
+    sample_gate_values: tuple = ()
 
     @property
     def sessions(self):
@@ -480,6 +495,10 @@ class ApprovalEvidence:
     def worst_case(self):
         return json.loads(self.evidence_json)['worst_case']
 
+    @property
+    def p99_case(self):
+        return json.loads(self.evidence_json)['p99_case']
+
 
 def validate_sessions(paths) -> ApprovalEvidence:
     paths = tuple(Path(os.path.abspath(path)) for path in paths)
@@ -487,6 +506,7 @@ def validate_sessions(paths) -> ApprovalEvidence:
         raise ValueError('Exactly three independent sessions required')
     try:
         sessions = [_validate(path) for path in paths]
+        sample_gate_values = tuple(tuple(session.pop('sample_gate_values')) for session in sessions)
         if (len({s['audit_session_id'] for s in sessions}) != 3 or
                 len({s['monitor_session_id'] for s in sessions}) != 3):
             raise ValueError('Exactly three independent sessions required')
@@ -494,15 +514,19 @@ def validate_sessions(paths) -> ApprovalEvidence:
             if len({_canonical(s['actor_metadata'][field]) for s in sessions}) != 1:
                 raise ValueError('checkpoint/config/gpu mismatch: '+field)
         worst = {}
+        p99 = {}
         for limit, metric in [('camera_age_s', 'camera_age_ms'), ('state_age_s', 'state_age_ms'),
                               ('camera_skew_s', 'camera_skew_ms'), ('mapping_error_s', 'mapping_error_ms'),
                               ('tf_position_error_m', 'tf_position_error_m'), ('tf_rotation_error_rad', 'tf_rotation_error_rad')]:
             values = [s['metrics'][metric] for s in sessions]
             maxima = [v['max'] if 'max' in v else max(d['max'] for d in v.values()) for v in values]
             worst[limit] = max(maxima)/(1000 if metric.endswith('_ms') else 1)
+            percentiles = [v['p99'] if 'p99' in v else max(d['p99'] for d in v.values()) for v in values]
+            p99[limit] = max(percentiles)/(1000 if metric.endswith('_ms') else 1)
         if worst['tf_position_error_m'] > .005 or worst['tf_rotation_error_rad'] > .02:
             raise ValueError('TF observed maxima exceed task ceilings')
-        return ApprovalEvidence(tuple(map(str, paths)), _canonical(dict(sessions=sessions, worst_case=worst)))
+        evidence_json = _canonical(dict(sessions=sessions, worst_case=worst, p99_case=p99))
+        return ApprovalEvidence(tuple(map(str, paths)), evidence_json, sample_gate_values)
     except (KeyError, TypeError, OverflowError) as error:
         raise ValueError('Incomplete or invalid qualification evidence') from error
 
@@ -517,15 +541,53 @@ def approve_limits(evidence, limits, output):
     fresh = validate_sessions(evidence.paths)
     if fresh.evidence_json != evidence.evidence_json:
         raise ValueError('Evidence changed since validation')
-    margins = {name: limits[name]-value for name, value in fresh.worst_case.items()}
-    for name in ('camera_age_s', 'state_age_s', 'camera_skew_s', 'mapping_error_s'):
+    dynamic = ('camera_age_s', 'state_age_s', 'camera_skew_s', 'mapping_error_s')
+    margins = {name: limits[name]-fresh.p99_case[name] for name in dynamic}
+    margin_basis = {name: 'worst_per_session_p99' for name in dynamic}
+    for name in ('tf_position_error_m', 'tf_rotation_error_rad'):
+        margins[name] = limits[name]-fresh.worst_case[name]
+        margin_basis[name] = 'worst_observed'
+    for name in dynamic:
         if margins[name] <= 0:
-            raise ValueError('Explicit positive worst-case margin required: '+name)
+            raise ValueError('Explicit positive per-session P99 margin required: '+name)
     if limits['tf_position_error_m'] != .005 or limits['tf_rotation_error_rad'] != .02:
         raise ValueError('TF task ceilings must remain 0.005 m and 0.02 rad')
+    by_limit, by_session, total_samples = {}, [], 0
+    rejected_per_session = []
+    for session, values in zip(fresh.sessions, fresh.sample_gate_values):
+        if len(values) != session['sample_count']:
+            raise ValueError('Derived per-sample gate evidence count mismatch')
+        counts = {name: 0 for name in _LIMIT_NAMES}
+        rejected = 0
+        for sample in values:
+            if type(sample) is not dict or set(sample) != _LIMIT_NAMES:
+                raise ValueError('Invalid derived per-sample gate evidence')
+            exceeded = []
+            for name, value in sample.items():
+                limit = _decimal(limits[name]) if isinstance(value, Fraction) else limits[name]
+                if value > limit:
+                    counts[name] += 1
+                    exceeded.append(name)
+            rejected += bool(exceeded)
+        by_session.append(dict(audit_session_id=session['audit_session_id'],
+                               rejected_samples=rejected, sample_count=len(values),
+                               rejected_rate=rejected/len(values)))
+        rejected_per_session.append(rejected)
+        total_samples += len(values)
+        for name, count in counts.items():
+            by_limit.setdefault(name, []).append(count)
+    if total_samples <= 0:
+        raise ValueError('No per-sample gate evidence')
+    observed_exceedances = dict(
+        sample_count=total_samples, rejected_samples=sum(rejected_per_session),
+        rejected_rate=sum(rejected_per_session)/total_samples, per_session=by_session,
+        by_limit={name: dict(total=sum(counts), per_session=counts)
+                  for name, counts in by_limit.items()})
     metadata = fresh.sessions[0]['actor_metadata']
     return _exclusive(output, dict(schema=1, limits=limits, margins=margins,
-        worst_case=fresh.worst_case, sessions=fresh.sessions,
+        margin_basis=margin_basis, approval_basis='per_session_p99_fail_closed_tail_rejection',
+        p99_case=fresh.p99_case, worst_case=fresh.worst_case,
+        observed_exceedances=observed_exceedances, sessions=fresh.sessions,
         checkpoint_sha256=metadata['checkpoint_sha256'], policy_config=metadata['policy_config'],
         gpu_name=metadata['gpu_name'], approved_at_utc=datetime.now(timezone.utc).isoformat(),
         thresholds_approved=True, motion_authorized=False, source_clock_identity_proven=False))

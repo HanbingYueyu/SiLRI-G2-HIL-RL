@@ -13,20 +13,23 @@ class Proposal:
 
 
 class ProposalMapper:
-    """axis_map: signed raw indices for forward, left, up, respectively.
+    """Signed raw indices for XYZ and base-frame rotation-vector XYZ.
 
-    Indices are 1-based, restricted to the three translation channels.
-    Signs must be calibrated; no default axis mapping is supplied.
+    Three-entry maps retain the old CLI shorthand for XYZ and append the
+    native rotational channels (-5,-4,-6). Training configs require six.
     valid is supplied by the reader's freshness/connection checks, not a
     hardware enable. Rotations are base-frame rotation-vector components,
     not absolute Euler angles. Left button never selects intervention.
     """
     def __init__(self, *, axis_map, deadzone=0.1):
         self.axis_map = tuple(axis_map)
-        if (len(self.axis_map) != 3 or
+        if len(self.axis_map) == 3:
+            self.axis_map += (-5, -4, -6)
+        if (len(self.axis_map) != 6 or
                 any(type(i) is not int for i in self.axis_map) or
-                set(map(abs, self.axis_map)) != {1, 2, 3}):
-            raise ValueError('Expected signed permutation of 1,2,3')
+                set(map(abs, self.axis_map[:3])) != {1, 2, 3} or
+                set(map(abs, self.axis_map[3:])) != {4, 5, 6}):
+            raise ValueError('Expected signed XYZ permutation of 1,2,3 and rotation permutation of 4,5,6')
         if not math.isfinite(deadzone) or not 0 <= deadzone < 1:
             raise ValueError('Deadzone must be finite in [0,1)')
         self.deadzone = deadzone
@@ -43,19 +46,19 @@ class ProposalMapper:
         except Exception:
             self.armed = False
             raise
-        mode = 'rotation' if left_pressed else 'translation'
-        if mode != self.mode or not valid:
+        mode = 'six_dof' if left_pressed else 'translation'
+        if not valid:
             self.armed = False
         self.mode = mode
-        xyz = tuple(raw[abs(i) - 1] * (1 if i > 0 else -1) for i in self.axis_map)
-        if valid and all(abs(v) <= self.deadzone for v in xyz):
+        mapped = tuple(raw[abs(i) - 1] * (1 if i > 0 else -1) for i in self.axis_map)
+        enabled = mapped if left_pressed else mapped[:3]
+        if valid and all(abs(v) <= self.deadzone for v in enabled):
             self.armed = True
         if not self.armed:
             return Proposal((0.,) * 6, mode, True)
         values = tuple(math.copysign(max(0., abs(v) - self.deadzone) /
-                                     (1 - self.deadzone), v) for v in xyz)
-        forward, left, up = values
-        action = (0., 0., 0., left, forward, up) if left_pressed else (*values, 0., 0., 0.)
+                                     (1 - self.deadzone), v) for v in enabled)
+        action = values if left_pressed else (*values, 0., 0., 0.)
         return Proposal(action, mode, False)
 
 
@@ -91,7 +94,8 @@ class LiveInputGate:
             raw = vector(frame.axes, 6)
             stamps = tuple(frame.axis_times)
             button = frame.buttons[self.left_button]
-            neutral = all(abs(v) <= self.mapper.deadzone for v in raw[:3])
+            neutral = all(abs(v) <= self.mapper.deadzone for v in
+                          (raw if button else raw[:3]))
             self.fresh = bool(math.isfinite(now) and frame.ready and len(stamps) == 2
                      and all(t is not None and math.isfinite(t) and
                              0 <= now-t <= self.max_age for t in stamps))
@@ -155,10 +159,12 @@ class HumanInput:
 
 
 class AutomaticIntervention:
-    """Motion-triggered Gym intervention with a fresh-neutral release hold.
+    """Motion-triggered intervention with a confirmed-neutral release hold.
 
     The caller owns the reader lifecycle. A fault ends this source's episode;
-    recovery requires a new source and reader.
+    recovery requires a new source and reader. poll must perform a live device
+    read and raise on disconnect, not just return an application-side cache.
+    A silent zero report is not a device/firmware heartbeat.
     """
     def __init__(self, reader, config, *, clock=time.monotonic):
         self.reader = reader
@@ -174,9 +180,13 @@ class AutomaticIntervention:
         self.last_stamps = None
         self.fault = None
         self.require_fresh = lambda: True
+        self._zero_evidence = None
+        self.verified_neutral = False
+        self._last_now = None
 
     def _raw_neutral(self, frame):
-        return all(abs(v) <= self.config.release_deadzone for v in frame.axes[:3])
+        active_axes = frame.axes if frame.buttons[self.config.left_button] else frame.axes[:3]
+        return all(abs(v) <= self.config.release_deadzone for v in active_axes)
 
     def __call__(self):
         if self.fault is not None:
@@ -184,6 +194,9 @@ class AutomaticIntervention:
         try:
             frame = self.reader.poll()
             now = self.clock()
+            if not math.isfinite(now) or (self._last_now is not None and now < self._last_now):
+                raise ValueError('SpaceMouse clock moved backwards')
+            self._last_now = now
             proposal = self.gate.update(frame, now=now)
             self.last_frame = frame
             stamps = tuple(frame.axis_times)
@@ -191,18 +204,31 @@ class AutomaticIntervention:
                     any(t is None or not math.isfinite(t) or t < 0 or t > now
                         for t in stamps)):
                 raise ValueError('SpaceMouse report unavailable or malformed')
+            if self.last_stamps is not None and any(
+                    current < previous for current, previous in zip(stamps, self.last_stamps)):
+                raise ValueError('SpaceMouse report timestamp moved backwards')
             new_report = (self.last_stamps is None or
-                          all(current > previous for current, previous in
+                          any(current > previous for current, previous in
                               zip(stamps, self.last_stamps)))
             self.last_stamps = stamps
+            signature = (stamps, tuple(frame.buttons), tuple(frame.axes))
+            exactly_zero = not any(value != 0 for value in frame.axes)
+            # Require a newly observed zero report; never infer release from
+            # silence following motion or a value merely inside the deadzone.
+            if not exactly_zero:
+                self._zero_evidence = None
+            elif self.gate.fresh and new_report and not proposal.blocked:
+                self._zero_evidence = signature
+            self.verified_neutral = bool(exactly_zero and self._zero_evidence == signature)
             if not self.gate.fresh and any(value != 0 for value in frame.axes):
                 raise RuntimeError('stale nonzero SpaceMouse input')
-            if not self.gate.fresh and self.require_fresh():
+            if not self.gate.fresh and not self.verified_neutral and self.require_fresh():
                 raise RuntimeError('stale neutral SpaceMouse input')
             moving = max(map(abs, proposal.action)) > self.config.engage_deadzone
             if moving:
                 self.active, self.neutral_since = True, None
-            elif self.active and self.gate.fresh and new_report and self._raw_neutral(frame):
+            elif self.active and (self.verified_neutral or
+                    (self.gate.fresh and new_report and self._raw_neutral(frame))):
                 self.neutral_since = now if self.neutral_since is None else self.neutral_since
                 if now - self.neutral_since >= self.config.release_hold_s:
                     self.active, self.neutral_since = False, None
@@ -215,8 +241,27 @@ class AutomaticIntervention:
             self.neutral_since = None
             self.last_frame = None
             self.last_stamps = None
+            self._zero_evidence = None
+            self.verified_neutral = False
             self.gate.invalidate()
             raise
+
+
+class DemonstrationIntervention(AutomaticIntervention):
+    """Keep human authority while recording; neutral never hands to a policy."""
+
+    def __call__(self):
+        super().__call__()  # Retain the same live-read and fault checks.
+        if self.gate.fresh:
+            # Capture deliberate low-amplitude input below takeover threshold.
+            proposal = self.gate.mapper.update(
+                self.last_frame.axes,
+                left_pressed=self.last_frame.buttons[self.config.left_button], valid=True)
+            return True, proposal.action
+        if self.verified_neutral:
+            return True, (0.,) * 6
+        # Waiting for a start chord cannot emit a movement command.
+        return True, (0.,) * 6
 
 
 class RotationCheck:
@@ -263,7 +308,7 @@ class RotationCheck:
         try:
             proposal = self.gate.update(frame, now=now)
             left = frame.buttons[self.gate.left_button]
-            neutral = all(abs(v) <= self.gate.mapper.deadzone for v in frame.axes[:3])
+            neutral = all(abs(v) <= self.gate.mapper.deadzone for v in frame.axes)
             advance = False
             if self.stage == 'press':
                 advance = frame.ready and left
@@ -306,7 +351,7 @@ def main():
     import sys
     parser = argparse.ArgumentParser(description='Offline normalized action preview, no motion')
     parser.add_argument('--axis-map', required=True,
-                        help='Signed raw axes for forward,left,up; e.g. --axis-map=2,-1,3')
+                        help='Signed XYZ and rotation axes; 3-axis shorthand appends -5,-4,-6')
     parser.add_argument('--deadzone', type=float, default=.1)
     args = parser.parse_args()
     mapper = ProposalMapper(axis_map=tuple(int(x) for x in args.axis_map.split(',')),

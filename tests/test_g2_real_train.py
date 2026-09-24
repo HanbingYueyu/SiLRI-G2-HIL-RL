@@ -298,6 +298,7 @@ def test_learner_passes_owned_output_checkpoint_path_to_runtime(tmp_path, monkey
             return {}
     class Service:
         failure = None
+        preservation_failure = None
         def __init__(self, learner):
             pass
         def publish(self, envelope):

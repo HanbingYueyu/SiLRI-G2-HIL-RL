@@ -102,6 +102,7 @@ def create_motion_env(config, coordinator, *, cli_allow_motion, factories=None) 
                                 send_timeout=config.motion.send_timeout_s,
                                 stop_timeout=config.motion.stop_timeout_s,
                                 send_rate_hz=config.motion.send_rate_hz,
+                                local_envelope=config.motion.local_envelope,
                                 step_period=1. / config.task.control_hz,
                                 allow_motion=True)
         return G2LocalEnv(backend, max_steps=config.task.max_episode_steps,

@@ -33,7 +33,7 @@ from .clock_mapping import (
 _MASTER_LINE = re.compile(r'\bselected best master clock (\S+)')
 _FAULT_MARKERS = ('FAULTY', 'UNCALIBRATED to LISTENING',
                   'SLAVE to LISTENING', 'clockcheck:', 'timed out')
-_WINDOW_CAPACITY = 64
+_WINDOW_CAPACITY = 16
 
 
 @dataclass(frozen=True)
@@ -170,6 +170,12 @@ class ClockWindow:
                 self._latch('ptp_delivery_delay')
                 return
             if not 0 <= sample['delay_ns'] <= MAX_PATH_DELAY_NS:
+                if self._mapping is None:
+                    # Ignore a startup path-delay spike before any clock
+                    # mapping exists. It cannot seed a fit or authorize use;
+                    # subsequent in-range reports must warm a fresh window.
+                    self._samples.clear()
+                    return
                 self._latch('path_delay')
                 return
             if self._last_ptp_mono_ns is not None:

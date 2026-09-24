@@ -4,7 +4,7 @@ from g2_local import spacemouse
 
 
 def make_frame(now, z=0., left=True, x=0.):
-    return SimpleNamespace(axes=(x, 0., z, 0., 0., 0.), buttons=(left, False),
+    return SimpleNamespace(axes=(0., 0., 0., x, 0., z), buttons=(left, False),
                            axis_times=(now, now), ready=True)
 
 
@@ -72,5 +72,5 @@ def test_runner_records_raw_evidence_for_success():
     calibration.run_check(reader, session, output.append,
                           clock=lambda: reader.current.axis_times[0], sleep=lambda _: None)
     assert output[-1]['stage'] == 'passed'
-    assert output[2]['raw_axes'][2] == -.8
-    assert output[4]['raw_axes'][2] == .8
+    assert output[2]['raw_axes'][5] == -.8
+    assert output[4]['raw_axes'][5] == .8

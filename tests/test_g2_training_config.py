@@ -36,7 +36,7 @@ def valid_payload():
                         'camera_rois': {'left_wrist': [0, 0, 1280, 1056],
                                         'right_aux': [0, 0, 1280, 1056]},
                         'raw_rgb_logging': False},
-        'intervention': {'axis_map': [-2, -1, -3], 'left_button': 0,
+        'intervention': {'axis_map': [-2, -1, -3, -5, -4, -6], 'left_button': 0,
                          'right_button': 1, 'engage_deadzone': .12,
                          'release_deadzone': .08, 'release_hold_s': .25,
                          'report_max_age_s': .25},
@@ -71,6 +71,13 @@ def test_config_needs_cli_and_approved_evidence_before_motion(tmp_path):
     assert loaded.task.action_scale == (.0015, .0015, .0015, .026, .026, .026)
     assert loaded.task.failure_reward == -1.0
     assert load_training_config(write_config(tmp_path, payload), cli_allow_motion=True).motion_permitted is False
+
+
+def test_config_rejects_image_size_not_supported_by_policy(tmp_path):
+    payload = valid_payload()
+    payload['observation']['image_size'] = 160
+    with pytest.raises(ValueError, match='image_size.*128'):
+        load_training_config(write_config(tmp_path, payload), cli_allow_motion=False)
 
 
 def test_manifest_is_canonical_and_refuses_existing_output(tmp_path):
@@ -352,4 +359,4 @@ def test_checked_in_example_stays_read_only_and_unapproved():
     assert loaded.motion_permitted is False
     assert loaded.commissioning.profile == 'unapproved'
     assert loaded.commissioning.evidence == ()
-    assert loaded.intervention.axis_map == (-2, -1, -3)
+    assert loaded.intervention.axis_map == (-2, -1, -3, -5, -4, -6)

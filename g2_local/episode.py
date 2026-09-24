@@ -52,6 +52,9 @@ class EpisodeRunner:
         observation = self.backend.observe()
         if observation is None:
             raise ValueError('Missing initial observation')
+        begin_episode = getattr(self.backend, 'begin_episode', None)
+        if begin_episode is not None:
+            begin_episode(observation)
         self.observation = deepcopy(observation)
         self.context = context
         self.steps = 0
