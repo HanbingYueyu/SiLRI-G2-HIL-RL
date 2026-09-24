@@ -106,8 +106,8 @@ def _policy_observation(obs, device, image_size):
     return result
 
 
-def validate_real_transition(row, run_id, config_hash):
-    """Validate full real provenance before learner replay mutation."""
+def validate_transition_provenance(row, run_id, config_hash):
+    """Validate identity, actions, outcomes and scene provenance."""
     if type(row) is not dict or set(row) != {
             'state', 'next_state', 'action', 'reward', 'done', 'truncated',
             'complementary_info'}:
@@ -157,6 +157,12 @@ def validate_real_transition(row, run_id, config_hash):
             not torch.isfinite(action).all().item() or
             not np.array_equal(action.cpu().numpy(), np.asarray(executed, dtype=np.float32))):
         raise ValueError('Executed action mismatch')
+    return identity
+
+
+def validate_real_transition(row, run_id, config_hash):
+    """Validate full real provenance before learner replay mutation."""
+    identity = validate_transition_provenance(row, run_id, config_hash)
     for field in ('state', 'next_state'):
         obs = row[field]
         if type(obs) is not dict or set(obs) != {

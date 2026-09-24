@@ -1,6 +1,8 @@
 """Validated real SiLRI learner with dual replay and atomic local resume."""
 
 from dataclasses import asdict, dataclass
+from copy import deepcopy
+from collections import deque
 import os
 from pathlib import Path
 import random
@@ -20,6 +22,7 @@ from lerobot.utils.buffer import ReplayBuffer, concatenate_batch_transitions
 from .contract import CAMERA_KEYS
 from .policy import create_policy
 from .real_actor import ParameterEnvelope, validate_real_transition
+from .provenance import ProvenanceRecords, compact_record, tensor_digest
 from .runtime import train_batch
 from .training_config import OptimizationConfig, RuntimeConfig, _open_owned_regular
 
@@ -128,19 +131,25 @@ def _restore_replay(buffer, state):
 
 
 def _check_replay_records(buffer, records):
-    if len(buffer) != min(len(records), buffer.capacity):
+    recent = deque(maxlen=buffer.capacity)
+    count = 0
+    for index, row in enumerate(records):
+        recent.append((index, row))
+        count += 1
+    if len(buffer) != min(count, buffer.capacity):
         raise ValueError('Replay size and provenance mismatch')
-    if buffer.position != len(records) % buffer.capacity:
+    if buffer.position != count % buffer.capacity:
         raise ValueError('Replay position and provenance mismatch')
-    for index in range(max(0, len(records) - buffer.capacity), len(records)):
-        row = records[index]
+    for index, row in recent:
         slot = index % buffer.capacity
-        if not torch.equal(buffer.actions[slot].cpu(), row['action'].cpu()):
+        if not torch.equal(buffer.actions[slot].cpu(), torch.tensor(row['action'], dtype=torch.float32)):
             raise ValueError('Replay executed action and provenance mismatch')
         for field, replay_field in (('state', 'states'), ('next_state', 'next_states')):
             for key, value in row[field].items():
-                if not torch.equal(getattr(buffer, replay_field)[key][slot].cpu(),
-                                   value.squeeze(0).cpu()):
+                stored = getattr(buffer, replay_field)[key][slot].cpu()
+                matches = (torch.equal(stored, torch.tensor(value, dtype=torch.float32).squeeze(0))
+                           if key == 'observation.state' else tensor_digest(stored) == value)
+                if not matches:
                     raise ValueError('Replay observation and provenance mismatch')
         if (buffer.rewards[slot].item() != torch.tensor(row['reward'], dtype=torch.float32).item() or
                 buffer.dones[slot].item() != row['done'] or
@@ -188,7 +197,7 @@ class RealLearnerRuntime:
         self.online_replay = buffer(opt.online_capacity)
         self.human_replay = buffer(opt.human_capacity)
         self.seen_transition_ids = set()
-        self.records = []
+        self.records = ProvenanceRecords(opt.online_capacity + opt.human_capacity)
         self.version = 0
         self.message_sequence = -1
         self._published_version = 0
@@ -202,6 +211,8 @@ class RealLearnerRuntime:
         self.checkpoint_path = checkpoint_path
         self.stopped = threading.Event()
         self._lock = threading.RLock()
+        self._update_lock = threading.RLock()
+        self._parameter_lock = threading.RLock()
 
     def snapshot_counts(self):
         with self._lock:
@@ -213,12 +224,14 @@ class RealLearnerRuntime:
 
     def ingest(self, rows):
         with self._lock:
+            if self.stopped.is_set():
+                raise RuntimeError('Learner stopped')
             rows = tuple(rows)
             prepared = [(validate_real_transition(row, self.run_id, self.config_hash).value,
-                         _training_row(row)) for row in rows]
+                         _training_row(row), compact_record(row)) for row in rows]
             new = set()
             accepted = duplicates = 0
-            for row, (identity, training) in zip(rows, prepared):
+            for row, (identity, training, record) in zip(rows, prepared):
                 if identity in self.seen_transition_ids or identity in new:
                     duplicates += 1
                     continue
@@ -227,7 +240,7 @@ class RealLearnerRuntime:
                     self.human_replay.add(**training)
                 self.seen_transition_ids.add(identity)
                 new.add(identity)
-                self.records.append(row)
+                self.records.append(record)
                 accepted += 1
             self.accepted_transitions += accepted
             self._interaction_budget += accepted * self.config.optimization.utd_ratio
@@ -239,7 +252,7 @@ class RealLearnerRuntime:
                                  self.message_sequence, state)
 
     def publish_parameters(self):
-        with self._lock:
+        with self._update_lock, self._parameter_lock:
             if self.stopped.is_set():
                 raise RuntimeError('Learner stopped')
             state = {key: value.detach().cpu().clone()
@@ -256,7 +269,7 @@ class RealLearnerRuntime:
             return envelope
 
     def heartbeat_parameters(self):
-        with self._lock:
+        with self._parameter_lock:
             if self.stopped.is_set():
                 raise RuntimeError('Learner stopped')
             envelope = self._envelope(self._published_version,
@@ -270,25 +283,27 @@ class RealLearnerRuntime:
             return envelope
 
     def update_once(self):
-        with self._lock:
+        with self._update_lock:
             if self.stopped.is_set():
                 raise RuntimeError('Learner stopped')
             opt = self.config.optimization
-            if len(self.online_replay) < max(opt.min_online_transitions,
-                                              opt.online_batch_size):
-                return None
-            online = self.online_replay.sample(opt.online_batch_size)
-            has_human = len(self.human_replay) >= opt.human_batch_size
-            data = (concatenate_batch_transitions(
-                online, self.human_replay.sample(opt.human_batch_size))
-                if has_human else online)
+            with self._lock:
+                if len(self.online_replay) < max(opt.min_online_transitions,
+                                                  opt.online_batch_size):
+                    return None
+                online = self.online_replay.sample(opt.online_batch_size)
+                has_human = len(self.human_replay) >= opt.human_batch_size
+                data = (concatenate_batch_transitions(
+                    online, self.human_replay.sample(opt.human_batch_size))
+                    if has_human else online)
             names = ('critic', 'actor', 'lagrange', 'expert', 'actor_bc') if has_human else (
                 'critic', 'actor', 'lagrange')
             metrics = train_batch(self.policy, self.optimizers, data, names)
-            self.version += 1
-            self.update_count += 1
-            if self._interaction_budget:
-                self._interaction_budget -= 1
+            with self._lock:
+                self.version += 1
+                self.update_count += 1
+                if self._interaction_budget:
+                    self._interaction_budget -= 1
             if self.version % opt.target_update_interval == 0:
                 self.policy.update_target_networks()
             if self.version % opt.publish_interval == 0:
@@ -298,7 +313,7 @@ class RealLearnerRuntime:
             return metrics
 
     def update_for_interactions(self):
-        with self._lock:
+        with self._update_lock:
             results = []
             while self._interaction_budget:
                 result = self.update_once()
@@ -319,7 +334,7 @@ class RealLearnerRuntime:
                     online_replay=_replay_state(self.online_replay),
                     human_replay=_replay_state(self.human_replay),
                     seen_transition_ids=sorted(self.seen_transition_ids),
-                    records=self.records, version=self.version,
+                    provenance=self.records.descriptor(), version=self.version,
                     message_sequence=self.message_sequence,
                     published_version=self._published_version,
                     published_actor_state=self._published_actor_state,
@@ -331,16 +346,19 @@ class RealLearnerRuntime:
                     numpy_rng=np.random.get_state(), python_rng=random.getstate())
 
     def save_checkpoint(self, path: Path) -> Path:
-        with self._lock:
+        with self._update_lock:
+            with self._lock, self._parameter_lock:
+                payload = deepcopy(self._payload())
             path = Path(path)
             if not path.parent.is_dir() or path.is_symlink():
                 raise ValueError('Checkpoint parent must exist and target cannot be a symlink')
+            self.records.save_snapshot(path.parent, payload['provenance'])
             fd, temporary_name = tempfile.mkstemp(prefix=path.name + '.', suffix='.tmp',
                                                   dir=path.parent)
             temporary = Path(temporary_name)
             try:
                 with os.fdopen(fd, 'wb') as stream:
-                    torch.save(self._payload(), stream)
+                    torch.save(payload, stream)
                     stream.flush()
                     os.fsync(stream.fileno())
                 os.replace(temporary, path)
@@ -384,15 +402,16 @@ def load_checkpoint(path: Path, *, expected_run_id: str, expected_config_hash: s
     _restore_replay(learner.online_replay, payload['online_replay'])
     _restore_replay(learner.human_replay, payload['human_replay'])
     learner.seen_transition_ids = set(payload['seen_transition_ids'])
-    learner.records = payload['records']
-    for row in learner.records:
-        validate_real_transition(row, expected_run_id, expected_config_hash)
+    learner.records = ProvenanceRecords.restore(
+        Path(path).parent, payload.get('provenance'),
+        capacity=config.optimization.online_capacity + config.optimization.human_capacity,
+        run_id=expected_run_id, config_hash=expected_config_hash)
     record_ids = {row['complementary_info']['transition_id'] for row in learner.records}
     if learner.seen_transition_ids != record_ids or len(record_ids) != len(learner.records):
         raise ValueError('Checkpoint transition dedup mismatch')
     _check_replay_records(learner.online_replay, learner.records)
-    human_records = [row for row in learner.records
-                     if row['complementary_info']['is_intervention']]
+    human_records = (row for row in learner.records
+                     if row['complementary_info']['is_intervention'])
     _check_replay_records(learner.human_replay, human_records)
     for name in ('version', 'message_sequence', 'accepted_transitions',
                  'update_count', 'interaction_budget'):
@@ -416,6 +435,9 @@ def load_checkpoint(path: Path, *, expected_run_id: str, expected_config_hash: s
     learner.accepted_transitions = payload['accepted_transitions']
     learner.update_count = payload['update_count']
     learner._interaction_budget = payload['interaction_budget']
+    if (learner.accepted_transitions != len(learner.records) or
+            learner.version != learner.update_count):
+        raise ValueError('Checkpoint provenance counters mismatch')
     torch.set_rng_state(payload['torch_rng'])
     if payload['cuda_rng'] is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(payload['cuda_rng'])
@@ -432,6 +454,11 @@ class GrpcLearnerService(rpc.LearnerServiceServicer):
         self.learner = learner
         self._condition = threading.Condition()
         self._latest = None
+        self._work = threading.Event()
+        self._idle = threading.Event()
+        self._idle.set()
+        self._worker = None
+        self.failure = None
         learner.publish = self.publish
 
     def publish(self, envelope):
@@ -443,8 +470,46 @@ class GrpcLearnerService(rpc.LearnerServiceServicer):
 
     def _stop(self):
         self.learner.stopped.set()
+        self._work.set()
         with self._condition:
             self._condition.notify_all()
+
+    def close(self):
+        self._stop()
+        if self._worker is not None:
+            self._worker.join(self.learner.config.runtime.transport_timeout_s)
+
+    def _optimize(self):
+        try:
+            while not self.learner.stopped.is_set():
+                self._work.wait()
+                self._work.clear()
+                if self.learner.stopped.is_set():
+                    return
+                # The interaction budget is the only pending-work counter.
+                # Discard per-update metrics here rather than accumulating a list.
+                while self.learner.snapshot_counts()['budget']:
+                    if self.learner.stopped.is_set():
+                        return
+                    if self.learner.update_once() is None:
+                        break
+                with self._condition:
+                    if not self._work.is_set():
+                        self._idle.set()
+        except BaseException as error:
+            self.failure = error
+            self._stop()
+        finally:
+            self._idle.set()
+
+    def _schedule(self):
+        with self._condition:
+            self._idle.clear()
+            self._work.set()
+            if self._worker is None:
+                self._worker = threading.Thread(target=self._optimize,
+                                                name='learner-optimizer', daemon=True)
+                self._worker.start()
 
     def SendTransitions(self, request_iterator, context):  # noqa: N802
         data = bytearray()
@@ -456,13 +521,17 @@ class GrpcLearnerService(rpc.LearnerServiceServicer):
                 if ended:
                     raise ValueError('Unexpected transition chunk after batch end')
                 data.extend(chunk.data)
+                if len(data) > self.learner.config.runtime.queue_capacity * 2 * 1024 * 1024:
+                    raise ValueError('Transition ingress byte bound exceeded')
                 if chunk.transfer_state == pb.TransferState.TRANSFER_END:
                     ended = True
             if not ended:
                 raise ValueError('Incomplete transition batch')
             rows = bytes_to_transitions(bytes(data))
+            if len(rows) > self.learner.config.runtime.queue_capacity:
+                raise ValueError('Transition ingress row bound exceeded')
             self.learner.ingest(rows)
-            self.learner.update_for_interactions()
+            self._schedule()
         except BaseException:
             self._stop()
             raise

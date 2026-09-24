@@ -52,7 +52,25 @@ def test_motion_engages_and_only_fresh_held_neutral_releases():
 def test_silent_neutral_never_releases_active_intervention():
     source, reader, now = engaged_source()
     reader.frame = frame(stamps=(1.,1.)); now[0] = 5.
-    assert source()[0] is True
+    with pytest.raises(RuntimeError, match='stale'):
+        source()
+
+
+def test_stale_neutral_stops_before_policy_execution():
+    source, reader, now = automatic_source()
+    class FakeCommandPort(SyntheticBackend):
+        action_count = 0
+        def execute(self, action):
+            self.action_count += 1
+            return super().execute(action)
+    port = FakeCommandPort()
+    env = G2LocalEnv(port, intervention=source)
+    env.reset()
+    now[0] = 2.
+    with pytest.raises(RuntimeError, match='stale'):
+        env.step(np.ones(6))
+    assert port.action_count == 0
+    assert not env.runner.active
 
 
 def test_unplug_latches_fault_instead_of_policy_fallback():
@@ -91,7 +109,7 @@ def test_repeated_neutral_snapshot_cannot_accumulate_release_hold():
     assert source()[0] is True
     now[0] = 1.39  # Still age-fresh, but no new axis-channel packets.
     assert source()[0] is True
-    reader.frame = frame(stamps=(1.5,1.2)); now[0] = 1.5
+    reader.frame = frame(stamps=(1.39,1.2)); now[0] = 1.39
     assert source()[0] is True
     reader.frame = frame(stamps=(1.6,1.6)); now[0] = 1.6
     assert source()[0] is True

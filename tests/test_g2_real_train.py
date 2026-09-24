@@ -12,6 +12,35 @@ from g2_local import real_train
 TEMPLATE = Path(__file__).resolve().parents[1] / 'configs/g2_real_training_readonly.json'
 
 
+@pytest.mark.parametrize('key,error', [('Y', None), ('F', RuntimeError), ('Y', KeyboardInterrupt)])
+def test_terminal_single_byte_and_restoration(monkeypatch, key, error):
+    import os
+    import pty
+    import select
+    import termios
+    master, slave = pty.openpty()
+    try:
+        with os.fdopen(os.dup(slave), 'r') as stream:
+            monkeypatch.setattr(real_train.sys, 'stdin', stream)
+            original = termios.tcgetattr(slave)
+            def run():
+                with real_train._TerminalInput() as terminal:
+                    os.write(master, key.encode())
+                    assert select.select([slave], [], [], .2)[0]
+                    assert terminal.read_available(limit=1) == [key]
+                    if error:
+                        raise error()
+            if error:
+                with pytest.raises(error):
+                    run()
+            else:
+                run()
+            assert termios.tcgetattr(slave) == original
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
 def _config(tmp_path, *, mode='train'):
     data = json.loads(TEMPLATE.read_text())
     data['mode'] = mode
@@ -268,9 +297,12 @@ def test_learner_passes_owned_output_checkpoint_path_to_runtime(tmp_path, monkey
         def snapshot_counts(self):
             return {}
     class Service:
+        failure = None
         def __init__(self, learner):
             pass
         def publish(self, envelope):
+            pass
+        def close(self):
             pass
     class Server:
         def add_insecure_port(self, address):

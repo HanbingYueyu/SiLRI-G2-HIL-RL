@@ -300,7 +300,7 @@ class CommissioningConfig:
     expected_master: str
     evidence: Sequence[CommissioningEvidence]
 
-    def verify_files_and_hashes(self) -> bool:
+    def verify_files_and_hashes(self, freshness: FreshnessLimits) -> bool:
         kinds = set()
         valid = True
         for item in self.evidence:
@@ -314,6 +314,27 @@ class CommissioningConfig:
                 continue
             digest = hashlib.sha256()
             with os.fdopen(fd, 'rb') as stream:
+                if item.kind == 'freshness_approval':
+                    data = stream.read(131073)
+                    if len(data) > 131072:
+                        raise ValueError('approved freshness artifact is too large')
+                    digest.update(data)
+                    if digest.hexdigest() != item.sha256:
+                        valid = False
+                        continue
+                    artifact = json.loads(data.decode('utf-8'), object_pairs_hook=_unique_pairs,
+                                          parse_constant=_reject_constant)
+                    if (type(artifact) is not dict or type(artifact.get('schema')) is not int or
+                            artifact['schema'] != 1 or artifact.get('thresholds_approved') is not True or
+                            artifact.get('motion_authorized') is not False):
+                        raise ValueError('Invalid approved freshness artifact')
+                    limits = _keys(artifact.get('limits'), _fields(FreshnessLimits),
+                                   'approved freshness limits')
+                    approved = FreshnessLimits(**{key: _number(value, key, positive=True)
+                                                  for key, value in limits.items()})
+                    if approved != freshness:
+                        raise ValueError('Live limits differ from approved freshness limits')
+                    continue
                 for chunk in iter(lambda: stream.read(1024 * 1024), b''):
                     digest.update(chunk)
             valid &= digest.hexdigest() == item.sha256
@@ -553,7 +574,7 @@ def load_training_config(path: Path, *, cli_allow_motion: bool) -> LoadedTrainin
     payload = read_owned_regular_json(path, max_bytes=131072)
     reject_unknown_or_missing_keys(payload, SCHEMA_ONE_KEYS)
     parsed = parse_schema_one(payload)
-    approved = parsed.commissioning.verify_files_and_hashes()
+    approved = parsed.commissioning.verify_files_and_hashes(parsed.freshness)
     digest = hashlib.sha256(canonical_json(payload)).hexdigest()
     return replace(parsed,
                    motion_permitted=bool(cli_allow_motion and parsed.requested_motion and approved),

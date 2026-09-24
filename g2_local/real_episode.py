@@ -30,6 +30,7 @@ class RealEpisodeCoordinator:
         self.clock_ns = clock_ns
         self.chord = StartChord(left_button=left_button, right_button=right_button)
         self.state = 'WAITING_FOR_RESET'
+        self.intervention.require_fresh = lambda: self.running
         self.context = None
         self._token = None
         self._completed_token = None

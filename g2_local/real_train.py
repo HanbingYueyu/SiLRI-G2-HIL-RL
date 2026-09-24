@@ -247,12 +247,29 @@ def load_eval_checkpoint(path, *, run_id, config_hash):
 
 
 class _TerminalInput:
-    def read_available(self, *, limit):
+    def __enter__(self):
+        import termios
+        import tty
         if not sys.stdin.isatty():
             raise RuntimeError('Interactive terminal required for Y/F outcomes')
+        self.stream = sys.stdin
+        self.fd = self.stream.fileno()
+        self.original = termios.tcgetattr(self.fd)
+        try:
+            tty.setcbreak(self.fd, termios.TCSANOW)
+        except BaseException:
+            termios.tcsetattr(self.fd, termios.TCSANOW, self.original)
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        import termios
+        termios.tcsetattr(self.fd, termios.TCSANOW, self.original)
+
+    def read_available(self, *, limit):
         result = []
-        while len(result) < limit and select.select([sys.stdin], [], [], 0)[0]:
-            result.append(os.read(sys.stdin.fileno(), 1).decode('ascii', 'ignore'))
+        while len(result) < limit and select.select([self.stream], [], [], 0)[0]:
+            result.append(os.read(self.fd, 1).decode('ascii', 'ignore'))
         return result
 
 
@@ -302,8 +319,11 @@ def _run_learner(args, loaded, evidence):
                        checkpoint_path=str(learner.checkpoint_path))
         while not learner.stopped.wait(.2):
             pass
+        if service.failure is not None:
+            raise RuntimeError('Background learner optimization failed') from service.failure
         return 0
     finally:
+        service.close()
         server.stop(grace=loaded.runtime.transport_timeout_s).wait()
         evidence.event('learner_stopped', **learner.snapshot_counts())
 
@@ -342,10 +362,10 @@ def _run_actor_or_eval(args, loaded, evidence):
     if adapter_root not in sys.path:
         sys.path.insert(0, adapter_root)
     hid_type = import_gdk_runtime()
-    with hid_type(str(args.hid_device)) as reader:
+    with _TerminalInput() as terminal, hid_type(str(args.hid_device)) as reader:
         intervention = AutomaticIntervention(reader, loaded.intervention)
         coordinator = RealEpisodeCoordinator(
-            intervention, _TerminalInput(), loaded.task,
+            intervention, terminal, loaded.task,
             context_max_age_s=loaded.runtime.context_max_age_s,
             left_button=loaded.intervention.left_button,
             right_button=loaded.intervention.right_button)

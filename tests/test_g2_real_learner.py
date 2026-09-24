@@ -149,11 +149,79 @@ def test_grpc_valid_batch_updates_once_per_configured_utd():
     service = GrpcLearnerService(learner)
     packet = transitions_to_bytes([_row()])
     service.SendTransitions(send_bytes_in_chunks(packet, pb.Transition), None)
+    assert service._idle.wait(5.)
     assert learner.version == 2
     assert learner.snapshot_counts()['online'] == 1
     service.SendTransitions(send_bytes_in_chunks(packet, pb.Transition), None)
+    assert service._idle.wait(5.)
     assert learner.version == 2
     assert learner.snapshot_counts()['online'] == 1
+    service.close()
+
+
+def test_blocked_optimizer_does_not_block_subsequent_ingress_ack(monkeypatch):
+    from g2_local import real_learner
+    learner = _learner()
+    service = GrpcLearnerService(learner)
+    entered, release, ack = threading.Event(), threading.Event(), threading.Event()
+    original = real_learner.train_batch
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(5.)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(real_learner, 'train_batch', blocked)
+    errors = []
+    def send():
+        try:
+            for step in (0, 1):
+                service.SendTransitions(send_bytes_in_chunks(
+                    transitions_to_bytes([_row(step)]), pb.Transition), None)
+                if step == 0:
+                    assert entered.wait(2.)
+            ack.set()
+        except BaseException as error:
+            errors.append(error)
+    sender = threading.Thread(target=send)
+    sender.start()
+    try:
+        assert entered.wait(2.)
+        assert ack.wait(.5), 'ingestion ACK waited for optimization'
+        assert learner.snapshot_counts()['accepted'] == 2
+    finally:
+        release.set()
+        sender.join(5.)
+        service.close()
+    assert not errors
+
+
+def test_background_optimizer_failure_closes_parameter_liveness(monkeypatch):
+    from g2_local import real_learner
+    learner = _learner()
+    service = GrpcLearnerService(learner)
+    release = threading.Event()
+    def fail(*args, **kwargs):
+        assert release.wait(5.)
+        raise RuntimeError('optimizer failed')
+    monkeypatch.setattr(real_learner, 'train_batch', fail)
+    acknowledged = threading.Event()
+    def send():
+        service.SendTransitions(send_bytes_in_chunks(
+            transitions_to_bytes([_row()]), pb.Transition), None)
+        acknowledged.set()
+    sender = threading.Thread(target=send)
+    sender.start()
+    try:
+        assert acknowledged.wait(.5)
+        context = _StreamContext()
+        stream = service.StreamParameters(pb.Empty(), context)
+        release.set()
+        assert learner.stopped.wait(2.)
+        assert list(stream) == []
+        assert isinstance(service.failure, RuntimeError)
+    finally:
+        release.set()
+        sender.join(5.)
+        service.close()
 
 
 def test_resume_rejects_symlink_and_corrupt_provenance(tmp_path):
@@ -165,12 +233,45 @@ def test_resume_rejects_symlink_and_corrupt_provenance(tmp_path):
     with pytest.raises(ValueError):
         load_checkpoint(link, expected_run_id='run-1', expected_config_hash='hash-1')
     payload = torch.load(checkpoint, weights_only=False)
-    payload['records'][0]['complementary_info']['transition_id'] = 'wrong'
+    provenance = tmp_path / payload['provenance']['file']
+    provenance.write_bytes(provenance.read_bytes().replace(b'run-1/ep-1/0', b'run-1/ep-1/9'))
     corrupt = tmp_path / 'corrupt.pt'
     torch.save(payload, corrupt)
     with pytest.raises(ValueError):
         load_checkpoint(corrupt, expected_run_id='run-1',
                         expected_config_hash='hash-1')
+
+
+def test_provenance_scale_is_bounded_and_checkpoint_prefix_resumes(tmp_path):
+    import json
+    from collections import deque
+    optimization = replace(_config().optimization, online_capacity=3, human_capacity=2)
+    learner = RealLearnerRuntime(config=_config(optimization=optimization), run_id='run-1')
+    for step in range(11):
+        learner.ingest([_row(step, human=step % 3 == 0)])
+    # No historical image tensors or rows remain resident; only a replay-sized
+    # window of compact provenance may be cached.
+    assert isinstance(learner.records.cache, deque)
+    assert len(learner.records.cache) <= 5
+    assert len(json.dumps(list(learner.records.cache))) < 20000
+    assert len(learner.records) == 11
+    checkpoint = learner.save_checkpoint(tmp_path / 'checkpoint.pt')
+    payload = torch.load(checkpoint, weights_only=False)
+    assert 'records' not in payload
+    learner.ingest([_row(11)])
+    restored = load_checkpoint(checkpoint, expected_run_id='run-1', expected_config_hash='hash-1')
+    assert len(restored.records) == 11
+    assert [row['complementary_info']['transition_id'] for row in restored.records] == [
+        f'run-1/ep-1/{step}' for step in range(11)]
+    assert restored.online_replay.position == 2
+    assert restored.human_replay.position == 0
+    assert restored.ingest([_row(0)]).duplicates == 1
+    assert restored.ingest([_row(11)]).accepted == 1
+    assert restored.online_replay.position == 0
+    sidecar = tmp_path / payload['provenance']['file']
+    sidecar.write_bytes(sidecar.read_bytes() + b'{}\n')
+    with pytest.raises(ValueError, match='provenance'):
+        load_checkpoint(checkpoint, expected_run_id='run-1', expected_config_hash='hash-1')
 
 
 def test_resume_rejects_dedup_ids_that_do_not_match_records(tmp_path):

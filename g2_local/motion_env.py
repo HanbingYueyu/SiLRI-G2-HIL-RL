@@ -70,7 +70,7 @@ def create_motion_env(config, coordinator, *, cli_allow_motion, factories=None) 
     if (type(cli_allow_motion) is not bool or cli_allow_motion is not True or
             config.requested_motion is not True or config.motion_permitted is not True):
         raise PermissionError('commissioned motion permission is required')
-    if config.commissioning.verify_files_and_hashes() is not True:
+    if config.commissioning.verify_files_and_hashes(config.freshness) is not True:
         raise PermissionError('commissioning evidence is not current')
     config.motion.limits.validate_motion()
     if type(config.motion.control_mode) is not int or config.motion.control_mode not in (1, 3):

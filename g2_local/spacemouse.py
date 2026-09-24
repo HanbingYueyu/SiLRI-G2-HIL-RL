@@ -173,6 +173,7 @@ class AutomaticIntervention:
         self.last_frame = None
         self.last_stamps = None
         self.fault = None
+        self.require_fresh = lambda: True
 
     def _raw_neutral(self, frame):
         return all(abs(v) <= self.config.release_deadzone for v in frame.axes[:3])
@@ -196,6 +197,8 @@ class AutomaticIntervention:
             self.last_stamps = stamps
             if not self.gate.fresh and any(value != 0 for value in frame.axes):
                 raise RuntimeError('stale nonzero SpaceMouse input')
+            if not self.gate.fresh and self.require_fresh():
+                raise RuntimeError('stale neutral SpaceMouse input')
             moving = max(map(abs, proposal.action)) > self.config.engage_deadzone
             if moving:
                 self.active, self.neutral_since = True, None

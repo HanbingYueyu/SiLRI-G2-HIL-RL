@@ -176,13 +176,19 @@ def test_approved_profile_requires_all_verified_evidence_and_both_flags(tmp_path
     evidence = []
     for name in names:
         path = tmp_path / f'{name}.json'
-        path.write_text(name)
+        content = json.dumps({'schema': 1, 'limits': payload['freshness'],
+                              'thresholds_approved': True, 'motion_authorized': False}) if name == 'freshness_approval' else name
+        path.write_text(content)
         evidence.append({'kind': name, 'path': str(path),
-                         'sha256': hashlib.sha256(name.encode()).hexdigest()})
+                         'sha256': hashlib.sha256(content.encode()).hexdigest()})
     payload['commissioning']['evidence'] = evidence
     config_path = write_config(tmp_path, payload)
     assert load_training_config(config_path, cli_allow_motion=False).motion_permitted is False
     assert load_training_config(config_path, cli_allow_motion=True).motion_permitted is True
+    payload['freshness']['camera_age_s'] = .2
+    with pytest.raises(ValueError, match='approved freshness'):
+        load_training_config(write_config(tmp_path, payload), cli_allow_motion=True)
+    payload['freshness']['camera_age_s'] = .1
     payload['requested_motion'] = False
     assert load_training_config(write_config(tmp_path, payload), cli_allow_motion=True).motion_permitted is False
     payload['requested_motion'] = True

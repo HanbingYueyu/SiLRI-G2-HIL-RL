@@ -23,7 +23,7 @@ class Commissioning:
         self.events = events
         self.approved = approved
 
-    def verify_files_and_hashes(self):
+    def verify_files_and_hashes(self, freshness):
         self.events.append('evidence')
         return self.approved
 
