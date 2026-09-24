@@ -1,5 +1,50 @@
 # G2 局部插入适配记录
 
+## 正式 SiLRI 运行时的隔离集成证明（2026-09-24，功能分支）
+
+`feature/real-silri-training-runtime` 已实现版本化配置/清单（`a1bd58a`、`d51360c`、
+`9eeb14b`）、SpaceMouse 接管（`eb91ecf`、`b124169`）、回合状态机（`2789339`、
+`e0816b7`）、运动环境装配（`5972c3c`、`b4fecb6`）、Real Actor（`cbb9f08`、
+`762f3bd`）、Real Learner（`522c137`、`5b25fff`、`5c38975`）以及 train/eval 入口
+（`31e1c80`、`43b5921`、`961f399`）。Task 8 新增隔离的正式路径测试：独立 Learner
+进程与 Actor 通过真实本机 gRPC 序列化通信，真实 Gym/MotionBackend、时钟 freshness
+guard、回合状态机、SpaceMouse 输入门控、SiLRI policy/双 replay/更新和 checkpoint/resume
+贯通；四条带身份 transition 中有两条人工接管，恢复后物理状态仍为
+`WAITING_FOR_RESET`。过期时钟、HID 拔出、Learner 断开、命令超时、后继过期和证据写入
+失败均检查停止尝试及不自动重建后端。
+
+所有时钟快照、GDK reader、命令端口、HID 报告和上游上下文均为测试替身；测试断言
+未加载真实 GDK/HID 模块。命令端口只在测试内确认目标，不连接机器人或 `/dev/hidraw*`。
+初版 `tests/test_g2_real_training_integration.py` 正常训练/恢复与六故障矩阵共 `7 passed`。
+独立审查发现故障矩阵原先接受过宽泛异常，且断线注入绕过真实发送器；修正后由原始 gRPC
+transport 在 channel 关闭时传播失败，并校验故障拒绝码、已执行命令数、Actor transition
+数和 Learner replay 数。改后关键验证：Learner 断线 `1 passed`；时钟过期和后继相机过旧
+`2 passed`；其余四个故障行在同一矩阵运行中通过。未运行计划中的组合套件、仓库全套或已知
+worktree 子模块导入异常的 `tests/test_g2_processes.py`。
+Task 8 最终审查后修复提交 `d0fba8b` 补上五项重要缺陷中的四项：审批阈值绑定活动 freshness
+配置；RUNNING 中 SpaceMouse 任意过期轴帧（包括回中零值）立即停止；Actor/Eval 使用 cbreak
+读取单字节 Y/F 并在退出路径还原终端；Learner 单 worker 异步执行优化/写 checkpoint，transition
+ACK 不等待普通优化，后台失败关闭参数流；完整图像不再在 provenance records/checkpoint 中重复保留，
+改为有界缓存与带 digest/offset 的 content-addressed sidecar。修复后关键用例为 `10 passed in
+3.68s`，恢复一致性 + 隔离 Actor–Learner smoke 为 `7 passed in 14.23s`；静态范围复核关闭了阈值、
+HID、Y/F 和 RGB provenance 四项。Task 8A 进一步以有界 FIFO ingress queue 避免 checkpoint 深拷贝
+阻塞 RPC ACK；溢出或其他入口错误会先关闭参数流，排空所有已 ACK transition 并写恢复 checkpoint；
+`close()` 等待恢复完成，生产入口在关闭后检查保存/worker 错误并仍执行 gRPC 清理和终态证据记录。
+针对 ACK 锁竞争、溢出排空/恢复和关闭等待/失败传播的定点测试分别为 `6 passed`、`4 passed`、
+`2 passed`（后续轮次有部分重叠）；两轮独立窄复核均关闭对应 Important，无新 Critical/Important。
+未执行全仓测试或任何硬件操作。Task 8 软件路径审查完成，代码仍在功能 worktree、尚未提交；
+本结果不表示真实 GDK/SpaceMouse/PTP/硬件急停已验收，`motion_authorized=false`，真机训练仍禁止。
+隔离 worktree 的 `lerobot/` 为空，定向命令使用主仓库现有的 `../../lerobot/src` 和
+`../../.venv/bin/python`。本结果仅证明软件闭环与这些故障分支，不证明真实 GDK、
+SpaceMouse、PTP、硬件急停、物理停止距离或插入效果。`motion_authorized=false`，
+真实 GDK 继续 `allow_motion=False`；配置中的请求或测试的假许可不构成现场授权。
+
+连续真机训练仍须依序完成：(1) 三轮合格的真实 Actor/freshness 会话并人工批准六项阈值；
+(2) 空夹爪 XYZ/RPY 方向、尺度及工作空间 commissioning；(3) 软件停止、租约到期和
+硬件急停的时间/距离证据；(4) 一轮低速 reset、双键 chord、Y/F 与人工接管交接；
+(5) 小批量 checkpoint/resume 与固定 checkpoint eval。上述现场门槛完成前不执行
+真实运动或真机训练。
+
 ## 真实 Actor 只读审计工具（2026-09-21，尚待三轮现场验收）
 
 已增加可信本机 checkpoint 的 Actor-only 加载和 RTX 3090 同步计时；检查完整

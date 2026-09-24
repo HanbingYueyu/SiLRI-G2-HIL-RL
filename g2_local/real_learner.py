@@ -226,17 +226,24 @@ class RealLearnerRuntime:
         with self._lock:
             if self.stopped.is_set():
                 raise RuntimeError('Learner stopped')
-            rows = tuple(rows)
-            prepared = [(validate_real_transition(row, self.run_id, self.config_hash).value,
-                         _training_row(row), compact_record(row)) for row in rows]
+            return self._ingest_prepared(self._prepare_rows(rows))
+
+    def _prepare_rows(self, rows):
+        return tuple((validate_real_transition(row, self.run_id, self.config_hash).value,
+                      _training_row(row), compact_record(row)) for row in rows)
+
+    def _ingest_prepared(self, prepared, *, accepted_before_stop=False):
+        with self._lock:
+            if self.stopped.is_set() and not accepted_before_stop:
+                raise RuntimeError('Learner stopped')
             new = set()
             accepted = duplicates = 0
-            for row, (identity, training, record) in zip(rows, prepared):
+            for identity, training, record in prepared:
                 if identity in self.seen_transition_ids or identity in new:
                     duplicates += 1
                     continue
                 self.online_replay.add(**training)
-                if row['complementary_info']['is_intervention']:
+                if training['complementary_info']['is_intervention']:
                     self.human_replay.add(**training)
                 self.seen_transition_ids.add(identity)
                 new.add(identity)
@@ -457,8 +464,13 @@ class GrpcLearnerService(rpc.LearnerServiceServicer):
         self._work = threading.Event()
         self._idle = threading.Event()
         self._idle.set()
+        self._pending = deque()
+        self._pending_rows = 0
+        self._acknowledged_rows = 0
         self._worker = None
         self.failure = None
+        self.preservation_failure = None
+        self.recovery_checkpoint_path = None
         learner.publish = self.publish
 
     def publish(self, envelope):
@@ -469,15 +481,17 @@ class GrpcLearnerService(rpc.LearnerServiceServicer):
             self._condition.notify_all()
 
     def _stop(self):
-        self.learner.stopped.set()
-        self._work.set()
         with self._condition:
+            self.learner.stopped.set()
+            self._work.set()
             self._condition.notify_all()
 
     def close(self):
         self._stop()
         if self._worker is not None:
-            self._worker.join(self.learner.config.runtime.transport_timeout_s)
+            self._worker.join()
+        if self.preservation_failure is not None:
+            raise RuntimeError('Learner recovery checkpoint failed') from self.preservation_failure
 
     def _optimize(self):
         try:
@@ -486,11 +500,21 @@ class GrpcLearnerService(rpc.LearnerServiceServicer):
                 self._work.clear()
                 if self.learner.stopped.is_set():
                     return
-                # The interaction budget is the only pending-work counter.
-                # Discard per-update metrics here rather than accumulating a list.
-                while self.learner.snapshot_counts()['budget']:
+                # Accepted batches are applied by this worker in ingress order.
+                # Keep in-flight rows counted until replay mutation completes.
+                while True:
                     if self.learner.stopped.is_set():
                         return
+                    with self._condition:
+                        prepared = self._pending[0] if self._pending else None
+                    if prepared is not None:
+                        self.learner._ingest_prepared(prepared, accepted_before_stop=True)
+                        with self._condition:
+                            self._pending.popleft()
+                            self._pending_rows -= len(prepared)
+                        continue
+                    if not self.learner.snapshot_counts()['budget']:
+                        break
                     if self.learner.update_once() is None:
                         break
                 with self._condition:
@@ -500,6 +524,28 @@ class GrpcLearnerService(rpc.LearnerServiceServicer):
             self.failure = error
             self._stop()
         finally:
+            try:
+                # Liveness is already stopped. Preserve every ACKed batch before
+                # the worker exits, even when a later RPC caused that stop.
+                while True:
+                    with self._condition:
+                        prepared = self._pending[0] if self._pending else None
+                    if prepared is None:
+                        break
+                    self.learner._ingest_prepared(prepared, accepted_before_stop=True)
+                    with self._condition:
+                        self._pending.popleft()
+                        self._pending_rows -= len(prepared)
+                if self._acknowledged_rows:
+                    path = self.learner.checkpoint_path
+                    if path is None:
+                        path = Path(tempfile.mkdtemp(prefix='learner-recovery-')) / 'checkpoint.pt'
+                    self.learner.save_checkpoint(path)
+                    self.recovery_checkpoint_path = Path(path)
+            except BaseException as error:
+                self.preservation_failure = error
+                self.failure = error
+                self._stop()
             self._idle.set()
 
     def _schedule(self):
@@ -508,7 +554,7 @@ class GrpcLearnerService(rpc.LearnerServiceServicer):
             self._work.set()
             if self._worker is None:
                 self._worker = threading.Thread(target=self._optimize,
-                                                name='learner-optimizer', daemon=True)
+                                                name='learner-optimizer')
                 self._worker.start()
 
     def SendTransitions(self, request_iterator, context):  # noqa: N802
@@ -530,8 +576,16 @@ class GrpcLearnerService(rpc.LearnerServiceServicer):
             rows = bytes_to_transitions(bytes(data))
             if len(rows) > self.learner.config.runtime.queue_capacity:
                 raise ValueError('Transition ingress row bound exceeded')
-            self.learner.ingest(rows)
-            self._schedule()
+            prepared = self.learner._prepare_rows(rows)
+            with self._condition:
+                if self.learner.stopped.is_set():
+                    raise RuntimeError('Learner stopped')
+                if self._pending_rows + len(prepared) > self.learner.config.runtime.queue_capacity:
+                    raise ValueError('Transition ingress queue capacity exceeded')
+                self._pending.append(prepared)
+                self._pending_rows += len(prepared)
+                self._acknowledged_rows += len(prepared)
+                self._schedule()
         except BaseException:
             self._stop()
             raise

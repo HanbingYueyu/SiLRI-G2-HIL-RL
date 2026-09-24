@@ -186,12 +186,172 @@ def test_blocked_optimizer_does_not_block_subsequent_ingress_ack(monkeypatch):
     try:
         assert entered.wait(2.)
         assert ack.wait(.5), 'ingestion ACK waited for optimization'
-        assert learner.snapshot_counts()['accepted'] == 2
     finally:
         release.set()
         sender.join(5.)
+        assert service._idle.wait(5.)
         service.close()
     assert not errors
+    assert learner.snapshot_counts()['accepted'] == 2
+
+
+def test_checkpoint_snapshot_does_not_block_ingress_ack_and_rows_resume(monkeypatch, tmp_path):
+    from g2_local import real_learner
+    learner = _learner()
+    service = GrpcLearnerService(learner)
+    first = transitions_to_bytes([_row(0)])
+    second = transitions_to_bytes([_row(1, executed=.5)])
+    service.SendTransitions(send_bytes_in_chunks(first, pb.Transition), None)
+    assert service._idle.wait(5.)
+    entered, release, acknowledged = threading.Event(), threading.Event(), threading.Event()
+    original = real_learner.deepcopy
+    def blocked_snapshot(value):
+        entered.set()
+        assert release.wait(5.)
+        return original(value)
+    monkeypatch.setattr(real_learner, 'deepcopy', blocked_snapshot)
+    snapshot = threading.Thread(target=lambda: learner.save_checkpoint(tmp_path / 'blocked.pt'))
+    errors = []
+    def send():
+        try:
+            service.SendTransitions(send_bytes_in_chunks(second, pb.Transition), None)
+            acknowledged.set()
+        except BaseException as error:
+            errors.append(error)
+    sender = threading.Thread(target=send)
+    snapshot.start()
+    try:
+        assert entered.wait(2.)
+        sender.start()
+        assert acknowledged.wait(.25), 'ingress ACK waited for checkpoint snapshot'
+    finally:
+        release.set()
+        snapshot.join(5.)
+        sender.join(5.)
+    try:
+        assert not errors
+        assert not snapshot.is_alive()
+        assert (tmp_path / 'blocked.pt').exists()
+        assert service._idle.wait(5.)
+        assert learner.seen_transition_ids == {'run-1/ep-1/0', 'run-1/ep-1/1'}
+        assert learner.snapshot_counts()['online'] == 2
+        assert learner.online_replay.actions[:2, 0].tolist() == [0., .5]
+        checkpoint = learner.save_checkpoint(tmp_path / 'complete.pt')
+        restored = load_checkpoint(checkpoint, expected_run_id='run-1',
+                                   expected_config_hash='hash-1')
+        assert restored.seen_transition_ids == learner.seen_transition_ids
+        assert restored.snapshot_counts()['online'] == 2
+        assert restored.online_replay.actions[:2, 0].tolist() == [0., .5]
+    finally:
+        service.close()
+
+
+def test_ingress_queue_overflow_preserves_acknowledged_row(monkeypatch, tmp_path):
+    from g2_local import real_learner
+    runtime = replace(_config().runtime, queue_capacity=1)
+    checkpoint = tmp_path / 'checkpoint.pt'
+    learner = RealLearnerRuntime(config=_config(runtime=runtime), run_id='run-1',
+                                 checkpoint_path=checkpoint)
+    service = GrpcLearnerService(learner)
+    entered, release = threading.Event(), threading.Event()
+    original = real_learner.train_batch
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(5.)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(real_learner, 'train_batch', blocked)
+    try:
+        service.SendTransitions(send_bytes_in_chunks(
+            transitions_to_bytes([_row(0)]), pb.Transition), None)
+        assert entered.wait(2.)
+        service.SendTransitions(send_bytes_in_chunks(
+            transitions_to_bytes([_row(1, executed=.5)]), pb.Transition), None)
+        with pytest.raises(ValueError, match='queue capacity'):
+            service.SendTransitions(send_bytes_in_chunks(
+                transitions_to_bytes([_row(2)]), pb.Transition), None)
+        assert learner.stopped.is_set()
+        assert learner.seen_transition_ids == {'run-1/ep-1/0'}
+    finally:
+        release.set()
+    try:
+        assert service._idle.wait(5.)
+        assert learner.seen_transition_ids == {'run-1/ep-1/0', 'run-1/ep-1/1'}
+        assert learner.online_replay.actions[:2, 0].tolist() == [0., .5]
+        assert service.preservation_failure is None
+        assert service.recovery_checkpoint_path == checkpoint
+        restored = load_checkpoint(checkpoint, expected_run_id='run-1',
+                                   expected_config_hash='hash-1')
+        assert restored.seen_transition_ids == learner.seen_transition_ids
+        assert restored.online_replay.actions[:2, 0].tolist() == [0., .5]
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize('checkpoint_fails', [False, True])
+def test_close_waits_for_recovery_checkpoint_and_exposes_failure(monkeypatch, tmp_path,
+                                                                 checkpoint_fails):
+    from g2_local import real_learner
+    runtime = replace(_config().runtime, queue_capacity=1, transport_timeout_s=.05)
+    checkpoint = tmp_path / 'checkpoint.pt'
+    learner = RealLearnerRuntime(config=_config(runtime=runtime), run_id='run-1',
+                                 checkpoint_path=checkpoint)
+    service = GrpcLearnerService(learner)
+    optimizing, release_optimizer = threading.Event(), threading.Event()
+    checkpointing, release_checkpoint = threading.Event(), threading.Event()
+    original_train = real_learner.train_batch
+    original_save = learner.save_checkpoint
+    def blocked_train(*args, **kwargs):
+        optimizing.set()
+        assert release_optimizer.wait(5.)
+        return original_train(*args, **kwargs)
+    def blocked_save(path):
+        checkpointing.set()
+        assert release_checkpoint.wait(5.)
+        if checkpoint_fails:
+            raise OSError('recovery checkpoint failed')
+        return original_save(path)
+    monkeypatch.setattr(real_learner, 'train_batch', blocked_train)
+    monkeypatch.setattr(learner, 'save_checkpoint', blocked_save)
+    completed = threading.Event()
+    errors = []
+    def close():
+        try:
+            service.close()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            completed.set()
+    closer = threading.Thread(target=close)
+    try:
+        service.SendTransitions(send_bytes_in_chunks(
+            transitions_to_bytes([_row(0)]), pb.Transition), None)
+        assert optimizing.wait(2.)
+        service.SendTransitions(send_bytes_in_chunks(
+            transitions_to_bytes([_row(1, executed=.5)]), pb.Transition), None)
+        with pytest.raises(ValueError, match='queue capacity'):
+            service.SendTransitions(send_bytes_in_chunks(
+                transitions_to_bytes([_row(2)]), pb.Transition), None)
+        assert learner.stopped.is_set()
+        release_optimizer.set()
+        assert checkpointing.wait(3.)
+        closer.start()
+        assert not completed.wait(.15), 'close returned before recovery checkpoint finished'
+        release_checkpoint.set()
+        assert completed.wait(5.)
+        if checkpoint_fails:
+            assert len(errors) == 1
+            assert isinstance(errors[0], RuntimeError)
+            assert isinstance(service.preservation_failure, OSError)
+        else:
+            assert not errors
+            restored = load_checkpoint(checkpoint, expected_run_id='run-1',
+                                       expected_config_hash='hash-1')
+            assert restored.seen_transition_ids == {'run-1/ep-1/0', 'run-1/ep-1/1'}
+    finally:
+        release_optimizer.set()
+        release_checkpoint.set()
+        if closer.is_alive():
+            closer.join(5.)
 
 
 def test_background_optimizer_failure_closes_parameter_liveness(monkeypatch):

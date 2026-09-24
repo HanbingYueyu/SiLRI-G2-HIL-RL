@@ -319,13 +319,19 @@ def _run_learner(args, loaded, evidence):
                        checkpoint_path=str(learner.checkpoint_path))
         while not learner.stopped.wait(.2):
             pass
-        if service.failure is not None:
-            raise RuntimeError('Background learner optimization failed') from service.failure
-        return 0
     finally:
-        service.close()
-        server.stop(grace=loaded.runtime.transport_timeout_s).wait()
-        evidence.event('learner_stopped', **learner.snapshot_counts())
+        try:
+            service.close()
+        finally:
+            try:
+                server.stop(grace=loaded.runtime.transport_timeout_s).wait()
+            finally:
+                evidence.event('learner_stopped', **learner.snapshot_counts())
+    if service.preservation_failure is not None:
+        raise RuntimeError('Learner recovery checkpoint failed') from service.preservation_failure
+    if service.failure is not None:
+        raise RuntimeError('Background learner optimization failed') from service.failure
+    return 0
 
 
 def record_actor_failure(runtime, transport, evidence, role, error):
