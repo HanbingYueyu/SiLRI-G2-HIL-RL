@@ -1,0 +1,671 @@
+#!/usr/bin/env python
+
+# Copyright 2024 The HuggingFace Inc. team.
+# All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
+from collections.abc import Callable
+from dataclasses import asdict
+from typing import Literal
+
+import einops
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F  # noqa: N812
+from torch import Tensor
+from torch.distributions import MultivariateNormal, TanhTransform, Transform, TransformedDistribution
+import os
+import cv2
+from lerobot.policies.normalize import NormalizeBuffer
+from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.utils import get_device_from_parameters
+from lerobot.policies.sac.modeling_sac import SACObservationEncoder, MLP
+from lerobot.policies.silri_dualarm.modeling_silri_dualarm import DiscreteActorDualArm
+from lerobot.policies.hgdagger_dualarm.configuration_hgdagger_dualarm import HGDaggerDualArmConfig
+
+
+class HGDaggerDualArmPolicy(
+    PreTrainedPolicy,
+):
+    config_class = HGDaggerDualArmConfig
+    name = "hgdagger_dualarm"
+
+    def __init__(
+        self,
+        config: HGDaggerDualArmConfig | None = None,
+        dataset_stats: dict[str, dict[str, Tensor]] | None = None,
+    ):
+        super().__init__(config)
+        config.validate_features()
+        self.config = config
+
+        dataset_stats=self.config.dataset_stats
+
+        self.continuous_action_dim = config.output_features["action"].shape[0]
+        
+        self._init_normalization(dataset_stats)
+        self._init_encoders()  
+        self._init_actor(self.continuous_action_dim)
+
+    def get_optim_params(self) -> dict:
+        """Collect the trainable parameters of each module, used to build the optimizers."""
+        optim_params = {
+            "actor": [
+                p
+                for n, p in self.actor.named_parameters()
+                # With a shared encoder the actor does not optimize the encoder parameters (avoids gradient conflicts)
+                if not n.startswith("encoder") or not self.shared_encoder
+            ],
+        }
+        return optim_params
+    
+    def get_optimizer_and_scheduler(self):
+        if self.config.num_discrete_actions is not None:
+            optim_dict = {
+                "actor": torch.optim.Adam(list(self.actor.parameters()) + list(self.discrete_actor.parameters()), lr=self.config.actor_lr),
+            }
+        else:
+            optim_dict = {
+                "actor": torch.optim.Adam(self.actor.parameters(), lr=self.config.actor_lr),
+            }
+        return optim_dict, None
+
+    def reset(self):
+        """Reset the policy"""
+        pass
+    
+
+    @torch.no_grad()
+    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+        """Predict a chunk of actions given environment observations."""
+        raise NotImplementedError("SACPolicy does not support action chunking. It returns single actions!")
+
+    @torch.no_grad()
+    def select_action(self, batch: dict[str, Tensor], policy_noise=None) -> Tensor:
+        """Select action for inference/evaluation"""
+        """
+        Select an action during inference / evaluation.
+        Args:
+            batch: observation dict (images (left, wrist) and state)
+        Returns:
+            The final action tensor (continuous action concatenated with the optional discrete action)
+        """
+        observations_features = None
+        
+        # With a shared encoder and image inputs, cache the image features (avoids re-encoding, faster)
+        if self.shared_encoder and self.actor.encoder.has_images:
+            # Cache and normalize image features
+
+            observations_features = self.actor.encoder.get_cached_image_features(batch, normalize=True)
+        # The actor produces the base action for the current observation
+        actions, *_ = self.actor(batch, observations_features)
+
+
+        epsilon = 1e-6
+        actions = torch.clamp(actions, -1+epsilon, 1-epsilon)
+
+        # With discrete actions, the discrete critic scores each action and the argmax is taken
+        # todo11
+        if self.config.num_discrete_actions is not None:
+            # discrete_action_value = self.discrete_critic(batch, observations_features)
+            discrete_action_value = self.discrete_actor(batch, observations_features)
+            discrete_action = torch.argmax(discrete_action_value, dim=-1, keepdim=True)
+            actions = actions.reshape(-1, 2, self.continuous_action_dim//2)
+            actions = torch.cat([actions, discrete_action], dim=-1)
+            actions = actions.reshape(-1, self.continuous_action_dim+2)
+
+        return actions, {}
+
+    def critic_forward(
+        self,
+        observations: dict[str, Tensor],
+        actions: Tensor,
+        use_target: bool = False,
+        observation_features: Tensor | None = None,
+    ) -> Tensor:
+        """Forward pass through a critic network ensemble
+
+        Args:
+            observations: Dictionary of observations
+            actions: Action tensor
+            use_target: If True, use target critics, otherwise use ensemble critics
+
+        Returns:
+            Tensor of Q-values from all critics
+        """
+
+        critics = self.critic_target if use_target else self.critic_ensemble
+        q_values = critics(observations, actions, observation_features)
+        return q_values
+    
+    def discrete_critic_forward(
+        self, observations, use_target=False, observation_features=None
+    ) -> torch.Tensor:
+        """Forward pass through a discrete critic network
+
+        Args:
+            observations: Dictionary of observations
+            use_target: If True, use target critics, otherwise use ensemble critics
+            observation_features: Optional pre-computed observation features to avoid recomputing encoder output
+
+        Returns:
+            Tensor of Q-values from the discrete critic network
+        """
+        discrete_critic = self.discrete_critic_target if use_target else self.discrete_critic
+        q_values = discrete_critic(observations, observation_features)
+        return q_values
+
+    def forward(
+        self,
+        batch: dict[str, Tensor | dict[str, Tensor]],
+        model: Literal["actor"] = "actor",
+    ) -> dict[str, Tensor]:
+        """Compute the loss for the given model
+
+        Args:
+            batch: Dictionary containing:
+                - action: Action tensor
+                - reward: Reward tensor
+                - state: Observations tensor dict
+                - next_state: Next observations tensor dict
+                - done: Done mask tensor
+                - observation_feature: Optional pre-computed observation features
+                - next_observation_feature: Optional pre-computed next observation features
+            model: Which model to compute the loss for ("actor")
+
+        Returns:
+            The computed loss tensor
+        """
+        # Extract common components from batch
+        actions: Tensor = batch["action"]
+        observations: dict[str, Tensor] = batch["state"]
+        observation_features: Tensor = batch.get("observation_feature")
+
+        if model == "actor":
+            is_intervention = batch.get("is_intervention")
+            loss_actor_dict = self.compute_loss_actor(
+                    observations=observations,
+                    observation_features=observation_features,
+                    is_intervention=is_intervention,
+                    old_actions=actions,
+                )
+
+            loss_actor_dict["continous_actor_loss"] = loss_actor_dict["loss_actor"].item()
+            if self.config.num_discrete_actions is not None:
+                loss_discrete_actor = self.compute_loss_discrete_actor(
+                    observations=observations,
+                    observation_features=observation_features,
+                    is_intervention=is_intervention,
+                    old_actions=actions,
+                )
+                loss_actor_dict["discrete_actor_loss"] = loss_discrete_actor["loss_actor"].item()
+                loss_actor_dict["loss_actor"] = loss_actor_dict["loss_actor"] + loss_discrete_actor["loss_actor"]
+            return loss_actor_dict
+
+        raise ValueError(f"Unknown model type: {model}")
+
+
+    def update_target_networks(self):
+        pass
+
+
+
+
+
+    # todo1:compute_loss_discrete_actor nll
+    def compute_loss_discrete_actor(
+        self,
+        observations,
+        observation_features: Tensor | None = None,
+        is_intervention: Tensor | None = None,
+        old_actions: Tensor | None = None
+    ):
+        # NOTE: We only want to keep the discrete action part
+        # In the buffer we have the full action space (continuous + discrete)
+        # We need to split them before concatenating them in the critic forward
+        # ============= todo: add bc loss to discrete critic =============
+        N = old_actions.shape[0]
+        old_actions = old_actions.reshape(N, 2, -1)
+        actions_discrete = old_actions[:, :, -1:]
+        actions_discrete = actions_discrete.reshape(N, -1)
+
+        actions_discrete = torch.round(actions_discrete)
+        actions_discrete = actions_discrete.long()
+        actions_discrete = actions_discrete.squeeze(-1)  # (batch_size,) 1-D tensor
+
+        actions_pi = self.discrete_actor(observations, observation_features)
+        actions_pi = actions_pi.permute(0, 2, 1)
+        discrete_loss = F.cross_entropy(actions_pi, actions_discrete.long(), reduction="none")
+        discrete_loss = discrete_loss.sum(dim=-1).mean()
+        return {
+            "loss_actor": discrete_loss
+        }
+         
+ 
+    """
+    hg_dagger is imitation learning, so the actor loss is the BC loss.
+    A stochastic policy no longer uses an MSE loss.
+    """
+    def compute_loss_actor(
+        self,
+        observations,
+        observation_features: Tensor | None = None,
+        is_intervention: Tensor | None = None,
+        old_actions: Tensor | None = None,
+    ) -> Tensor:
+        N = old_actions.shape[0]
+        old_actions = old_actions.reshape(N, 2, -1)
+        old_continous_actions = old_actions[:, :, 0:self.continuous_action_dim // 2]
+        old_continous_actions = old_continous_actions.reshape(N, -1)
+        
+        log_probs = self.actor.get_log_probs(observations, old_continous_actions, observation_features)
+        actor_loss = - log_probs.mean()
+        return {
+            "loss_actor": actor_loss,
+        }
+    
+
+    def _init_normalization(self, dataset_stats):
+        """Initialize input/output normalization modules."""
+        self.normalize_inputs = nn.Identity()
+        self.normalize_targets = nn.Identity()
+        if self.config.dataset_stats is not None:
+            params = _convert_normalization_params_to_tensor(self.config.dataset_stats)
+            self.normalize_inputs = NormalizeBuffer(
+                self.config.input_features, self.config.normalization_mapping, params
+            )
+            stats = dataset_stats or params
+            self.normalize_targets = NormalizeBuffer(
+                self.config.output_features, self.config.normalization_mapping, stats
+            )
+
+    def _init_encoders(self):
+        """Initialize shared or separate encoders for actor and critic."""
+        self.shared_encoder = self.config.shared_encoder
+        self.encoder_critic = SACObservationEncoder(self.config, self.normalize_inputs)
+        self.encoder_actor = (
+            self.encoder_critic
+            if self.shared_encoder
+            else SACObservationEncoder(self.config, self.normalize_inputs)
+        )
+
+
+    # todo3: initialize discrete_actor
+    def _init_discrete_actor(self):
+        """Build discrete discrete critic ensemble and target networks."""
+        self.discrete_actor = DiscreteActorDualArm(
+            encoder=self.encoder_actor,
+            input_dim=self.encoder_actor.output_dim,
+            output_dim=self.config.num_discrete_actions,
+            **asdict(self.config.discrete_actor_network_kwargs),
+        )
+
+
+
+    def _init_actor(self, continuous_action_dim):
+        """Initialize policy actor network and default target entropy."""
+        # NOTE: The actor select only the continuous action part
+        self.actor = Policy(
+            encoder=self.encoder_actor,
+            network=MLP(input_dim=self.encoder_actor.output_dim, **asdict(self.config.actor_network_kwargs)),
+            action_dim=continuous_action_dim,
+            encoder_is_shared=self.shared_encoder,
+            # fixed_std=torch.tensor([5e-3]).to("cuda:0"),
+            **asdict(self.config.policy_kwargs),
+        )
+        if self.config.num_discrete_actions is not None:
+            self._init_discrete_actor()
+        
+
+        
+
+class Policy(nn.Module):
+    def __init__(
+        self,
+        encoder: SACObservationEncoder,
+        network: nn.Module,
+        action_dim: int,
+        std_min: float = 1e-5,
+        std_max: float = 10,
+        # std_min: float = -5,
+        # std_max: float = 2,
+        fixed_std: torch.Tensor | None = None,
+        init_final: float | None = None,
+        use_tanh_squash: bool = False,
+        encoder_is_shared: bool = False,
+        model_name: str = "MultivariateNormalDiag",
+    ):
+        super().__init__()
+        self.encoder: SACObservationEncoder = encoder
+        self.network = network
+        self.action_dim = action_dim
+        self.std_min = std_min
+        self.std_max = std_max
+        self.fixed_std = fixed_std
+        self.use_tanh_squash = use_tanh_squash
+        self.encoder_is_shared = encoder_is_shared
+
+        # print('std_min:', std_min, 'std_max:', std_max)
+        # input("Press Enter to continue...")
+
+        # Find the last Linear layer's output dimension
+        for layer in reversed(network.net):
+            if isinstance(layer, nn.Linear):
+                out_features = layer.out_features
+                break
+        # Mean layer
+        self.mean_layer = nn.Linear(out_features, action_dim)
+        if init_final is not None:
+            nn.init.uniform_(self.mean_layer.weight, -init_final, init_final)
+            nn.init.uniform_(self.mean_layer.bias, -init_final, init_final)
+        else:
+            orthogonal_init()(self.mean_layer.weight)
+        
+        self.model_name = model_name
+        # Standard deviation layer or parameter
+        if fixed_std is None:
+            self.std_layer = nn.Linear(out_features, action_dim)
+            if init_final is not None:
+                nn.init.uniform_(self.std_layer.weight, -init_final, init_final)
+                nn.init.uniform_(self.std_layer.bias, -init_final, init_final)
+            else:
+                orthogonal_init()(self.std_layer.weight)
+
+    def forward(
+        self,
+        observations: torch.Tensor,
+        observation_features: torch.Tensor | None = None,
+        n=1
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # We detach the encoder if it is shared to avoid backprop through it
+        # This is important to avoid the encoder to be updated through the policy
+        # Run the observation through the encoder to extract features
+        # print("observations.observation.images.right:", observations.observation.images.right.shape)
+        obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
+
+        # Get network outputs
+        # Network output and mean
+        outputs = self.network(obs_enc)
+
+        means = self.mean_layer(outputs)
+
+        """
+        means are squashed with tanh
+        """
+        means = torch.tanh(means)
+
+        # Compute standard deviations
+        # Standard deviation
+
+        if self.fixed_std is None:
+            log_std = self.std_layer(outputs)
+    
+            std = torch.exp(log_std)  # Match JAX "exp"
+        
+            std = torch.clamp(std, self.std_min, self.std_max)  # Match JAX default clip
+     
+        else:
+            std = self.fixed_std.expand_as(means)
+        
+
+        # Build transformed distribution
+        # Build a multivariate normal with diagonal covariance
+        # dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
+
+        """
+        Uses a multivariate normal distribution
+        """
+        dist = MultivariateNormalDiag(loc=means, scale_diag=std)
+
+        # Sample actions (reparameterized)
+        # Sample actions
+        if n == 1:
+            actions = dist.rsample()
+            """
+            Clip the actions
+            """
+            log_probs = dist.log_prob(actions) # torch.Size([batch_size, action_dim])
+        else:
+            """
+            Draw multiple samples
+            """
+            actions = dist.rsample(sample_shape=(n,)) # torch.Size([n, batch_size, action_dim])
+            # reshape -> [B, action_dim]
+            # actions=actions.reshape(-1, actions.shape[-1])
+            # print("actions shape after reshaping: ", actions.shape)
+
+            # Compute the log-probability of each sample
+            log_probs = torch.stack([dist.log_prob(actions[i]) for i in range(n)])
+            log_probs = dist.log_prob(actions) # torch.Size([n*batch_size, action_dim])
+            
+            # reshape -> [n, batch_size, action_dim]
+            # log_probs = log_probs.reshape(n, -1, log_probs.shape[-1])
+       
+     
+    
+        return actions, log_probs, means
+
+    def get_dist(
+        self,
+        observations: torch.Tensor,
+        observation_features: torch.Tensor | None = None,
+    ):
+        # We detach the encoder if it is shared to avoid backprop through it
+        # This is important to avoid the encoder to be updated through the policy
+        # Run the observation through the encoder to extract features
+        obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
+      
+        # Get network outputs
+        # Network output and mean
+        outputs = self.network(obs_enc)
+      
+        means = self.mean_layer(outputs)
+
+        """
+        means are squashed with tanh
+        """
+        means = torch.tanh(means)
+
+        # Compute standard deviations
+        # Standard deviation
+    
+        if self.fixed_std is None:
+            log_std = self.std_layer(outputs)
+            std = torch.exp(log_std)  # Match JAX "exp"
+            std = torch.clamp(std, self.std_min, self.std_max)  # Match JAX default clip
+        else:
+            std = self.fixed_std.expand_as(means)
+
+        # Build transformed distribution
+        # Build a multivariate normal with diagonal covariance
+        # dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
+        """
+        Uses a multivariate normal distribution
+        """
+        dist = MultivariateNormalDiag(loc=means, scale_diag=std)
+
+        return dist, means, std
+
+    """
+    add 2: compute the log-probability of the given state-action pair
+    """
+    def get_log_probs(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        observation_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # We detach the encoder if it is shared to avoid backprop through it
+        # This is important to avoid the encoder to be updated through the policy
+        # Run the observation through the encoder to extract features
+        obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
+      
+        # Get network outputs
+        # Network output and mean
+        outputs = self.network(obs_enc)
+      
+        means = self.mean_layer(outputs)
+
+        """
+        means are squashed with tanh
+        """
+        means = torch.tanh(means)
+
+        # Compute standard deviations
+        # Standard deviation
+    
+        if self.fixed_std is None:
+            log_std = self.std_layer(outputs)
+            std = torch.exp(log_std)  # Match JAX "exp"
+            std = torch.clamp(std, self.std_min, self.std_max)  # Match JAX default clip
+        else:
+            std = self.fixed_std.expand_as(means)
+
+        # Build transformed distribution
+        # Build a multivariate normal with diagonal covariance
+        # dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
+        """
+        Uses a multivariate normal distribution
+        """
+        dist = MultivariateNormalDiag(loc=means, scale_diag=std)
+
+        # Clip the actions to stay consistent with forward()
+        # epsilon = 1e-6
+        # actions = torch.clamp(actions, -1+epsilon, 1-epsilon)
+        
+        # Compute log_probs
+        # Compute the log-probability of the sampled actions
+        if actions.dim() == 2:  # single action: [batch_size, action_dim]
+            log_probs = dist.log_prob(actions)
+        elif actions.dim() == 3:  # multiple actions: [n, batch_size, action_dim]
+            # Compute the log-probability of each sample
+            n = actions.shape[0]
+            log_probs = torch.stack([dist.log_prob(actions[i]) for i in range(n)])
+           
+            # actions=actions.reshape(-1, actions.shape[-1])
+            # print("actions shape after reshaping: ", actions.shape)
+            # log_probs = dist.log_prob(actions) # torch.Size([n*batch_size, action_dim])
+            # log_probs = log_probs.reshape(n, -1, log_probs.shape[-1])
+        
+        else:
+            raise ValueError(f"Unexpected actions dimension: {actions.dim()}")
+       
+        if log_probs.abs().mean() > 100:
+            print('actions:', actions)
+            print('means:', means)
+            print('log_probs:', log_probs)
+        return log_probs
+    
+    def print_params(self):
+        print('---------------- print params ----------------')
+        for n, p in self.named_parameters():
+            print(n, p.mean()) 
+
+    def entropy(self, observations: torch.Tensor, observation_features: torch.Tensor | None = None):
+        
+
+        obs_enc = self.encoder(observations, cache=observation_features, detach=self.encoder_is_shared)
+      
+        # Get network outputs
+        # Network output and mean
+        outputs = self.network(obs_enc)
+      
+        means = self.mean_layer(outputs)
+
+        """
+        means are squashed with tanh
+        """
+        means = torch.tanh(means)
+
+        # Compute standard deviations
+        # Standard deviation    
+        if self.fixed_std is None:
+            log_std = self.std_layer(outputs)
+            std = torch.exp(log_std)  # Match JAX "exp"
+            std = torch.clamp(std, self.std_min, self.std_max)  # Match JAX default clip
+        else:
+            std = self.fixed_std.expand_as(means)
+        
+
+        # Build transformed distribution
+        # Build a multivariate normal with diagonal covariance
+        # dist = TanhMultivariateNormalDiag(loc=means, scale_diag=std)
+
+        """
+        Uses a multivariate normal distribution
+        """
+
+        dist = MultivariateNormalDiag(loc=means, scale_diag=std)
+
+        entropy = dist.entropy()
+
+
+        return entropy
+
+    def get_features(self, observations: torch.Tensor) -> torch.Tensor:
+        """Get encoded features from observations"""
+        device = get_device_from_parameters(self)
+        observations = observations.to(device)
+        if self.encoder is not None:
+            with torch.inference_mode():
+                return self.encoder(observations)
+        return observations
+
+
+
+
+def orthogonal_init():
+    return lambda x: torch.nn.init.orthogonal_(x, gain=1.0)
+
+
+
+
+def _convert_normalization_params_to_tensor(normalization_params: dict) -> dict:
+    converted_params = {}
+    for outer_key, inner_dict in normalization_params.items():
+        converted_params[outer_key] = {}
+        for key, value in inner_dict.items():
+            converted_params[outer_key][key] = torch.tensor(value)
+            if "image" in outer_key:
+                converted_params[outer_key][key] = converted_params[outer_key][key].view(3, 1, 1)
+
+    return converted_params
+
+
+
+class MultivariateNormalDiag(MultivariateNormal):
+    def __init__(self, loc, scale_diag):
+        # Create diagonal covariance matrix from scale_diag
+        covariance_matrix = torch.diag_embed(scale_diag)
+        # Initialize MultivariateNormal with loc and covariance_matrix
+        super().__init__(loc, covariance_matrix)
+        
+
+    def mode(self):
+        return self.mean
+
+    @property
+    def stddev(self):
+        # Access parent class stddev property via MultivariateNormal
+        # stddev is the square root of the diagonal of the covariance matrix
+        return torch.sqrt(torch.diagonal(self.covariance_matrix, dim1=-2, dim2=-1))
+
+    def entropy(self):
+        # Use parent class entropy method
+        return super().entropy()
+
+
+

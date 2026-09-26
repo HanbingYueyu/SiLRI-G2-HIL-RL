@@ -12,6 +12,9 @@ save_frames/
 save_frames
 scripts/
 scripts
+# Keep vendored LeRobot entrypoints trackable despite the generic scripts rule.
+!lerobot/src/lerobot/scripts/
+!lerobot/src/lerobot/scripts/**
 .DS_Store
 */.DS_Store
 expert/
@@ -44,3 +47,37 @@ python*.log.*
 *.swo
 /core
 /core.*
+
+# Shared local artifacts (also used by vendored LeRobot).
+# Keep dependency locks, source/configuration files and licenses versioned.
+.env
+.env.*
+!.env.example
+!.env.template
+env/
+venv/
+__pypackages__/
+node_modules/
+.cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+.tox/
+.nox/
+.hypothesis/
+.ipynb_checkpoints/
+.idea/
+.vscode/
+logs/
+tmp/
+*.log
+wandb/
+data/
+sdist/
+wheels/
+.eggs/
+pip-wheel-metadata/
+coverage.xml
+nosetests.xml
+Thumbs.db
