@@ -220,7 +220,11 @@ class ObservationFreshnessGuard:
             raise _Rejected('mapping_invalid', str(error)) from error
         return snapshot, now
 
-    def __call__(self, obs, info, after=None) -> bool:
+    def revalidate(self, obs, info):
+        """Recheck an already accepted policy input's age without source progress."""
+        return self.__call__(obs, info, check_progress=False)
+
+    def __call__(self, obs, info, after=None, *, check_progress=True) -> bool:
         with self._lock:
             diagnostics = {}
             try:
@@ -274,7 +278,7 @@ class ObservationFreshnessGuard:
                     raise _Rejected('camera_skew', 'Worst-case camera separation exceeds limit')
                 for source in SOURCES:
                     previous = self._previous_source_ns.get(source)
-                    if previous is not None and stamps[source] <= previous:
+                    if check_progress and previous is not None and stamps[source] <= previous:
                         code = 'source_frozen:' if stamps[source] == previous else 'source_reversed:'
                         raise _Rejected(code+source, f'{source} timestamp did not strictly advance')
                 if sent_ns is not None:
@@ -294,7 +298,8 @@ class ObservationFreshnessGuard:
             except (KeyError, TypeError, ValueError, OverflowError) as error:
                 self._last_decision = FreshnessDecision('invalid_evidence', str(error), **diagnostics)
                 return False
-            self._previous_source_ns = stamps
+            if check_progress:
+                self._previous_source_ns = stamps
             self._snapshot = snapshot
             self._last_decision = decision
             return True

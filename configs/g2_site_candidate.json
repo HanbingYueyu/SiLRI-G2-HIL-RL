@@ -4,7 +4,7 @@
   "requested_motion": false,
   "task": {
     "control_hz": 10,
-    "max_episode_steps": 80,
+    "max_episode_steps": 200,
     "fix_gripper": true,
     "action_scale": [
       0.0015,
@@ -23,6 +23,15 @@
     "ee_rpy_range_rad": 0.008726646259971648
   },
   "motion": {
+    "auto_reset": {
+      "enabled": true,
+      "lift_m": 0.05,
+      "linear_speed_m_s": 0.01,
+      "angular_speed_rad_s": 0.2,
+      "position_tolerance_m": 0.001,
+      "rotation_tolerance_rad": 0.01,
+      "timeout_s": 30.0
+    },
     "local_envelope": {
       "translation_low_m": [-0.02, -0.035, -0.09],
       "translation_high_m": [0.07, 0.02, 0.02],
@@ -103,7 +112,10 @@
     "actor_lr": 0.0003,
     "critic_lr": 0.0003,
     "expert_lr": 0.0003,
-    "lagrange_lr": 0.0003,
+    "lagrange_lr": 0.000003,
+    "beta_pretrain_steps": 500,
+    "beta_update_interval": 50,
+    "beta_update_steps": 50,
     "target_update_interval": 1,
     "publish_interval": 1,
     "checkpoint_interval": 1000

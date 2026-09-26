@@ -50,6 +50,21 @@ def running_episode():
     return machine
 
 
+def test_terminal_before_send_restores_previous_completed_token():
+    from g2_local.real_episode import TerminalBeforeCommand
+    machine = running_episode()
+    first = machine.begin_step()
+    machine.outcome(valid_successor())
+    machine.begin_step()
+    machine.keys.source.keys.append('y')
+    with pytest.raises(TerminalBeforeCommand):
+        machine.before_command()
+    assert machine.active_step_token is None
+    assert machine.completed_step_token == first
+    machine.seal_episode(first)
+    assert not machine.running
+
+
 def valid_successor():
     return dict(state=np.array((0., 0., 0., 0., 0., 0., 1.), dtype=np.float32),
                 left_wrist=np.zeros((2, 2, 3), dtype=np.uint8),

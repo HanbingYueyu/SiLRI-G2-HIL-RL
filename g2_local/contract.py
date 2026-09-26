@@ -31,6 +31,7 @@ class EpisodeContext:
     visual_reset_monotonic_ns: int | None = None
     visual_confidence: float | None = None
     upstream_frame_id: str | None = None
+    automatic_reset_monotonic_ns: int | None = None
 
     def __post_init__(self):
         if not self.episode_id or not self.approach_source or not self.grasp_description:
@@ -46,6 +47,12 @@ class EpisodeContext:
                     not math.isfinite(self.visual_confidence) or
                     not 0 <= self.visual_confidence <= 1):
                 raise ValueError('visual_confidence must be finite in [0,1]')
+        if self.automatic_reset_monotonic_ns is not None:
+            if (type(self.automatic_reset_monotonic_ns) is not int or
+                    self.automatic_reset_monotonic_ns < 0 or
+                    self.approach_source != 'automatic_lift_return' or
+                    self.visual_reset_monotonic_ns is not None):
+                raise ValueError('Invalid automatic reset provenance')
         if (self.upstream_frame_id is not None and
                 (type(self.upstream_frame_id) is not str or
                  not 0 < len(self.upstream_frame_id) <= 128 or
@@ -59,7 +66,7 @@ class EpisodeContext:
         allowed = {'episode_id', 'target_offset_m', 'approach_source',
                    'grasp_description', 'ee_reset_offset',
                    'visual_reset_monotonic_ns', 'visual_confidence',
-                   'upstream_frame_id'}
+                   'upstream_frame_id', 'automatic_reset_monotonic_ns'}
         if set(payload) - allowed:
             raise ValueError('Unknown episode context field')
         try:

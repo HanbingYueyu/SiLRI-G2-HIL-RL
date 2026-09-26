@@ -18,6 +18,12 @@ class StepToken:
     nonce: str
 
 
+class TerminalBeforeCommand(RuntimeError):
+    def __init__(self, label, read_ns):
+        super().__init__('Terminal input before command submission')
+        self.label, self.read_ns = label, read_ns
+
+
 class RealEpisodeCoordinator:
     def __init__(self, intervention, keys, task, *, context_max_age_s,
                  clock_ns=time.monotonic_ns, left_button=0, right_button=1):
@@ -39,6 +45,8 @@ class RealEpisodeCoordinator:
         self.success_reward = task.success_reward
         self.failure_reward = task.failure_reward
         self.step_reward = task.step_reward
+        self.last_terminal_read_ns = None
+        self._previous_completed_token = None
 
     @property
     def running(self):
@@ -55,7 +63,9 @@ class RealEpisodeCoordinator:
     def _validate_context(self, context):
         if not isinstance(context, EpisodeContext):
             raise TypeError('EpisodeContext required')
-        stamp = context.visual_reset_monotonic_ns
+        stamp = (context.automatic_reset_monotonic_ns
+                 if context.automatic_reset_monotonic_ns is not None
+                 else context.visual_reset_monotonic_ns)
         if stamp is not None:
             age = self.clock_ns() - stamp
             if age < 0 or age > self.context_max_age_s * 1_000_000_000:
@@ -91,9 +101,11 @@ class RealEpisodeCoordinator:
         if not self.chord.update(self.intervention.last_frame):
             return False
         self._validate_context(self.context)
-        if self.context.visual_reset_monotonic_ns is None:
+        if (self.context.visual_reset_monotonic_ns is None and
+                self.context.automatic_reset_monotonic_ns is None):
             raise ValueError('stale reset context: missing visual reset time')
         self.keys.drain()
+        self.last_terminal_read_ns = None
         self._step_id = 0
         self._pending_terminal = None
         self.chord.reset()
@@ -108,9 +120,23 @@ class RealEpisodeCoordinator:
         if getattr(self.intervention, 'fault', None) is not None or self.intervention.last_frame is None:
             self._abort()
             raise RuntimeError('Input fault during episode')
+        self._previous_completed_token = self._completed_token
         self._token = StepToken(self.context.episode_id, self._step_id, uuid.uuid4().hex)
         self._completed_token = None
         return self._token
+
+    def before_command(self):
+        """Last terminal poll before submit; cancel the new, not-yet-sent step."""
+        label = self.keys.poll()
+        if label is None:
+            return
+        read_ns = self.clock_ns()
+        if self._previous_completed_token is None:
+            self._abort()
+            raise RuntimeError('Terminal input before first action; no sample to label')
+        self._completed_token = self._previous_completed_token
+        self._token = None
+        raise TerminalBeforeCommand(label, read_ns)
 
     def request_terminal(self, label):
         if not self.running:
@@ -184,6 +210,7 @@ class RealEpisodeCoordinator:
         try:
             label = self.keys.poll()
             if label is not None:
+                self.last_terminal_read_ns = self.clock_ns()
                 self.request_terminal(label)
             return self._finish_step(token)
         except Exception:

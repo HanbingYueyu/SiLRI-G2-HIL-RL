@@ -251,6 +251,10 @@ def load_eval_checkpoint(path, *, run_id, config_hash):
             tuple(payload.get('camera_keys', ())) != CAMERA_KEYS or
             payload.get('image_size') != 128 or payload.get('action_size') != 6):
         raise ValueError('Checkpoint identity or camera/action contract mismatch')
+    from .code_identity import algorithm_identity
+    if (type(payload.get('runtime')) is not dict or
+            payload.get('algorithm_identity') != algorithm_identity(payload['runtime']['device'])):
+        raise ValueError('Algorithm code/version identity mismatch; explicit migration required')
     version = payload.get('published_version')
     state = payload.get('published_actor_state')
     if (type(version) is not int or version < 0 or
@@ -331,8 +335,12 @@ def _run_learner(args, loaded, evidence):
     if getattr(args, 'demonstrations', ()):
         from .demonstrations import import_demonstrations
         result = import_demonstrations(learner, args.demonstrations, evidence=evidence)
+        learner.pretrain_behavior()
         learner.save_checkpoint(learner.checkpoint_path)
         evidence.event('demo_import_completed', **result)
+        evidence.event('beta_pretrained', steps=learner.beta_pretrain_completed,
+                       last_loss=learner.beta_last_loss,
+                       human_samples=learner.human_transitions_total)
     service = GrpcLearnerService(learner)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     rpc.add_LearnerServiceServicer_to_server(service, server)

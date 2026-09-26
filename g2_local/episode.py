@@ -67,7 +67,10 @@ class EpisodeRunner:
             raise RuntimeError('Reset required before stepping')
         try:
             decision = select_action(policy, human_active=human_active, human=human)
-            result = self.backend.execute(decision.selected_action)
+            execute_from = getattr(self.backend, 'execute_from', None)
+            result = (execute_from(decision.selected_action, self.observation)
+                      if execute_from is not None else
+                      self.backend.execute(decision.selected_action))
             truncated = self.steps + 1 >= self.max_steps and not result.terminated
             row = transition(self.observation, result.observation, decision,
                              result.executed_action, reward=result.reward,

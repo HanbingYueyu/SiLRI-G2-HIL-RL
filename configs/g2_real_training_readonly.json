@@ -54,8 +54,8 @@
     "report_max_age_s": 0.25
   },
   "optimization": {
-    "online_capacity": 100000,
-    "human_capacity": 50000,
+    "online_capacity": 2048,
+    "human_capacity": 1024,
     "min_online_transitions": 256,
     "online_batch_size": 128,
     "human_batch_size": 128,
@@ -63,7 +63,10 @@
     "actor_lr": 0.0003,
     "critic_lr": 0.0003,
     "expert_lr": 0.0003,
-    "lagrange_lr": 0.0003,
+    "lagrange_lr": 0.000003,
+    "beta_pretrain_steps": 500,
+    "beta_update_interval": 50,
+    "beta_update_steps": 50,
     "target_update_interval": 1,
     "publish_interval": 1,
     "checkpoint_interval": 1000

@@ -139,11 +139,13 @@ def test_boolean_failure_gets_failure_stop_reason(tmp_path):
 
 def test_eval_checkpoint_checks_identity_without_constructing_optimizer(tmp_path):
     import torch
+    from g2_local.code_identity import algorithm_identity
     checkpoint = tmp_path / 'checkpoint.pt'
     torch.save({'schema': 1, 'run_id': 'run-1', 'config_hash': 'hash-1',
                 'manifest_digest': 'hash-1', 'camera_keys': ('left_wrist', 'right_aux'),
                 'image_size': 128, 'action_size': 6, 'version': 4,
-                'published_version': 3,
+                'published_version': 3, 'runtime': {'device': 'cpu'},
+                'algorithm_identity': algorithm_identity('cpu'),
                 'published_actor_state': {'weight': torch.tensor([3.])}}, checkpoint)
     checkpoint.chmod(0o600)
     frozen = real_train.load_eval_checkpoint(checkpoint, run_id='run-1',

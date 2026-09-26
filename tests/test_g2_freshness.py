@@ -87,6 +87,15 @@ def test_no_limit_has_a_production_default():
         FreshnessLimits()
 
 
+def test_policy_revalidation_checks_age_without_resetting_source_progress(rig):
+    obs, info = observation(), evidence()
+    assert rig.guard(obs, info)
+    assert rig.guard.revalidate(obs, info)
+    assert not rig.guard(obs, info)  # A new observation still cannot repeat stamps.
+    rig.now += 60_000_000
+    assert not rig.guard.revalidate(obs, info)
+
+
 @pytest.mark.parametrize('field', list(FreshnessLimits.__annotations__))
 @pytest.mark.parametrize('value', [True, False, 0, -1., float('nan'), float('inf'),
                                    -float('inf'), '0.1', np.float64(.1),

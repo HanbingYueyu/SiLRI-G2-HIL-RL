@@ -21,6 +21,7 @@ from .config import HingeInsertTaskConfig, LocalTaskConfig
 from .contract import CAMERA_KEYS
 from .freshness import FreshnessLimits
 from .local_envelope import LocalEnvelope
+from .auto_reset import AutoResetConfig
 
 
 _REQUIRED_EVIDENCE = frozenset({
@@ -257,6 +258,9 @@ class OptimizationConfig:
     target_update_interval: int
     publish_interval: int
     checkpoint_interval: int
+    beta_pretrain_steps: int = 500
+    beta_update_interval: int = 50
+    beta_update_steps: int = 50
 
 
 @dataclass(frozen=True)
@@ -286,6 +290,7 @@ class MotionRuntimeConfig:
     send_rate_hz: float
     adapter_root: Path
     local_envelope: LocalEnvelope | None = None
+    auto_reset: AutoResetConfig = AutoResetConfig()
 
 
 @dataclass(frozen=True)
@@ -371,7 +376,9 @@ class LoadedTrainingConfig:
         output = Path(output)
         if output.name in ('', '.', '..'):
             raise ValueError('A new manifest output directory is required')
+        from .code_identity import algorithm_identity
         data = {'schema': self.schema, 'run_id': run_id, 'role': role,
+                'algorithm_identity': algorithm_identity(self.runtime.device),
                 'config_sha256': self.config_hash,
                 'config': _thaw(self.canonical_payload)}
         encoded = canonical_json(data) + b'\n'
@@ -457,7 +464,13 @@ def parse_schema_one(payload) -> LoadedTrainingConfig:
         'command_lifetime_s', 'send_rate_hz', 'adapter_root')
     if type(payload['motion']) is dict and 'local_envelope' in payload['motion']:
         motion_fields += ('local_envelope',)
+    if type(payload['motion']) is dict and 'auto_reset' in payload['motion']:
+        motion_fields += ('auto_reset',)
     raw = _keys(payload['motion'], motion_fields, 'motion')
+    auto_reset = AutoResetConfig()
+    if 'auto_reset' in raw:
+        reset_values = _keys(raw['auto_reset'], _fields(AutoResetConfig), 'auto_reset')
+        auto_reset = AutoResetConfig(**reset_values)
     local_envelope = None
     if 'local_envelope' in raw:
         local = _keys(raw['local_envelope'],
@@ -480,7 +493,7 @@ def parse_schema_one(payload) -> LoadedTrainingConfig:
         command_lifetime_s=_number(raw['command_lifetime_s'], 'command_lifetime_s', positive=True),
         send_rate_hz=_number(raw['send_rate_hz'], 'send_rate_hz', positive=True),
         adapter_root=_path(raw['adapter_root'], 'adapter_root'),
-        local_envelope=local_envelope)
+        local_envelope=local_envelope, auto_reset=auto_reset)
     if (motion.send_timeout_s > motion.command_timeout_s or
             motion.command_lifetime_s > motion.command_timeout_s or
             1 / motion.send_rate_hz > motion.command_lifetime_s):
@@ -528,7 +541,13 @@ def parse_schema_one(payload) -> LoadedTrainingConfig:
             intervention.engage_deadzone >= 1):
         raise ValueError('Invalid intervention buttons or deadzones')
 
-    raw = _keys(payload['optimization'], _fields(OptimizationConfig), 'optimization')
+    if type(payload['optimization']) is not dict:
+        raise ValueError('optimization must be an object')
+    optimization_values = dict(payload['optimization'])
+    for key, default in (('beta_pretrain_steps', 500), ('beta_update_interval', 50),
+                         ('beta_update_steps', 50)):
+        optimization_values.setdefault(key, default)
+    raw = _keys(optimization_values, _fields(OptimizationConfig), 'optimization')
     optimization = OptimizationConfig(**{
         key: (_number(raw[key], key, positive=True) if key.endswith('_lr') else
               _integer(raw[key], key, minimum=1))

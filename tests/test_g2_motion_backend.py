@@ -76,6 +76,48 @@ def test_default_denies_motion():
         driver.close()
 
 
+def test_action_origin_is_policy_predecessor_not_new_feedback():
+    reader = Reader()
+    reader.state[0] = .5
+    port = Port(reader)
+    driver = backend(reader, port, allow_motion=True, reference_guard=lambda *args: True)
+    try:
+        predecessor = driver.observe()
+        reader.state[0] = .52
+        driver.execute_from((1,0,0,0,0,0), predecessor)
+        assert port.sent[0].position_m[0] == pytest.approx(.51)
+    finally:
+        driver.close()
+
+
+def test_expired_policy_predecessor_cannot_send():
+    reader = Reader()
+    port = Port(reader)
+    driver = backend(reader, port, allow_motion=True, reference_guard=lambda *args: False)
+    try:
+        predecessor = driver.observe()
+        with pytest.raises(RuntimeError, match='Policy input expired'):
+            driver.execute_from((0,)*6, predecessor)
+        assert port.sent == []
+    finally:
+        driver.close()
+
+
+def test_final_terminal_poll_cancels_before_command_submission():
+    from g2_local.real_episode import TerminalBeforeCommand
+    reader = Reader()
+    port = Port(reader)
+    def terminal():
+        raise TerminalBeforeCommand('success', time.monotonic_ns())
+    driver = backend(reader, port, allow_motion=True, before_command=terminal)
+    try:
+        with pytest.raises(TerminalBeforeCommand):
+            driver.execute((1,0,0,0,0,0))
+        assert not port.sent and driver.stopped
+    finally:
+        driver.close()
+
+
 def test_episode_local_envelope_rejects_target_before_send():
     from g2_local.local_envelope import LocalEnvelope
     reader = Reader()

@@ -17,7 +17,10 @@ from lerobot.transport.utils import (bytes_to_state_dict, send_bytes_in_chunks,
 
 def _config(*, optimization=None, runtime=None):
     optimization = optimization or OptimizationConfig(8, 4, 1, 1, 1, 2, 1e-4, 1e-4,
-                                                      1e-4, 1e-4, 2, 2, 3)
+                                                      1e-4, 1e-4, 2, 2, 3,
+                                                      beta_pretrain_steps=1,
+                                                      beta_update_interval=2,
+                                                      beta_update_steps=1)
     runtime = runtime or RuntimeConfig(1, 'cpu', '127.0.0.1', 50175, 4, 1., 2.,
                                       1., .1, 1., .05)
     observation = type('Observation', (), {'camera_keys': ('left_wrist', 'right_aux'),
@@ -143,14 +146,16 @@ def test_resume_preserves_replay_position_and_requires_identity(tmp_path):
                         expected_config_hash='hash-1')
 
 
-def test_online_update_skips_human_optimizers_and_uses_configured_utd():
+def test_online_update_waits_for_beta_then_uses_configured_utd():
     learner = _learner()
     learner.ingest([_row()])
-    assert len(learner.update_for_interactions()) == 2
-    assert learner.version == 2
+    assert learner.update_for_interactions() == []
+    assert learner.version == 0
     assert len(learner.optimizers['expert'].state) == 0
-    assert len(learner.optimizers['actor'].state) > 0
-    assert learner.message_sequence == 0
+    assert len(learner.optimizers['actor'].state) == 0
+    learner.ingest([_row(1, human=True)])
+    assert len(learner.update_for_interactions()) == 4
+    assert learner.version == 4
     assert learner.update_for_interactions() == []
 
 
@@ -158,8 +163,27 @@ def test_human_update_advances_expert_and_actor_optimizer():
     learner = _learner()
     learner.ingest([_row(human=True)])
     metrics = learner.update_once()
-    assert 'expert' in metrics and 'actor_bc' in metrics
+    assert learner.beta_pretrain_completed == 1
+    assert 'actor_bc' not in metrics
     assert len(learner.optimizers['expert'].state) > 0
+
+
+def test_beta_updates_follow_new_human_count_and_compact_checkpoint(tmp_path):
+    learner = _learner()
+    learner.ingest([_row(human=True)])
+    learner.update_once()
+    assert learner.beta_update_count == 0
+    learner.update_once()
+    assert learner.beta_update_count == 0
+    learner.ingest([_row(1,human=True), _row(2,human=True)])
+    learner.update_once()
+    assert learner.beta_update_count == 1
+    path = learner.save_checkpoint(tmp_path/'compact.pt')
+    raw = torch.load(path, weights_only=False)
+    assert raw['online_replay']['actions'].shape[0] == 3
+    assert raw['online_replay']['states']['observation.images.left_wrist'].shape[0] == 3
+    restored = load_checkpoint(path, expected_run_id='run-1', expected_config_hash='hash-1')
+    assert restored.beta_pretrain_completed == 1 and restored.beta_update_count == 1
 
 
 def test_grpc_ingress_rejects_entire_bad_batch_before_mutation():
@@ -196,7 +220,7 @@ def test_training_does_not_mutate_sampled_replay_batch():
 def test_grpc_valid_batch_updates_once_per_configured_utd():
     learner = _learner()
     service = GrpcLearnerService(learner)
-    packet = transitions_to_bytes([_row()])
+    packet = transitions_to_bytes([_row(human=True)])
     service.SendTransitions(send_bytes_in_chunks(packet, pb.Transition), None)
     assert service._idle.wait(5.)
     assert learner.version == 2
@@ -224,7 +248,7 @@ def test_blocked_optimizer_does_not_block_subsequent_ingress_ack(monkeypatch):
         try:
             for step in (0, 1):
                 service.SendTransitions(send_bytes_in_chunks(
-                    transitions_to_bytes([_row(step)]), pb.Transition), None)
+                    transitions_to_bytes([_row(step, human=True)]), pb.Transition), None)
                 if step == 0:
                     assert entered.wait(2.)
             ack.set()
@@ -311,7 +335,7 @@ def test_ingress_queue_overflow_preserves_acknowledged_row(monkeypatch, tmp_path
     monkeypatch.setattr(real_learner, 'train_batch', blocked)
     try:
         service.SendTransitions(send_bytes_in_chunks(
-            transitions_to_bytes([_row(0)]), pb.Transition), None)
+            transitions_to_bytes([_row(0, human=True)]), pb.Transition), None)
         assert entered.wait(2.)
         service.SendTransitions(send_bytes_in_chunks(
             transitions_to_bytes([_row(1, executed=.5)]), pb.Transition), None)
@@ -373,7 +397,7 @@ def test_close_waits_for_recovery_checkpoint_and_exposes_failure(monkeypatch, tm
     closer = threading.Thread(target=close)
     try:
         service.SendTransitions(send_bytes_in_chunks(
-            transitions_to_bytes([_row(0)]), pb.Transition), None)
+            transitions_to_bytes([_row(0, human=True)]), pb.Transition), None)
         assert optimizing.wait(2.)
         service.SendTransitions(send_bytes_in_chunks(
             transitions_to_bytes([_row(1, executed=.5)]), pb.Transition), None)
@@ -415,7 +439,7 @@ def test_background_optimizer_failure_closes_parameter_liveness(monkeypatch):
     acknowledged = threading.Event()
     def send():
         service.SendTransitions(send_bytes_in_chunks(
-            transitions_to_bytes([_row()]), pb.Transition), None)
+            transitions_to_bytes([_row(human=True)]), pb.Transition), None)
         acknowledged.set()
     sender = threading.Thread(target=send)
     sender.start()
@@ -535,7 +559,7 @@ def test_checkpoint_restores_random_generators(tmp_path):
 def test_checkpoint_cadence_and_failed_publication_stop_updates(tmp_path):
     learner = RealLearnerRuntime(config=_config(), run_id='run-1',
                                  checkpoint_path=tmp_path / 'checkpoint.pt')
-    learner.ingest([_row()])
+    learner.ingest([_row(human=True)])
     learner.update_once()
     assert not (tmp_path / 'checkpoint.pt').exists()
     learner.update_once()
@@ -543,7 +567,7 @@ def test_checkpoint_cadence_and_failed_publication_stop_updates(tmp_path):
     learner.update_once()
     assert (tmp_path / 'checkpoint.pt').exists()
     failing = _learner()
-    failing.ingest([_row()])
+    failing.ingest([_row(human=True)])
     failing.publish = lambda _: (_ for _ in ()).throw(ConnectionError('stream failed'))
     failing.update_once()
     with pytest.raises(ConnectionError):
@@ -569,7 +593,7 @@ def test_checkpoint_mid_utd_retains_remaining_updates_on_resume(tmp_path):
             raise ConnectionError('stop after first checkpoint')
 
     learner.publish = publish
-    learner.ingest([_row()])
+    learner.ingest([_row(human=True)])
     with pytest.raises(ConnectionError):
         learner.update_for_interactions()
     restored = load_checkpoint(tmp_path / 'checkpoint.pt', expected_run_id='run-1',
@@ -586,7 +610,7 @@ def test_warmup_preserves_pending_utd_credits():
     learner.ingest([_row()])
     assert learner.update_for_interactions() == []
     assert learner.snapshot_counts()['budget'] == 2
-    learner.ingest([_row(1)])
+    learner.ingest([_row(1, human=True)])
     assert len(learner.update_for_interactions()) == 4
     assert learner.snapshot_counts()['budget'] == 0
 
@@ -594,7 +618,7 @@ def test_warmup_preserves_pending_utd_credits():
 def test_heartbeat_uses_last_published_policy_below_publish_interval():
     learner = _learner()
     initial = learner.publish_parameters()
-    learner.ingest([_row()])
+    learner.ingest([_row(human=True)])
     learner.update_once()
     heartbeat = learner.heartbeat_parameters()
     assert learner.version == 1
@@ -608,7 +632,7 @@ def test_parameter_stream_serializes_last_published_state_below_interval():
     learner = _learner()
     initial = {key: value.detach().cpu().clone()
                for key, value in learner.policy.actor.state_dict().items()}
-    learner.ingest([_row()])
+    learner.ingest([_row(human=True)])
     learner.update_once()
     service = GrpcLearnerService(learner)
     context = _StreamContext()

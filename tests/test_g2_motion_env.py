@@ -184,9 +184,16 @@ def test_failed_port_construction_releases_reader_then_clock():
     assert state.reader.closed and state.clock.closed
 
 
+def accepting_guard(client, limits):
+    def accept(obs, info, after):
+        return True
+    accept.revalidate = lambda obs, info: True
+    return accept
+
+
 def test_assembly_owns_one_session_and_explicit_limits(monkeypatch):
     monkeypatch.setattr('g2_local.motion_env.ObservationFreshnessGuard',
-                        lambda client, limits: lambda obs, info, after: True)
+                        accepting_guard)
     events = []
     factories, state = fake_factories(events)
     env = create_motion_env(config(events), coordinator(),
@@ -202,7 +209,7 @@ def test_assembly_owns_one_session_and_explicit_limits(monkeypatch):
 
 def test_feedback_lease_expires_without_another_gym_step(monkeypatch):
     monkeypatch.setattr('g2_local.motion_env.ObservationFreshnessGuard',
-                        lambda client, limits: lambda obs, info, after: True)
+                        accepting_guard)
     events = []
     factories, state = fake_factories(events)
     env = create_motion_env(config(events), coordinator(),
@@ -237,7 +244,7 @@ def test_freshness_lease_requires_exact_true_and_expires():
 
 def test_camera_roi_crops_before_resize_and_rejects_out_of_frame(monkeypatch):
     monkeypatch.setattr('g2_local.motion_env.ObservationFreshnessGuard',
-                        lambda client, limits: lambda obs, info, after: True)
+                        accepting_guard)
     events = []
     factories, _ = fake_factories(events)
     rois = {'left_wrist': (10, 20, 100, 80), 'right_aux': (30, 40, 120, 90)}

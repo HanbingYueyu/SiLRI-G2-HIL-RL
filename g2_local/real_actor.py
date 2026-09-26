@@ -4,7 +4,9 @@ The environment factory is the only path to motion. This module never creates
 GDK resources itself; tests inject a fake environment and transport.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from types import SimpleNamespace
+import uuid
 import logging
 import math
 import os
@@ -120,6 +122,8 @@ def validate_transition_provenance(row, run_id, config_hash):
                 'target_offset_m', 'ee_reset_offset', 'approach_source',
                 'grasp_description', 'visual_reset_monotonic_ns',
                 'visual_confidence', 'upstream_frame_id'}
+    if type(info) is dict and 'automatic_reset_monotonic_ns' in info:
+        required.add('automatic_reset_monotonic_ns')
     if type(info) is not dict or set(info) != required:
         raise ValueError('Invalid transition provenance fields')
     if info['run_id'] != run_id or info['config_hash'] != config_hash:
@@ -138,7 +142,8 @@ def validate_transition_provenance(row, run_id, config_hash):
     EpisodeContext(info['episode_id'], info['target_offset_m'],
                    info['approach_source'], info['grasp_description'],
                    info['ee_reset_offset'], info['visual_reset_monotonic_ns'],
-                   info['visual_confidence'], info['upstream_frame_id'])
+                   info['visual_confidence'], info['upstream_frame_id'],
+                   info.get('automatic_reset_monotonic_ns'))
     if type(row['done']) is not bool or type(row['truncated']) is not bool:
         raise ValueError('Invalid terminal flags')
     if type(row['reward']) not in (int, float) or not math.isfinite(row['reward']):
@@ -456,6 +461,44 @@ class RealActorRuntime:
                                self.interventions, self.parameter_version,
                                self.stop_reason)
 
+    def _automatic_reset(self, reference, previous_context):
+        from .auto_reset import run_reset
+        def poll():
+            if self.stop_event.is_set():
+                raise RuntimeError('Actor stopped during automatic reset')
+            self.transport.assert_alive()
+            self.accept_latest_parameters()
+            intervention = self.coordinator.intervention
+            active, action = intervention()
+            if not (intervention.gate.fresh or intervention.verified_neutral):
+                raise RuntimeError('SpaceMouse neutral state unconfirmed during reset')
+            if (action is not None and any(abs(v) > 0 for v in action)) or any(
+                    abs(v) > intervention.config.release_deadzone
+                    for v in intervention.last_frame.axes):
+                raise RuntimeError('SpaceMouse motion cancels automatic reset')
+            if self.coordinator.keys.poll() is not None:
+                raise RuntimeError('Operator key cancels automatic reset')
+        self.coordinator.keys.drain()
+        poll()
+        reset_coordinator = SimpleNamespace(outcome=lambda obs: (0., False), intervention=None)
+        env = self.env_factory(self.config, reset_coordinator)
+        self._env = env
+        try:
+            self._emit('reset_started', previous_episode_id=previous_context.episode_id)
+            # run_reset closes resources before any new context becomes eligible.
+            run_reset(env, reference, self.config.motion, poll=poll, emit=self._emit)
+        finally:
+            env.close()
+        self._env = None
+        context = replace(previous_context, episode_id='auto-'+uuid.uuid4().hex,
+                          approach_source='automatic_lift_return',
+                          visual_reset_monotonic_ns=None, visual_confidence=None,
+                          upstream_frame_id=None, automatic_reset_monotonic_ns=time.monotonic_ns())
+        self.coordinator.offer_context(context)
+        self._emit('reset_completed', episode_id=context.episode_id,
+                   automatic_reset_monotonic_ns=context.automatic_reset_monotonic_ns,
+                   next_episode_requires_start_chord=True)
+
     def stop(self, reason):
         if self.stop_event.is_set():
             return
@@ -482,9 +525,55 @@ class RealActorRuntime:
         env = None
         completed = 0
         previous_step_at = None
+        episode_start_pose = None
         primary_error = None
+        pending = None
+        def upload(row):
+            self.transport.send_transition_batch((row,))
+            self.transitions_sent += 1
+            self.interventions += int(row['complementary_info']['is_intervention'])
+        def finish_episode(token, context, truncated):
+            nonlocal env, previous_step_at
+            self.episodes_completed += 1
+            previous_step_at = None
+            if truncated and self.coordinator.running:
+                self.coordinator.seal_episode(token)
+            completed_env = env
+            env = None
+            self._env = None
+            self.current_observation = None
+            completed_env.close()
+            reset_config = getattr(getattr(self.config, 'motion', None), 'auto_reset', None)
+            if reset_config is not None and reset_config.enabled:
+                self._automatic_reset(episode_start_pose, context)
+        def terminal_before_next_action(forced=None):
+            nonlocal pending
+            if pending is None:
+                return False
+            keys = getattr(self.coordinator, 'keys', None)
+            label = forced.label if forced is not None else (keys.poll() if keys is not None else None)
+            if label is None:
+                return False
+            read_ns = forced.read_ns if forced is not None else time.monotonic_ns()
+            row, token, context = pending
+            env.backend.stop()
+            self.coordinator.seal_episode(token)
+            row['done'], row['truncated'] = True, False
+            row['reward'] = (self.config.task.success_reward if label == 'success'
+                             else self.config.task.failure_reward)
+            row['complementary_info'].update(reward_source='human', success_label=label == 'success')
+            validate_real_transition(row, self.run_id, self.config_hash)
+            self._emit('terminal_label', label=label, read_monotonic_ns=read_ns,
+                       transition_id=row['complementary_info']['transition_id'],
+                       attribution='previous_successor_before_next_action')
+            upload(row)
+            pending = None
+            finish_episode(token, context, False)
+            return True
         try:
             while not self.stop_event.is_set():
+                if terminal_before_next_action():
+                    continue
                 self.transport.assert_alive()
                 self.accept_latest_parameters()  # boundary: never inside env.step
                 if not self.coordinator.running:
@@ -505,6 +594,7 @@ class RealActorRuntime:
                             env = self.env_factory(self.config, self.coordinator)
                             self._env = env
                             self.current_observation, _ = env.reset(options={'context': context})
+                            episode_start_pose = tuple(self.current_observation['state'])
                             _policy_observation(self.current_observation, 'cpu',
                                                 self.config.observation.image_size)
                     time.sleep(self.config.runtime.operator_poll_interval_s)
@@ -520,11 +610,18 @@ class RealActorRuntime:
                 control_period_s = (None if previous_step_at is None else
                                     inference_started - previous_step_at)
                 previous_step_at = inference_started
+                if terminal_before_next_action():
+                    continue
                 token = self.coordinator.begin_step()
                 self._step_active = True
                 try:
                     after, reward, terminated, truncated, info = env.step(policy_action)
-                except BaseException:
+                except BaseException as error:
+                    from .real_episode import TerminalBeforeCommand
+                    if isinstance(error, TerminalBeforeCommand) and pending is not None:
+                        self._step_active = False
+                        terminal_before_next_action(forced=error)
+                        continue
                     if self.coordinator.active_step_token == token:
                         try:
                             self.coordinator.abort_step(token)
@@ -535,28 +632,31 @@ class RealActorRuntime:
                     self._step_active = False
                 if self.coordinator.completed_step_token != token:
                     raise RuntimeError('coordinator outcome not completed')
+                if pending is not None:
+                    upload(pending[0])
+                    pending = None
                 row = self._build_confirmed_transition(
                     before, after, reward, terminated, truncated, info,
                     token, context, policy_action)
                 self._emit('step', episode_id=token.episode_id, step_id=token.step_id,
                            inference_latency_s=inference_latency_s,
-                           control_period_s=control_period_s)
-                self.transport.send_transition_batch((row,))
-                self.transitions_sent += 1
-                self.interventions += int(row['complementary_info']['is_intervention'])
+                           control_period_s=control_period_s,
+                           execution_timing=getattr(env.backend, 'last_execution_timing', {}))
+                if terminated and info.get('success_label') is not None:
+                    self._emit('terminal_label', transition_id=row['complementary_info']['transition_id'],
+                               read_monotonic_ns=getattr(self.coordinator, 'last_terminal_read_ns', None),
+                               attribution='during_command_or_successor_read')
                 completed += 1
                 self.current_observation = after
                 if terminated or truncated:
-                    self.episodes_completed += 1
-                    previous_step_at = None
-                    if truncated and self.coordinator.running:
-                        self.coordinator.seal_episode(token)
-                    completed_env = env
-                    env = None
-                    self._env = None
-                    self.current_observation = None
-                    completed_env.close()
+                    upload(row)
+                    finish_episode(token, context, truncated)
+                else:
+                    pending = (row, token, context)
                 if max_completed_steps is not None and completed >= max_completed_steps:
+                    if not terminal_before_next_action() and pending is not None:
+                        upload(pending[0])
+                        pending = None
                     return self.summary()
             return self.summary()
         except BaseException as error:

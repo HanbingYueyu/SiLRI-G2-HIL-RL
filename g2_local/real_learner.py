@@ -24,6 +24,7 @@ from .policy import create_policy
 from .real_actor import ParameterEnvelope, validate_real_transition
 from .provenance import ProvenanceRecords, compact_record, tensor_digest
 from .runtime import train_batch
+from .code_identity import algorithm_identity
 from .training_config import OptimizationConfig, RuntimeConfig, _open_owned_regular
 
 
@@ -63,11 +64,16 @@ def _training_row(row):
 
 def _replay_state(buffer):
     state = {'capacity': buffer.capacity, 'position': buffer.position,
-             'size': buffer.size, 'initialized': buffer.initialized}
+             'size': buffer.size, 'initialized': buffer.initialized,
+             'storage_format': 'occupied_slots_v1'}
+    def occupied(value):
+        if isinstance(value, dict):
+            return {key: occupied(tensor) for key, tensor in value.items()}
+        return value[:buffer.size].clone()
     if buffer.initialized:
         for key in ('states', 'next_states', 'actions', 'rewards', 'dones',
                     'truncateds', 'complementary_info', 'episode_ends'):
-            state[key] = getattr(buffer, key)
+            state[key] = occupied(getattr(buffer, key))
     return state
 
 
@@ -84,6 +90,24 @@ def _restore_replay(buffer, state):
         if state['position'] != 0:
             raise ValueError('Empty replay has invalid insertion position')
         return
+    if state.get('storage_format') == 'occupied_slots_v1':
+        def expand(value):
+            if isinstance(value, dict):
+                return {key: expand(tensor) for key, tensor in value.items()}
+            if (type(value) is not torch.Tensor or value.ndim < 1 or
+                    value.shape[0] != state['size'] or value.device.type != 'cpu'):
+                raise ValueError('Invalid compact replay tensor')
+            result = torch.zeros((buffer.capacity, *value.shape[1:]), dtype=value.dtype)
+            result[:state['size']].copy_(value)
+            return result
+        state = dict(state)
+        for key in ('states', 'next_states', 'actions', 'rewards', 'dones',
+                    'truncateds', 'complementary_info', 'episode_ends'):
+            if key not in state:
+                raise ValueError('Incomplete compact replay checkpoint')
+            state[key] = expand(state[key])
+    elif state.get('storage_format') is not None:
+        raise ValueError('Unknown replay storage format')
     if state['position'] != state['size'] % buffer.capacity and state['size'] < buffer.capacity:
         raise ValueError('Invalid replay insertion position')
     for key in ('states', 'next_states', 'actions', 'rewards', 'dones',
@@ -182,6 +206,7 @@ class RealLearnerRuntime:
                 opt.min_online_transitions > opt.online_capacity):
             raise ValueError('Impossible replay batch')
         self.policy = policy or create_policy(config.runtime.device)
+        self.algorithm_identity = algorithm_identity(config.runtime.device)
         self.optimizers, _ = self.policy.get_optimizer_and_scheduler()
         for name, lr in (('actor', opt.actor_lr), ('critic', opt.critic_lr),
                          ('expert', opt.expert_lr), ('lagrange', opt.lagrange_lr)):
@@ -206,6 +231,11 @@ class RealLearnerRuntime:
             for key, value in self.policy.actor.state_dict().items()}
         self.accepted_transitions = 0
         self.update_count = 0
+        self.beta_pretrain_completed = 0
+        self.beta_update_count = 0
+        self.human_transitions_total = 0
+        self.beta_last_human_count = 0
+        self.beta_last_loss = None
         self._interaction_budget = 0
         self.publish = publish
         self.checkpoint_path = checkpoint_path
@@ -217,6 +247,9 @@ class RealLearnerRuntime:
     def snapshot_counts(self):
         with self._lock:
             return {'online': len(self.online_replay), 'human': len(self.human_replay),
+                    'beta_pretrain_steps': self.beta_pretrain_completed,
+                    'beta_update_steps': self.beta_update_count,
+                    'human_total': self.human_transitions_total,
                     'accepted': self.accepted_transitions, 'updates': self.update_count,
                     'budget': self._interaction_budget,
                     'online_position': self.online_replay.position,
@@ -245,6 +278,7 @@ class RealLearnerRuntime:
                 self.online_replay.add(**training)
                 if training['complementary_info']['is_intervention']:
                     self.human_replay.add(**training)
+                    self.human_transitions_total += 1
                 self.seen_transition_ids.add(identity)
                 new.add(identity)
                 self.records.append(record)
@@ -289,23 +323,58 @@ class RealLearnerRuntime:
                     raise
             return envelope
 
+    def pretrain_behavior(self):
+        """Train beta alone before any online Actor/Lagrange optimization."""
+        with self._update_lock:
+            opt = self.config.optimization
+            if self.beta_pretrain_completed >= opt.beta_pretrain_steps:
+                return True
+            with self._lock:
+                if len(self.human_replay) == 0:
+                    return False
+                baseline_count = self.human_transitions_total
+            while self.beta_pretrain_completed < opt.beta_pretrain_steps:
+                if self.stopped.is_set():
+                    raise RuntimeError('Learner stopped during beta pretraining')
+                with self._lock:
+                    data = self.human_replay.sample(opt.human_batch_size)
+                metrics = train_batch(self.policy, self.optimizers, data, ('expert',))
+                self.beta_last_loss = metrics['expert']
+                self.beta_pretrain_completed += 1
+            self.beta_last_human_count = baseline_count
+            return True
+
     def update_once(self):
         with self._update_lock:
             if self.stopped.is_set():
                 raise RuntimeError('Learner stopped')
             opt = self.config.optimization
+            if not self.pretrain_behavior():
+                return None
+            while self.human_transitions_total-self.beta_last_human_count >= opt.beta_update_interval:
+                for _ in range(opt.beta_update_steps):
+                    if self.stopped.is_set():
+                        raise RuntimeError('Learner stopped during beta update')
+                    with self._lock:
+                        beta_data = self.human_replay.sample(opt.human_batch_size)
+                    self.beta_last_loss = train_batch(
+                        self.policy, self.optimizers, beta_data, ('expert',))['expert']
+                    self.beta_update_count += 1
+                self.beta_last_human_count += opt.beta_update_interval
             with self._lock:
                 if len(self.online_replay) < max(opt.min_online_transitions,
                                                   opt.online_batch_size):
                     return None
                 online = self.online_replay.sample(opt.online_batch_size)
-                has_human = len(self.human_replay) >= opt.human_batch_size
+                has_human = len(self.human_replay) > 0
                 data = (concatenate_batch_transitions(
                     online, self.human_replay.sample(opt.human_batch_size))
                     if has_human else online)
-            names = ('critic', 'actor', 'lagrange', 'expert', 'actor_bc') if has_human else (
-                'critic', 'actor', 'lagrange')
+            names = ('critic', 'actor', 'lagrange')
             metrics = train_batch(self.policy, self.optimizers, data, names)
+            metrics.update(beta_pretrain_steps=self.beta_pretrain_completed,
+                           beta_update_steps=self.beta_update_count,
+                           beta_last_loss=self.beta_last_loss)
             with self._lock:
                 self.version += 1
                 self.update_count += 1
@@ -331,6 +400,7 @@ class RealLearnerRuntime:
 
     def _payload(self):
         return dict(schema=1, run_id=self.run_id, config_hash=self.config_hash,
+                    algorithm_identity=self.algorithm_identity,
                     manifest_digest=self.manifest_digest,
                     camera_keys=CAMERA_KEYS, image_size=128, action_size=6,
                     optimization=asdict(self.config.optimization),
@@ -347,6 +417,11 @@ class RealLearnerRuntime:
                     published_actor_state=self._published_actor_state,
                     accepted_transitions=self.accepted_transitions,
                     update_count=self.update_count,
+                    beta_pretrain_completed=self.beta_pretrain_completed,
+                    beta_update_count=self.beta_update_count,
+                    human_transitions_total=self.human_transitions_total,
+                    beta_last_human_count=self.beta_last_human_count,
+                    beta_last_loss=self.beta_last_loss,
                     interaction_budget=self._interaction_budget,
                     torch_rng=torch.get_rng_state(),
                     cuda_rng=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -399,6 +474,8 @@ def load_checkpoint(path: Path, *, expected_run_id: str, expected_config_hash: s
         optimization=OptimizationConfig(**payload['optimization']),
         runtime=RuntimeConfig(**payload['runtime']),
         config_hash=expected_config_hash)
+    if payload.get('algorithm_identity') != algorithm_identity(config.runtime.device):
+        raise ValueError('Algorithm code/version identity mismatch; explicit migration required')
     learner = RealLearnerRuntime(config=config, run_id=expected_run_id,
                                  manifest_digest=payload['manifest_digest'])
     learner.policy.load_state_dict(payload['policy'], strict=True)
@@ -441,6 +518,22 @@ def load_checkpoint(path: Path, *, expected_run_id: str, expected_config_hash: s
     learner._published_actor_state = published
     learner.accepted_transitions = payload['accepted_transitions']
     learner.update_count = payload['update_count']
+    for name in ('beta_pretrain_completed', 'beta_update_count',
+                 'human_transitions_total', 'beta_last_human_count'):
+        value = payload.get(name)
+        if type(value) is not int or value < 0:
+            raise ValueError('Checkpoint lacks valid beta readiness counters')
+        setattr(learner, name, value)
+    if (learner.beta_pretrain_completed > config.optimization.beta_pretrain_steps or
+            learner.beta_last_human_count > learner.human_transitions_total or
+            (learner.update_count > 0 and
+             learner.beta_pretrain_completed != config.optimization.beta_pretrain_steps)):
+        raise ValueError('Inconsistent beta readiness checkpoint')
+    learner.beta_last_loss = payload.get('beta_last_loss')
+    if (learner.beta_last_loss is not None and
+            (type(learner.beta_last_loss) not in (int, float) or
+             not np.isfinite(learner.beta_last_loss))):
+        raise ValueError('Invalid beta loss checkpoint')
     learner._interaction_budget = payload['interaction_budget']
     if (learner.accepted_transitions != len(learner.records) or
             learner.version != learner.update_count):

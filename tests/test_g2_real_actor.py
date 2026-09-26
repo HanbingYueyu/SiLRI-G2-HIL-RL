@@ -201,6 +201,91 @@ def test_actor_uploads_driver_confirmed_action_with_identity():
     assert rig.coordinator.intervention.polls >= 1
 
 
+def test_y_after_successor_labels_previous_step_without_another_motion():
+    rig = actor_rig()
+    rig.runtime.config.task = SimpleNamespace(success_reward=10., failure_reward=-1.)
+    rig.coordinator.keys = SimpleNamespace(
+        poll=lambda: 'success' if rig.env.step_calls == 1 else None)
+    rig.runtime.run(max_completed_steps=1)
+    assert rig.env.step_calls == 1
+    assert len(rig.transport.sent) == 1
+    row = rig.transport.sent[0]
+    assert row['done'] and row['reward'] == 10.
+    assert row['complementary_info']['step_id'] == 0
+    assert row['complementary_info']['success_label'] is True
+
+
+def test_terminal_from_final_send_gate_settles_pending_previous_transition():
+    from g2_local.real_episode import TerminalBeforeCommand
+    rig = actor_rig()
+    rig.runtime.config.task = SimpleNamespace(success_reward=10., failure_reward=-1.)
+    def cancel_second():
+        if rig.env.step_calls == 2:
+            rig.coordinator.active_token = None
+            rig.coordinator.step_id -= 1  # Fake counts begins; production counts completed steps.
+            rig.runtime.stop_event.set()  # Bound this fake-only run after settlement.
+            raise TerminalBeforeCommand('success', 123)
+    rig.env.during_step = cancel_second
+    rig.runtime.run()
+    assert len(rig.transport.sent) == 1
+    assert rig.transport.sent[0]['done']
+    assert rig.transport.sent[0]['complementary_info']['step_id'] == 0
+
+
+def test_auto_reset_only_after_terminal_upload_and_confirmed_close():
+    rig = actor_rig()
+    rig.env.truncate_first = True
+    rig.runtime.config.motion = SimpleNamespace(auto_reset=SimpleNamespace(enabled=True))
+    calls = []
+    def reset(reference, context):
+        assert rig.env.closed and len(rig.transport.sent) == 1
+        assert reference == tuple(observation()['state'])
+        calls.append(context.episode_id)
+    rig.runtime._automatic_reset = reset
+    rig.runtime.run(max_completed_steps=1)
+    assert calls == ['episode-1']
+    assert len(rig.transport.sent) == 1
+
+    rig = actor_rig(blocked=True)
+    rig.env.truncate_first = True
+    rig.runtime.config.motion = SimpleNamespace(auto_reset=SimpleNamespace(enabled=True))
+    rig.runtime._automatic_reset = lambda *args: calls.append('unexpected')
+    with pytest.raises(TimeoutError):
+        rig.runtime.run(max_completed_steps=1)
+    assert calls == ['episode-1']
+
+
+def test_automatic_reset_failure_does_not_offer_context(monkeypatch):
+    import g2_local.auto_reset as module
+    rig = actor_rig()
+    rig.runtime.config.motion = SimpleNamespace()
+    class Idle:
+        gate = SimpleNamespace(fresh=True)
+        verified_neutral = True
+        config = SimpleNamespace(release_deadzone=.08)
+        last_frame = SimpleNamespace(axes=(0,)*6)
+        def __call__(self):
+            return False, None
+    rig.coordinator.intervention = Idle()
+    rig.coordinator.keys = SimpleNamespace(drain=lambda: None, poll=lambda: None)
+    rig.runtime.env_factory = lambda *args: rig.env
+    def fail(*args, **kwargs):
+        raise RuntimeError('reset failed')
+    monkeypatch.setattr(module, 'run_reset', fail)
+    with pytest.raises(RuntimeError, match='reset failed'):
+        rig.runtime._automatic_reset(tuple(observation()['state']),
+            EpisodeContext('old', (0,0,0), 'visual', 'grasp'))
+    assert rig.env.closed and rig.coordinator.context is None
+
+    monkeypatch.setattr(module, 'run_reset', lambda *args, **kwargs: None)
+    rig.runtime._automatic_reset(tuple(observation()['state']),
+        EpisodeContext('old', (0,0,0), 'visual', 'grasp', visual_reset_monotonic_ns=1))
+    assert rig.coordinator.context.approach_source == 'automatic_lift_return'
+    assert rig.coordinator.context.visual_reset_monotonic_ns is None
+    assert rig.coordinator.context.automatic_reset_monotonic_ns > 0
+    assert not rig.coordinator.running
+
+
 def test_actor_emits_real_step_timing_outside_transition_payload():
     rig = actor_rig()
     events = []
