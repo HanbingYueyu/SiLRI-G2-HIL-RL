@@ -60,6 +60,7 @@ def test_complete_demo_imports_human_actions_pixels_and_resumes_without_duplicat
     evidence = Evidence()
     assert import_demonstrations(learner, [path], evidence=evidence)['accepted'] == 2
     assert len(learner.human_replay) == len(learner.online_replay) == 2
+    assert len(learner.imported_demo_episodes) == 1
     assert learner.human_replay.actions[0, 0].item() == pytest.approx(.4)
     assert torch.all(learner.human_replay.next_states['observation.images.left_wrist'][0] == .25)
     assert learner.human_replay.dones[:2].tolist() == [False, True]
@@ -71,6 +72,7 @@ def test_complete_demo_imports_human_actions_pixels_and_resumes_without_duplicat
     budget = restored.snapshot_counts()['budget']
     result = import_demonstrations(restored, [path], evidence=evidence)
     assert result['duplicates'] == 2 and result['accepted'] == 0
+    assert restored.imported_demo_episodes == learner.imported_demo_episodes
     assert restored.snapshot_counts()['budget'] == budget
 
 

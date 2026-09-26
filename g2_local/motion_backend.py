@@ -10,6 +10,7 @@ import math
 import threading
 import time
 import numpy as np
+from scipy.spatial.transform import Rotation
 from .command_stream import CommandStream
 from .contract import CAMERA_KEYS, vector
 from .episode import StepResult
@@ -29,7 +30,8 @@ class MotionBackend:
     def __init__(self, reader, port, *, config, observation_guard, outcome,
                  command_timeout, send_timeout, step_period, allow_motion=False,
                  stop_timeout=1., send_rate_hz=50., local_envelope=None,
-                 reference_guard=None, before_command=None):
+                 reference_guard=None, before_command=None,
+                 policy_position_drift_m=.005, policy_rotation_drift_rad=.02):
         config.validate_motion()
         if type(allow_motion) is not bool:
             raise ValueError('Explicit boolean motion permission required')
@@ -38,6 +40,11 @@ class MotionBackend:
         if not math.isfinite(step_period) or not 0 < step_period < command_timeout:
             raise ValueError('Step period must be positive and below command lease')
         self.reader, self.config = reader, config
+        for value in (policy_position_drift_m, policy_rotation_drift_rad):
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError('Policy pose drift limits must be positive and finite')
+        self.policy_position_drift_m = policy_position_drift_m
+        self.policy_rotation_drift_rad = policy_rotation_drift_rad
         self.local_envelope = local_envelope
         self.episode_reference = None
         self.reference_guard = reference_guard
@@ -143,6 +150,13 @@ class MotionBackend:
                 if self.reference_guard(*reference) is not True:
                     raise RuntimeError('Policy input expired before command; action discarded')
             origin = before['state'] if reference is None else reference[0]['state']
+            position_drift = float(np.linalg.norm(np.asarray(before['state'][:3])-origin[:3]))
+            rotation_drift = float((Rotation.from_quat(before['state'][3:]) *
+                                    Rotation.from_quat(origin[3:]).inv()).magnitude())
+            if (position_drift > self.policy_position_drift_m or
+                    rotation_drift > self.policy_rotation_drift_rad):
+                raise RuntimeError(f'Policy pose drift exceeded: {position_drift:.6f} m, '
+                                   f'{rotation_drift:.6f} rad; re-observe before rearming')
             pose, effective = plan_target(origin, action, self.config)
             if self.local_envelope is not None:
                 self.local_envelope.check(pose, self.episode_reference)
@@ -154,6 +168,8 @@ class MotionBackend:
             self.stream.check()
             after = self._read(after=sent_at)
             self.last_execution_timing = dict(
+                policy_position_drift_m=position_drift,
+                policy_rotation_drift_rad=rotation_drift,
                 command_sent_monotonic_ns=round(sent_at*1e9),
                 successor_received_monotonic_ns=time.monotonic_ns())
             decision = coerce_outcome(self.outcome(after))

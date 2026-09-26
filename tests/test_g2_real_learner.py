@@ -19,6 +19,8 @@ def _config(*, optimization=None, runtime=None):
     optimization = optimization or OptimizationConfig(8, 4, 1, 1, 1, 2, 1e-4, 1e-4,
                                                       1e-4, 1e-4, 2, 2, 3,
                                                       beta_pretrain_steps=1,
+                                                      beta_min_demo_episodes=1,
+                                                      beta_min_human_transitions=1,
                                                       beta_update_interval=2,
                                                       beta_update_steps=1)
     runtime = runtime or RuntimeConfig(1, 'cpu', '127.0.0.1', 50175, 4, 1., 2.,
@@ -52,7 +54,9 @@ def _row(step=0, *, human=False, executed=0.):
 
 def _learner():
     torch.set_num_threads(2)
-    return RealLearnerRuntime(config=_config(), run_id='run-1')
+    learner = RealLearnerRuntime(config=_config(), run_id='run-1')
+    learner.imported_demo_episodes.add('fixture-complete-demo')
+    return learner
 
 
 def test_duplicate_does_not_mutate_replay_or_update_budget():
@@ -325,6 +329,7 @@ def test_ingress_queue_overflow_preserves_acknowledged_row(monkeypatch, tmp_path
     checkpoint = tmp_path / 'checkpoint.pt'
     learner = RealLearnerRuntime(config=_config(runtime=runtime), run_id='run-1',
                                  checkpoint_path=checkpoint)
+    learner.imported_demo_episodes.add('fixture-complete-demo')
     service = GrpcLearnerService(learner)
     entered, release = threading.Event(), threading.Event()
     original = real_learner.train_batch
@@ -368,6 +373,7 @@ def test_close_waits_for_recovery_checkpoint_and_exposes_failure(monkeypatch, tm
     checkpoint = tmp_path / 'checkpoint.pt'
     learner = RealLearnerRuntime(config=_config(runtime=runtime), run_id='run-1',
                                  checkpoint_path=checkpoint)
+    learner.imported_demo_episodes.add('fixture-complete-demo')
     service = GrpcLearnerService(learner)
     optimizing, release_optimizer = threading.Event(), threading.Event()
     checkpointing, release_checkpoint = threading.Event(), threading.Event()
@@ -559,6 +565,7 @@ def test_checkpoint_restores_random_generators(tmp_path):
 def test_checkpoint_cadence_and_failed_publication_stop_updates(tmp_path):
     learner = RealLearnerRuntime(config=_config(), run_id='run-1',
                                  checkpoint_path=tmp_path / 'checkpoint.pt')
+    learner.imported_demo_episodes.add('fixture-complete-demo')
     learner.ingest([_row(human=True)])
     learner.update_once()
     assert not (tmp_path / 'checkpoint.pt').exists()
@@ -584,6 +591,7 @@ def test_checkpoint_mid_utd_retains_remaining_updates_on_resume(tmp_path):
                            publish_interval=1, checkpoint_interval=1)
     learner = RealLearnerRuntime(config=_config(optimization=optimization), run_id='run-1',
                                  checkpoint_path=tmp_path / 'checkpoint.pt')
+    learner.imported_demo_episodes.add('fixture-complete-demo')
     calls = 0
 
     def publish(_envelope):
@@ -607,6 +615,7 @@ def test_checkpoint_mid_utd_retains_remaining_updates_on_resume(tmp_path):
 def test_warmup_preserves_pending_utd_credits():
     optimization = replace(_config().optimization, min_online_transitions=2)
     learner = RealLearnerRuntime(config=_config(optimization=optimization), run_id='run-1')
+    learner.imported_demo_episodes.add('fixture-complete-demo')
     learner.ingest([_row()])
     assert learner.update_for_interactions() == []
     assert learner.snapshot_counts()['budget'] == 2

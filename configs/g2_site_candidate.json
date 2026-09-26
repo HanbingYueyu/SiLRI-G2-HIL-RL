@@ -23,8 +23,10 @@
     "ee_rpy_range_rad": 0.008726646259971648
   },
   "motion": {
+    "policy_position_drift_m": 0.005,
+    "policy_rotation_drift_rad": 0.02,
     "auto_reset": {
-      "enabled": true,
+      "enabled": false,
       "lift_m": 0.05,
       "linear_speed_m_s": 0.01,
       "angular_speed_rad_s": 0.2,
@@ -114,6 +116,8 @@
     "expert_lr": 0.0003,
     "lagrange_lr": 0.000003,
     "beta_pretrain_steps": 500,
+    "beta_min_demo_episodes": 20,
+    "beta_min_human_transitions": 256,
     "beta_update_interval": 50,
     "beta_update_steps": 50,
     "target_update_interval": 1,

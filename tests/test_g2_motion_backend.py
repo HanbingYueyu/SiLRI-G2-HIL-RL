@@ -83,7 +83,7 @@ def test_action_origin_is_policy_predecessor_not_new_feedback():
     driver = backend(reader, port, allow_motion=True, reference_guard=lambda *args: True)
     try:
         predecessor = driver.observe()
-        reader.state[0] = .52
+        reader.state[0] = .502
         driver.execute_from((1,0,0,0,0,0), predecessor)
         assert port.sent[0].position_m[0] == pytest.approx(.51)
     finally:

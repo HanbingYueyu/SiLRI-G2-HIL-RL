@@ -182,6 +182,9 @@ def import_demonstrations(learner, paths, *, evidence):
                             transition_id=f'{learner.run_id}/{episode_id}/{info["step_id"]}')
                 rows.append(row)
             result = learner.ingest(rows)
+            # Only fully validated contiguous imports satisfy initialization.
+            with learner._lock:
+                learner.imported_demo_episodes.add(episode_id)
             accepted += result.accepted
             duplicates += result.duplicates
             episodes += 1

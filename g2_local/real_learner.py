@@ -236,6 +236,7 @@ class RealLearnerRuntime:
         self.human_transitions_total = 0
         self.beta_last_human_count = 0
         self.beta_last_loss = None
+        self.imported_demo_episodes = set()
         self._interaction_budget = 0
         self.publish = publish
         self.checkpoint_path = checkpoint_path
@@ -250,6 +251,7 @@ class RealLearnerRuntime:
                     'beta_pretrain_steps': self.beta_pretrain_completed,
                     'beta_update_steps': self.beta_update_count,
                     'human_total': self.human_transitions_total,
+                    'imported_demo_episodes': len(self.imported_demo_episodes),
                     'accepted': self.accepted_transitions, 'updates': self.update_count,
                     'budget': self._interaction_budget,
                     'online_position': self.online_replay.position,
@@ -330,7 +332,8 @@ class RealLearnerRuntime:
             if self.beta_pretrain_completed >= opt.beta_pretrain_steps:
                 return True
             with self._lock:
-                if len(self.human_replay) == 0:
+                if (len(self.human_replay) < opt.beta_min_human_transitions or
+                        len(self.imported_demo_episodes) < opt.beta_min_demo_episodes):
                     return False
                 baseline_count = self.human_transitions_total
             while self.beta_pretrain_completed < opt.beta_pretrain_steps:
@@ -422,6 +425,7 @@ class RealLearnerRuntime:
                     human_transitions_total=self.human_transitions_total,
                     beta_last_human_count=self.beta_last_human_count,
                     beta_last_loss=self.beta_last_loss,
+                    imported_demo_episodes=sorted(self.imported_demo_episodes),
                     interaction_budget=self._interaction_budget,
                     torch_rng=torch.get_rng_state(),
                     cuda_rng=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -530,6 +534,14 @@ def load_checkpoint(path: Path, *, expected_run_id: str, expected_config_hash: s
              learner.beta_pretrain_completed != config.optimization.beta_pretrain_steps)):
         raise ValueError('Inconsistent beta readiness checkpoint')
     learner.beta_last_loss = payload.get('beta_last_loss')
+    demo_ids = payload.get('imported_demo_episodes')
+    if (type(demo_ids) is not list or any(type(key) is not str or not key for key in demo_ids)
+            or len(set(demo_ids)) != len(demo_ids)):
+        raise ValueError('Invalid imported demonstration checkpoint inventory')
+    learner.imported_demo_episodes = set(demo_ids)
+    if (learner.beta_pretrain_completed and
+            len(demo_ids) < config.optimization.beta_min_demo_episodes):
+        raise ValueError('Beta checkpoint lacks required complete demonstrations')
     if (learner.beta_last_loss is not None and
             (type(learner.beta_last_loss) not in (int, float) or
              not np.isfinite(learner.beta_last_loss))):

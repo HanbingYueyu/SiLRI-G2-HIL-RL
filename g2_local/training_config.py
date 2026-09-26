@@ -261,6 +261,8 @@ class OptimizationConfig:
     beta_pretrain_steps: int = 500
     beta_update_interval: int = 50
     beta_update_steps: int = 50
+    beta_min_demo_episodes: int = 20
+    beta_min_human_transitions: int = 256
 
 
 @dataclass(frozen=True)
@@ -291,6 +293,8 @@ class MotionRuntimeConfig:
     adapter_root: Path
     local_envelope: LocalEnvelope | None = None
     auto_reset: AutoResetConfig = AutoResetConfig()
+    policy_position_drift_m: float = .005
+    policy_rotation_drift_rad: float = .02
 
 
 @dataclass(frozen=True)
@@ -466,6 +470,10 @@ def parse_schema_one(payload) -> LoadedTrainingConfig:
         motion_fields += ('local_envelope',)
     if type(payload['motion']) is dict and 'auto_reset' in payload['motion']:
         motion_fields += ('auto_reset',)
+    if type(payload['motion']) is dict:
+        motion_fields += tuple(key for key in ('policy_position_drift_m',
+                                               'policy_rotation_drift_rad')
+                               if key in payload['motion'])
     raw = _keys(payload['motion'], motion_fields, 'motion')
     auto_reset = AutoResetConfig()
     if 'auto_reset' in raw:
@@ -493,7 +501,11 @@ def parse_schema_one(payload) -> LoadedTrainingConfig:
         command_lifetime_s=_number(raw['command_lifetime_s'], 'command_lifetime_s', positive=True),
         send_rate_hz=_number(raw['send_rate_hz'], 'send_rate_hz', positive=True),
         adapter_root=_path(raw['adapter_root'], 'adapter_root'),
-        local_envelope=local_envelope, auto_reset=auto_reset)
+        local_envelope=local_envelope, auto_reset=auto_reset,
+        policy_position_drift_m=_number(raw.get('policy_position_drift_m', .005),
+                                       'policy_position_drift_m', positive=True),
+        policy_rotation_drift_rad=_number(raw.get('policy_rotation_drift_rad', .02),
+                                         'policy_rotation_drift_rad', positive=True))
     if (motion.send_timeout_s > motion.command_timeout_s or
             motion.command_lifetime_s > motion.command_timeout_s or
             1 / motion.send_rate_hz > motion.command_lifetime_s):
@@ -545,7 +557,8 @@ def parse_schema_one(payload) -> LoadedTrainingConfig:
         raise ValueError('optimization must be an object')
     optimization_values = dict(payload['optimization'])
     for key, default in (('beta_pretrain_steps', 500), ('beta_update_interval', 50),
-                         ('beta_update_steps', 50)):
+                         ('beta_update_steps', 50), ('beta_min_demo_episodes', 20),
+                         ('beta_min_human_transitions', 256)):
         optimization_values.setdefault(key, default)
     raw = _keys(optimization_values, _fields(OptimizationConfig), 'optimization')
     optimization = OptimizationConfig(**{
@@ -554,7 +567,8 @@ def parse_schema_one(payload) -> LoadedTrainingConfig:
         for key in _fields(OptimizationConfig)})
     if (optimization.online_batch_size > optimization.online_capacity or
             optimization.human_batch_size > optimization.human_capacity or
-            optimization.min_online_transitions > optimization.online_capacity):
+            optimization.min_online_transitions > optimization.online_capacity or
+            optimization.beta_min_human_transitions > optimization.human_capacity):
         raise ValueError('Optimization batch or warmup exceeds replay capacity')
 
     raw = _keys(payload['runtime'], _fields(RuntimeConfig), 'runtime')

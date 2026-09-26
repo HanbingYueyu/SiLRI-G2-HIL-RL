@@ -686,6 +686,18 @@ class RealActorRuntime:
             raise
         finally:
             cleanup_error = None
+            if pending is not None:
+                # Do not invent a terminal label or retry an ambiguous delivery.
+                # Preserve the identity and uncertainty in the existing journal.
+                try:
+                    self._emit('pending_transition_discarded', count=1,
+                               transition_id=pending[0]['complementary_info']['transition_id'],
+                               reason='actor_exit_before_pending_delivery_confirmed',
+                               delivery_status='not_confirmed',
+                               error=(type(primary_error).__name__ if primary_error else None))
+                except BaseException as error:
+                    cleanup_error = error
+                    logging.exception('Could not journal pending transition discard')
             try:
                 if env is not None:
                     env.close()

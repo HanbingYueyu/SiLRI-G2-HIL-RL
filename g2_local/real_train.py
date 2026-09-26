@@ -335,10 +335,12 @@ def _run_learner(args, loaded, evidence):
     if getattr(args, 'demonstrations', ()):
         from .demonstrations import import_demonstrations
         result = import_demonstrations(learner, args.demonstrations, evidence=evidence)
-        learner.pretrain_behavior()
+        beta_ready = learner.pretrain_behavior()
         learner.save_checkpoint(learner.checkpoint_path)
         evidence.event('demo_import_completed', **result)
-        evidence.event('beta_pretrained', steps=learner.beta_pretrain_completed,
+        evidence.event('beta_pretrained' if beta_ready else 'beta_waiting_for_demonstrations',
+                       complete_demo_episodes=len(learner.imported_demo_episodes),
+                       steps=learner.beta_pretrain_completed,
                        last_loss=learner.beta_last_loss,
                        human_samples=learner.human_transitions_total)
     service = GrpcLearnerService(learner)
