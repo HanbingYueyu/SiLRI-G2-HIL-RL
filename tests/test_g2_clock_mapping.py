@@ -37,8 +37,21 @@ def test_mapping_sign_scale_drift_and_error_growth():
     assert later_error > error
 
 
+def test_millisecond_ptp_jitter_is_accounted_for_within_total_error_budget():
+    from g2_local.clock_mapping import fit_mapping
+    evidence = samples()
+    for i, sample in enumerate(evidence):
+        sample['offset_ns'] += 1_100_000 if i % 2 else -1_100_000
+    m = fit_mapping(evidence, master='044052.fffe.000010',
+                    utc_offset_s=37, session='jitter')
+    assert 1_000_000 < m.residual_ns <= 1_500_000
+    _, error = m.offset_at(m.expires_ns, session='jitter', scale='raw_ptp')
+    assert error >= 2_000_000 + m.residual_ns + 40_000 + 450_000
+    assert error <= 5_000_000
+
+
 @pytest.mark.parametrize('when,session,scale', [
-    (121_000_000_000, 'test', 'raw_ptp'),
+    (123_000_000_000, 'test', 'raw_ptp'),
     (99_000_000_000, 'test', 'raw_ptp'),
     (118_000_000_000, 'other-boot-or-run', 'raw_ptp'),
     (118_000_000_000, 'test', 'unknown'),

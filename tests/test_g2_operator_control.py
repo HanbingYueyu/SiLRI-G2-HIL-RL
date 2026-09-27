@@ -29,10 +29,11 @@ def test_duplicate_context_is_rejected(tmp_path):
     with pytest.raises(ValueError, match='duplicate'): inbox.read_new()
 
 
-def test_chord_needs_fresh_joint_press_and_release():
+def test_chord_accepts_split_press_reports_then_full_release():
     chord = StartChord(left_button=0, right_button=1)
     assert chord.update(frame(buttons=(True, False), pressed=(0,))) is False
     assert chord.update(frame(buttons=(True, True), pressed=(1,))) is False
+    assert chord.update(frame(buttons=(False, False))) is True
     assert chord.update(frame(buttons=(False, False))) is False
     assert chord.update(frame(buttons=(True, True), pressed=(0, 1))) is False
     assert chord.update(frame(buttons=(True, False))) is False

@@ -12,6 +12,34 @@ from g2_local import real_train
 TEMPLATE = Path(__file__).resolve().parents[1] / 'configs/g2_real_training_readonly.json'
 
 
+def test_persistent_checkpoint_prefers_saved_state_and_refuses_missing_seed(tmp_path):
+    args = SimpleNamespace(role='learner', checkpoint_dir=tmp_path/'training',
+                           checkpoint=tmp_path/'seed.pt')
+    with pytest.raises(ValueError):
+        real_train.learner_checkpoint_paths(args, tmp_path/'output')
+    args.checkpoint.write_bytes(b'seed')
+    source, target = real_train.learner_checkpoint_paths(args, tmp_path/'output')
+    assert source == args.checkpoint
+    target.write_bytes(b'latest')
+    source, again = real_train.learner_checkpoint_paths(args, tmp_path/'new-output')
+    assert source == target == again
+
+
+def test_clock_endpoint_override_preserves_contract_and_never_grants_motion(tmp_path):
+    from g2_local.training_config import load_training_config
+    loaded = load_training_config(_config(tmp_path), cli_allow_motion=False)
+    args = SimpleNamespace(role='actor', clock_socket=Path('/tmp/new-clock/clock.sock'))
+    updated = real_train.with_clock_endpoint(args, loaded)
+    assert updated.commissioning.clock_socket == args.clock_socket
+    assert updated.config_hash == loaded.config_hash
+    assert updated.canonical_payload == loaded.canonical_payload
+    assert updated.motion_permitted is False
+    assert loaded.commissioning.clock_socket != args.clock_socket
+    args.role = 'learner'
+    with pytest.raises(ValueError, match='clock'):
+        real_train.with_clock_endpoint(args, loaded)
+
+
 @pytest.mark.parametrize('key,error', [('Y', None), ('F', RuntimeError), ('Y', KeyboardInterrupt)])
 def test_terminal_single_byte_and_restoration(monkeypatch, key, error):
     import os
@@ -290,6 +318,8 @@ def test_learner_passes_owned_output_checkpoint_path_to_runtime(tmp_path, monkey
     created = []
     class Learner:
         version = 0
+        update_count = 0
+        completed_episode_ids = set()
         stopped = SimpleNamespace(wait=lambda timeout: True)
         def __init__(self, **kwargs):
             created.append(kwargs)
@@ -298,9 +328,12 @@ def test_learner_passes_owned_output_checkpoint_path_to_runtime(tmp_path, monkey
             return object()
         def snapshot_counts(self):
             return {}
+        def save_checkpoint(self, path):
+            assert path == self.checkpoint_path
     class Service:
         failure = None
         preservation_failure = None
+        recovery_checkpoint_path = None
         def __init__(self, learner):
             pass
         def publish(self, envelope):

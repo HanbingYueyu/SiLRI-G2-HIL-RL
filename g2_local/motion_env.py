@@ -23,7 +23,12 @@ class MotionFactories:
         def clock_client(socket, master):
             return SnapshotClient(socket, timeout_s=2., expected_master=master)
 
-        return MotionFactories(clock_client, GdkReader, GdkCommandPort)
+        def command_port(controller, **kwargs):
+            from .safe_stop import prepare_safe_stop
+            request = prepare_safe_stop(controller.robot, kwargs['expected_mode'])
+            return GdkCommandPort(controller, safe_stop_request=request, **kwargs)
+
+        return MotionFactories(clock_client, GdkReader, command_port)
 
 
 class OwnedObservationSource:
@@ -44,6 +49,10 @@ class OwnedObservationSource:
 
     def observe(self):
         return self.reader.observe()
+
+    @property
+    def read_control_pose(self):
+        return getattr(self.reader, 'read_control_pose', None)
 
     def close(self):
         if self._closed:
@@ -87,14 +96,36 @@ def create_motion_env(config, coordinator, *, cli_allow_motion, factories=None) 
                                   timeout_s=config.motion.reader_timeout_s,
                                   allow_motion=True)
         source = OwnedObservationSource(reader, client)
+        if hasattr(reader, 'camera_pair_max_skew_s'):
+            # Acquisition prefilter only: the final guard still accounts for
+            # mapping uncertainty, age, progression and post-command ordering.
+            reader.camera_pair_max_skew_s = config.freshness.camera_skew_s
         _preflight_mode(source.controller, config.motion.control_mode)
         observation_guard = ObservationFreshnessGuard(client, config.freshness)
         lease = FreshnessLeaseGuard(observation_guard,
                                     feedback_lease_s=config.motion.command_timeout_s)
+        stop_options = {}
+        if callable(getattr(reader, 'read_stop_feedback', None)):
+            stop_guard = ObservationFreshnessGuard(client, config.freshness)
+            def stop_pose_provider():
+                # Do not race an SDK read or release its resources under a hold.
+                if backend is None or not backend.reader_lock.acquire(
+                        timeout=config.motion.stop_timeout_s):
+                    raise TimeoutError('Independent stop feedback reader is busy')
+                try:
+                    info = reader.read_stop_feedback()
+                    stop_guard.validate_stop_feedback(info)
+                    from .motion_backend import PoseTarget
+                    pose = info['motion_pose']
+                    return PoseTarget(tuple(pose[:3]), tuple(pose[3:]))
+                finally:
+                    backend.reader_lock.release()
+            stop_options['stop_pose_provider'] = stop_pose_provider
         port = factories.command_port(source.controller,
                                       expected_mode=config.motion.control_mode,
                                       allow_motion=True, freshness_guard=lease,
-                                      life_time_s=config.motion.command_lifetime_s)
+                                      life_time_s=config.motion.command_lifetime_s,
+                                      **stop_options)
         backend = MotionBackend(source, port, config=config.motion.limits,
                                 observation_guard=lease.accept,
                                 outcome=coordinator.outcome,
@@ -104,6 +135,8 @@ def create_motion_env(config, coordinator, *, cli_allow_motion, factories=None) 
                                 send_rate_hz=config.motion.send_rate_hz,
                                 local_envelope=config.motion.local_envelope,
                                 reference_guard=observation_guard.revalidate,
+                                startup_camera_wait_s=2.,
+                                startup_mapping_wait_s=60.,
                                 policy_position_drift_m=config.motion.policy_position_drift_m,
                                 policy_rotation_drift_rad=config.motion.policy_rotation_drift_rad,
                                 before_command=getattr(coordinator, 'before_command', None),

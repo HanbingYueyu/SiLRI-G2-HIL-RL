@@ -98,7 +98,8 @@ class LiveInputGate:
                           (raw if button else raw[:3]))
             self.fresh = bool(math.isfinite(now) and frame.ready and len(stamps) == 2
                      and all(t is not None and math.isfinite(t) and
-                             0 <= now-t <= self.max_age for t in stamps))
+                             0 <= now-t <= self.max_age
+                             for t in (stamps if button else stamps[:1])))
             evidence = (stamps, button)
             idle = (math.isfinite(now) and frame.ready and neutral and
                     self.neutral_evidence == evidence and
@@ -166,6 +167,8 @@ class AutomaticIntervention:
     read and raise on disconnect, not just return an application-side cache.
     A silent zero report is not a device/firmware heartbeat.
     """
+    accept_observed_zero_hold = False
+
     def __init__(self, reader, config, *, clock=time.monotonic):
         self.reader = reader
         self.config = config
@@ -197,9 +200,25 @@ class AutomaticIntervention:
             if not math.isfinite(now) or (self._last_now is not None and now < self._last_now):
                 raise ValueError('SpaceMouse clock moved backwards')
             self._last_now = now
+            # Automatic/demo control does not require a neutral ritual before
+            # accepting the first live movement. Freshness is still mandatory.
+            if (frame.ready is True and len(frame.axis_times) == 2 and
+                    all(t is not None and math.isfinite(t) and
+                        0 <= now-t <= self.config.report_max_age_s for t in
+                        (frame.axis_times if frame.buttons[self.config.left_button]
+                         else frame.axis_times[:1]))):
+                self.gate.mapper.armed = True
             proposal = self.gate.update(frame, now=now)
             self.last_frame = frame
             stamps = tuple(frame.axis_times)
+            if (frame.ready is False and self.last_stamps is None and
+                    len(stamps) == 2 and
+                    all(t is None or (math.isfinite(t) and 0 <= t <= now) for t in stamps)):
+                # Startup readiness needs both axis channels AND a button report.
+                # No complete axis report yet: zero-only hold, never replay input.
+                self.gate.invalidate()
+                self.active = False
+                return False, None
             if (frame.ready is not True or len(stamps) != 2 or
                     any(t is None or not math.isfinite(t) or t < 0 or t > now
                         for t in stamps)):
@@ -211,17 +230,36 @@ class AutomaticIntervention:
                           any(current > previous for current, previous in
                               zip(stamps, self.last_stamps)))
             self.last_stamps = stamps
-            signature = (stamps, tuple(frame.buttons), tuple(frame.axes))
+            # Exactly-zero six-axis evidence is independent of button mode.
+            signature = (stamps, tuple(frame.axes))
             exactly_zero = not any(value != 0 for value in frame.axes)
             # Require a newly observed zero report; never infer release from
             # silence following motion or a value merely inside the deadzone.
             if not exactly_zero:
                 self._zero_evidence = None
-            elif self.gate.fresh and new_report and not proposal.blocked:
+            elif new_report and ((self.gate.fresh and not proposal.blocked) or
+                                 self.accept_observed_zero_hold):
+                # Pure-human demo may hold on observed complete exact-zero
+                # reports even across SDK startup delay. This is NOT freshness
+                # and must never authorize policy takeover or nonzero movement.
                 self._zero_evidence = signature
             self.verified_neutral = bool(exactly_zero and self._zero_evidence == signature)
+            if not self.gate.fresh and not self.verified_neutral and not self.require_fresh():
+                # Waiting for the start chord is not an executing episode.
+                # Discard expired input and require a new frame to arm.
+                self.active = False
+                self.neutral_since = None
+                self._zero_evidence = None
+                self.verified_neutral = False
+                self.gate.invalidate()
+                return False, None
             if not self.gate.fresh and any(value != 0 for value in frame.axes):
-                raise RuntimeError('stale nonzero SpaceMouse input')
+                ages = tuple(round(now-t, 4) for t in stamps)
+                raise RuntimeError(
+                    'stale nonzero SpaceMouse input: '
+                    f'axis_ages_s={ages}, axes={tuple(frame.axes)}, '
+                    f'left_pressed={frame.buttons[self.config.left_button]}, '
+                    f'max_age_s={self.config.report_max_age_s}')
             if not self.gate.fresh and not self.verified_neutral and self.require_fresh():
                 raise RuntimeError('stale neutral SpaceMouse input')
             moving = max(map(abs, proposal.action)) > self.config.engage_deadzone
@@ -249,6 +287,8 @@ class AutomaticIntervention:
 
 class DemonstrationIntervention(AutomaticIntervention):
     """Keep human authority while recording; neutral never hands to a policy."""
+
+    accept_observed_zero_hold = True
 
     def __call__(self):
         super().__call__()  # Retain the same live-read and fault checks.

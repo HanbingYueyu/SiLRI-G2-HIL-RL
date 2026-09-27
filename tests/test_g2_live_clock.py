@@ -44,6 +44,23 @@ def feed_master_properties_and_8_samples(window):
         )
 
 
+def test_local_properties_before_remote_discovery_do_not_poison_startup():
+    from g2_local.live_clock import ClockWindow
+
+    window = ClockWindow(MASTER, 'boot', 'run')
+    window.feed_ptp('ptp4l[0.100]: selected local clock c8ffbf.fffe.0c8c47 as best master',
+                    100_000_000, wall(100_000_000))
+    window.feed_properties(properties(timescale=0), 200_000_000)
+    early = window.snapshot(300_000_000, wall(300_000_000))
+    assert not early.healthy
+    assert early.reason == 'warming_up'
+    assert early.valid_until_ns == 0
+    feed_master_properties_and_8_samples(window)
+    assert window.snapshot(16_100_000_000, wall(16_100_000_000)).healthy
+    window.feed_properties(properties(timescale=0), 16_200_000_000)
+    assert window.snapshot(16_300_000_000, wall(16_300_000_000)).reason == 'properties_invalid'
+
+
 def healthy_window():
     from g2_local.live_clock import ClockWindow
 
@@ -86,7 +103,7 @@ def test_window_warms_then_publishes_short_raw_ptp_lease():
     assert snap.wall_minus_mono_ns == ORIGIN_NS
     assert snap.created_mono_ns == 16_100_000_000
     assert snap.last_sample_mono_ns == 16_000_000_000
-    assert snap.valid_until_ns == snap.last_sample_mono_ns + 2_500_000_000
+    assert snap.valid_until_ns == snap.last_sample_mono_ns + 4_500_000_000
 
 
 def test_repeating_snapshot_does_not_extend_old_lease():
@@ -107,9 +124,42 @@ def test_new_sample_refits_and_moves_only_the_ptp_derived_lease():
     second = window.snapshot(18_100_000_000, wall(18_100_000_000))
 
     assert second.reference_mono_ns == 18_000_000_000
-    assert second.valid_until_ns == 20_500_000_000
+    assert second.valid_until_ns == 22_500_000_000
     assert second.valid_until_ns > first.valid_until_ns
     assert second.offset_at_reference_ns == pytest.approx(18_000_160_000, abs=1)
+
+
+def test_quarantined_sample_gap_rewarms_without_latching_transport_failure():
+    window = healthy_window()
+    # Raw reports remain 2 seconds apart; only the fit rejects the 18s outlier.
+    window.feed_ptp(offset_line(18, 55_100_000_000),
+                    18_010_000_000, wall(18_010_000_000))
+    window.feed_ptp(offset_line(20.001, 55_000_180_010),
+                    20_011_000_000, wall(20_011_000_000))
+    snap = window.snapshot(20_100_000_000, wall(20_100_000_000))
+    assert not snap.healthy
+    assert snap.reason == 'warming_up'
+    assert snap.valid_until_ns == 0
+    for index in range(1, 8):
+        ns = 20_001_000_000 + index * 2_000_000_000
+        window.feed_ptp(offset_line(ns / 1e9, 55_000_180_010 + index * 20_000),
+                        ns + 10_000_000, wall(ns + 10_000_000))
+    recovered = window.snapshot(34_100_000_000, wall(34_100_000_000))
+    assert recovered.healthy
+    assert recovered.reference_mono_ns == 34_001_000_000
+
+
+def test_lease_tolerates_one_quarantined_report_but_expires_without_recovery():
+    window = healthy_window()
+    before = window.snapshot(16_100_000_000, wall(16_100_000_000))
+    window.feed_ptp(offset_line(18, 55_100_000_000),
+                    18_010_000_000, wall(18_010_000_000))
+    waiting = window.snapshot(20_100_000_000, wall(20_100_000_000))
+    assert waiting.healthy
+    assert waiting.reference_mono_ns == before.reference_mono_ns
+    assert waiting.valid_until_ns == before.valid_until_ns
+    expired = window.snapshot(20_500_000_001, wall(20_500_000_001))
+    assert not expired.healthy and expired.reason == 'lease_expired'
 
 
 def inject_fault(window, fault):
@@ -129,7 +179,7 @@ def inject_fault(window, fault):
     elif fault == 'residual':
         now_ns = 18_000_000_000
         wall_ns = wall(now_ns)
-        window.feed_ptp(offset_line(18, 55_002_160_000), now_ns, wall_ns)
+        window.feed_ptp(offset_line(18, 55_003_160_000), now_ns, wall_ns)
     elif fault == 'delay':
         now_ns = 18_000_000_000
         wall_ns = wall(now_ns)
@@ -168,7 +218,7 @@ def test_post_mapping_transient_spike_is_quarantined_without_lease_extension():
     # A syntactically valid but transient residual spike must not revoke the
     # already published lease or make the monitor exit.  It is not evidence
     # that can extend the lease either.
-    window.feed_ptp(offset_line(18, 55_002_160_000),
+    window.feed_ptp(offset_line(18, 55_003_160_000),
                     18_010_000_000, wall(18_010_000_000))
     held = window.snapshot(18_100_000_000, wall(18_100_000_000))
     assert held.healthy is True
@@ -191,7 +241,7 @@ def test_post_mapping_transient_spike_is_quarantined_without_lease_extension():
 def test_post_mapping_transient_spike_expires_without_clean_recovery():
     window = healthy_window()
     first = window.snapshot(16_100_000_000, wall(16_100_000_000))
-    window.feed_ptp(offset_line(18, 55_002_160_000),
+    window.feed_ptp(offset_line(18, 55_003_160_000),
                     18_010_000_000, wall(18_010_000_000))
 
     expired = window.snapshot(first.valid_until_ns + 1,
@@ -264,17 +314,17 @@ def test_startup_high_path_delay_discards_sample_then_recovers_cleanly():
 
 def test_repeated_transient_spikes_restart_warmup_without_gap_latch():
     window = healthy_window()
-    window.feed_ptp(offset_line(18, 55_002_160_000),
+    window.feed_ptp(offset_line(18, 55_003_160_000),
                     18_010_000_000, wall(18_010_000_000))
-    window.feed_ptp(offset_line(20, 55_002_180_000),
+    window.feed_ptp(offset_line(20, 55_003_180_000),
                     20_010_000_000, wall(20_010_000_000))
 
-    warming = window.snapshot(20_100_000_000, wall(20_100_000_000))
+    warming = window.snapshot(20_600_000_000, wall(20_600_000_000))
     assert warming.healthy is False
-    assert warming.reason == 'warming_up'
+    assert warming.reason == 'lease_expired'
 
-    # The ordering anchor remains at 20 s, while the expired fit window has
-    # been discarded. Eight clean reports can form a wholly new mapping.
+    # The next raw report is timely, but its gap from the accepted window is
+    # excessive. It starts a fresh warm-up instead of latching a transport fault.
     for index, second in enumerate(range(22, 38, 2)):
         window.feed_ptp(offset_line(second, 55_100_000_000 + index * 20_000),
                         second * 1_000_000_000 + 10_000_000,
@@ -417,7 +467,7 @@ def test_startup_residual_spike_restarts_warmup_and_allows_a_fresh_mapping():
     # The eighth candidate is valid PTP syntax/delivery evidence, but its
     # offset makes the first fit exceed the fixed residual limit.
     window.feed_ptp(
-        offset_line(16, 55_002_140_000),
+        offset_line(16, 55_003_140_000),
         16_010_000_000,
         wall(16_010_000_000),
     )
@@ -547,10 +597,10 @@ def test_missing_or_expired_evidence_is_unhealthy_without_extending_the_lease():
     assert no_properties.snapshot(16_100_000_000, wall(16_100_000_000)).healthy is False
 
     window = healthy_window()
-    expired = window.snapshot(18_500_000_001, wall(18_500_000_001))
+    expired = window.snapshot(20_500_000_001, wall(20_500_000_001))
     assert expired.healthy is False
     assert expired.reason == 'lease_expired'
-    assert expired.valid_until_ns == 18_500_000_000
+    assert expired.valid_until_ns == 20_500_000_000
 
 
 def test_snapshot_is_frozen():

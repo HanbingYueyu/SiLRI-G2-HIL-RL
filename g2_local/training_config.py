@@ -263,6 +263,8 @@ class OptimizationConfig:
     beta_update_steps: int = 50
     beta_min_demo_episodes: int = 20
     beta_min_human_transitions: int = 256
+    actor_update_interval: int = 1  # Legacy profiles retain their original schedule.
+    episode_checkpoint_interval: int = 10
 
 
 @dataclass(frozen=True)
@@ -558,7 +560,8 @@ def parse_schema_one(payload) -> LoadedTrainingConfig:
     optimization_values = dict(payload['optimization'])
     for key, default in (('beta_pretrain_steps', 500), ('beta_update_interval', 50),
                          ('beta_update_steps', 50), ('beta_min_demo_episodes', 20),
-                         ('beta_min_human_transitions', 256)):
+                         ('beta_min_human_transitions', 256), ('actor_update_interval', 1),
+                         ('episode_checkpoint_interval', 10)):
         optimization_values.setdefault(key, default)
     raw = _keys(optimization_values, _fields(OptimizationConfig), 'optimization')
     optimization = OptimizationConfig(**{

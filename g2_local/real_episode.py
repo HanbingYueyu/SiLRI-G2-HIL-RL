@@ -95,7 +95,7 @@ class RealEpisodeCoordinator:
             self._abort()
             raise RuntimeError('Input fault before episode start')
         gate = getattr(self.intervention, 'gate', None)
-        if gate is None or getattr(gate, 'fresh', None) is not True:
+        if gate is None:
             self.chord.reset()
             return False
         if not self.chord.update(self.intervention.last_frame):

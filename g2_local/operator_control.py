@@ -44,9 +44,12 @@ class StartChord:
         self._previous = (False, False)
         self._armed = False
         self._released = False
+        self._presses = set()
 
     def update(self, frame):
-        if frame is None or getattr(frame, 'ready', True) is not True:
+        # Axis readiness is not button readiness. This frame came from the
+        # live HID poll; observed button transitions alone confirm the chord.
+        if frame is None:
             self.reset()
             return False
         buttons = (frame.buttons[self.left_button], frame.buttons[self.right_button])
@@ -54,23 +57,25 @@ class StartChord:
             self.reset()
             raise ValueError('Boolean button reports required')
         pressed = getattr(frame, 'pressed', None)
-        if pressed is None:
-            fresh = tuple(i for i, (old, new) in enumerate(zip(self._previous, buttons))
-                          if not old and new)
-        else:
-            fresh = tuple((self.left_button, self.right_button).index(i)
-                          for i in pressed if i in (self.left_button, self.right_button))
+        fresh = set(i for i, (old, new) in enumerate(zip(self._previous, buttons))
+                    if not old and new)
+        if pressed is not None:
+            fresh.update((self.left_button, self.right_button).index(i)
+                         for i in pressed if i in (self.left_button, self.right_button))
         result = False
+        self._presses.update(fresh)
         if self._armed:
             if buttons == (False, False):
                 self._armed = False
                 result = True
-        elif buttons == (True, True) and set(fresh) == {0, 1} and not self._released:
+        elif buttons == (True, True) and self._presses == {0, 1} and not self._released:
             self._armed = True
         if result:
             self._released = True
         elif buttons == (False, False):
             self._released = False
+        if buttons == (False, False):
+            self._presses.clear()
         self._previous = buttons
         return result
 

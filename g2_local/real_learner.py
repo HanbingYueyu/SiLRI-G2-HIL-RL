@@ -198,7 +198,8 @@ class RealLearnerRuntime:
         opt = config.optimization
         for name in ('online_capacity', 'human_capacity', 'min_online_transitions',
                      'online_batch_size', 'human_batch_size', 'utd_ratio',
-                     'target_update_interval', 'publish_interval', 'checkpoint_interval'):
+                     'target_update_interval', 'publish_interval', 'checkpoint_interval',
+                     'actor_update_interval', 'episode_checkpoint_interval'):
             if type(getattr(opt, name)) is not int or getattr(opt, name) <= 0:
                 raise ValueError(f'Invalid {name}')
         if (opt.online_batch_size > opt.online_capacity or
@@ -231,6 +232,8 @@ class RealLearnerRuntime:
             for key, value in self.policy.actor.state_dict().items()}
         self.accepted_transitions = 0
         self.update_count = 0
+        self.completed_episode_ids = set()
+        self.progress = None
         self.beta_pretrain_completed = 0
         self.beta_update_count = 0
         self.human_transitions_total = 0
@@ -253,25 +256,27 @@ class RealLearnerRuntime:
                     'human_total': self.human_transitions_total,
                     'imported_demo_episodes': len(self.imported_demo_episodes),
                     'accepted': self.accepted_transitions, 'updates': self.update_count,
+                    'completed_episodes': len(self.completed_episode_ids),
                     'budget': self._interaction_budget,
                     'online_position': self.online_replay.position,
                     'human_position': self.human_replay.position}
 
-    def ingest(self, rows):
-        with self._lock:
+    def ingest(self, rows, *, count_episodes=True):
+        with self._update_lock, self._lock:
             if self.stopped.is_set():
                 raise RuntimeError('Learner stopped')
-            return self._ingest_prepared(self._prepare_rows(rows))
+            return self._ingest_prepared(self._prepare_rows(rows), count_episodes=count_episodes)
 
     def _prepare_rows(self, rows):
         return tuple((validate_real_transition(row, self.run_id, self.config_hash).value,
                       _training_row(row), compact_record(row)) for row in rows)
 
-    def _ingest_prepared(self, prepared, *, accepted_before_stop=False):
-        with self._lock:
+    def _ingest_prepared(self, prepared, *, accepted_before_stop=False, count_episodes=True):
+        with self._update_lock, self._lock:
             if self.stopped.is_set() and not accepted_before_stop:
                 raise RuntimeError('Learner stopped')
             new = set()
+            previous_episodes = len(self.completed_episode_ids)
             accepted = duplicates = 0
             for identity, training, record in prepared:
                 if identity in self.seen_transition_ids or identity in new:
@@ -284,9 +289,18 @@ class RealLearnerRuntime:
                 self.seen_transition_ids.add(identity)
                 new.add(identity)
                 self.records.append(record)
+                if count_episodes and (training['done'] or training['truncated']):
+                    self.completed_episode_ids.add(record['complementary_info']['episode_id'])
                 accepted += 1
             self.accepted_transitions += accepted
             self._interaction_budget += accepted * self.config.optimization.utd_ratio
+            completed = len(self.completed_episode_ids)
+            if completed != previous_episodes and self.progress is not None:
+                self.progress(dict(event='episode_completed', completed_episodes=completed,
+                                   next_episode=completed+1, learner_update=self.update_count))
+            interval = self.config.optimization.episode_checkpoint_interval
+            if self.checkpoint_path is not None and completed//interval > previous_episodes//interval:
+                self.save_checkpoint(self.checkpoint_path)
             return IngestResult(accepted, duplicates)
 
     def _envelope(self, version, state):
@@ -373,7 +387,10 @@ class RealLearnerRuntime:
                 data = (concatenate_batch_transitions(
                     online, self.human_replay.sample(opt.human_batch_size))
                     if has_human else online)
-            names = ('critic', 'actor', 'lagrange')
+            # Count Critic updates, not environment steps; the counter is restored
+            # from checkpoint so resuming on an odd update preserves the phase.
+            actor_due = (self.update_count + 1) % opt.actor_update_interval == 0
+            names = ('critic', 'actor', 'lagrange') if actor_due else ('critic', 'lagrange')
             metrics = train_batch(self.policy, self.optimizers, data, names)
             metrics.update(beta_pretrain_steps=self.beta_pretrain_completed,
                            beta_update_steps=self.beta_update_count,
@@ -383,6 +400,11 @@ class RealLearnerRuntime:
                 self.update_count += 1
                 if self._interaction_budget:
                     self._interaction_budget -= 1
+            if self.progress is not None:
+                self.progress(dict(event='learner_update', learner_update=self.update_count,
+                                   completed_episodes=len(self.completed_episode_ids),
+                                   actor_updated=actor_due, actor_loss=metrics.get('actor'),
+                                   critic_loss=metrics['critic']))
             if self.version % opt.target_update_interval == 0:
                 self.policy.update_target_networks()
             if self.version % opt.publish_interval == 0:
@@ -420,6 +442,7 @@ class RealLearnerRuntime:
                     published_actor_state=self._published_actor_state,
                     accepted_transitions=self.accepted_transitions,
                     update_count=self.update_count,
+                    completed_episode_ids=sorted(self.completed_episode_ids),
                     beta_pretrain_completed=self.beta_pretrain_completed,
                     beta_update_count=self.beta_update_count,
                     human_transitions_total=self.human_transitions_total,
@@ -453,6 +476,10 @@ class RealLearnerRuntime:
                     os.fsync(directory_fd)
                 finally:
                     os.close(directory_fd)
+                if self.progress is not None:
+                    self.progress(dict(event='checkpoint_saved', path=str(path),
+                                       completed_episodes=len(self.completed_episode_ids),
+                                       learner_update=self.update_count))
                 return path
             finally:
                 temporary.unlink(missing_ok=True)
@@ -522,6 +549,14 @@ def load_checkpoint(path: Path, *, expected_run_id: str, expected_config_hash: s
     learner._published_actor_state = published
     learner.accepted_transitions = payload['accepted_transitions']
     learner.update_count = payload['update_count']
+    completed = payload.get('completed_episode_ids', [])
+    terminal_ids = {r['complementary_info']['episode_id'] for r in learner.records
+                    if r['done'] or r['truncated']}
+    if (type(completed) is not list or any(type(x) is not str for x in completed)
+            or len(set(completed)) != len(completed) or not set(completed) <= terminal_ids
+            or set(completed).intersection(payload.get('imported_demo_episodes', []))):
+        raise ValueError('Invalid completed episode checkpoint inventory')
+    learner.completed_episode_ids = set(completed)
     for name in ('beta_pretrain_completed', 'beta_update_count',
                  'human_transitions_total', 'beta_last_human_count'):
         value = payload.get(name)

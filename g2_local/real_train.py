@@ -1,8 +1,9 @@
 """Operator-facing, fail-closed composition for real SiLRI train and eval."""
 
 import argparse
+import fcntl
 from concurrent import futures
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from functools import partial
 import json
 import logging
@@ -29,11 +30,26 @@ def parser():
     cli.add_argument('--output', type=Path, required=True)
     cli.add_argument('--allow-motion', action='store_true')
     cli.add_argument('--checkpoint', type=Path)
+    cli.add_argument('--checkpoint-dir', type=Path,
+                     help='Learner only: persistent latest checkpoint; --checkpoint is first-run seed')
     cli.add_argument('--context', type=Path)
     cli.add_argument('--hid-device', type=Path)
+    cli.add_argument('--clock-socket', type=Path,
+                     help='Actor/demo/eval only: current PTP endpoint, logged separately from task identity')
     cli.add_argument('--demonstrations', type=Path, action='append', default=[],
                      help='Learner only: import a complete local demonstration dataset; repeatable')
     return cli
+
+
+def with_clock_endpoint(args, loaded):
+    path = getattr(args, 'clock_socket', None)
+    if path is None:
+        return loaded
+    if args.role == 'learner' or not path.is_absolute() or len(str(path).encode()) > 107:
+        raise ValueError('Absolute Unix clock socket required for Actor/demo/eval only')
+    # Operational endpoint, like --context/--hid-device. SnapshotClient still
+    # checks ownership, master and mapping; this cannot grant motion permission.
+    return replace(loaded, commissioning=replace(loaded.commissioning, clock_socket=path))
 
 
 def bounded_error(error):
@@ -317,21 +333,63 @@ def _validate_cli(args, loaded):
             raise ValueError('CUDA required by configuration but unavailable')
 
 
+def learner_checkpoint_paths(args, output):
+    directory = getattr(args, 'checkpoint_dir', None)
+    if directory is None:
+        return args.checkpoint, output / 'checkpoint.pt'
+    directory = Path(directory)
+    if directory.is_symlink():
+        raise ValueError('Checkpoint directory cannot be a symlink')
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stat = directory.stat()
+    if stat.st_uid != os.getuid() or stat.st_mode & 0o022:
+        raise ValueError('Checkpoint directory must be owned and private from other writers')
+    target = directory / 'checkpoint.pt'
+    if target.is_symlink():
+        raise ValueError('Checkpoint cannot be a symlink')
+    if target.exists():
+        return target, target  # Invalid latest checkpoint must fail, never silently restart.
+    if args.checkpoint is None or not args.checkpoint.is_file():
+        raise ValueError('First run requires an existing --checkpoint seed')
+    return args.checkpoint, target
+
+
 def _run_learner(args, loaded, evidence):
+    # One writer per persistent training directory, including checkpoint load.
+    if getattr(args, 'checkpoint_dir', None) is None:
+        return _run_learner_owned(args, loaded, evidence)
+    _, target = learner_checkpoint_paths(args, evidence.output)
+    fd = os.open(target.parent / 'learner.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return _run_learner_owned(args, loaded, evidence)
+    finally:
+        os.close(fd)
+
+
+def _run_learner_owned(args, loaded, evidence):
     import grpc
     from lerobot.transport import services_pb2_grpc as rpc
     from .real_learner import GrpcLearnerService, RealLearnerRuntime, load_checkpoint
-    if args.checkpoint:
-        snapshot = load_checkpoint(args.checkpoint, expected_run_id=args.run_id,
+    source, target = learner_checkpoint_paths(args, evidence.output)
+    if source:
+        snapshot = load_checkpoint(source, expected_run_id=args.run_id,
                                    expected_config_hash=loaded.config_hash)
         learner = snapshot.runtime
         learner.config = loaded  # Restore task/ROI contract for optional demo import.
-        learner.checkpoint_path = evidence.output / 'checkpoint.pt'
+        learner.checkpoint_path = target
         evidence.event('resumed', physical_episode_state=snapshot.physical_episode_state)
     else:
         learner = RealLearnerRuntime(config=loaded, run_id=args.run_id,
                                      config_hash=loaded.config_hash,
-                                     checkpoint_path=evidence.output / 'checkpoint.pt')
+                                     checkpoint_path=target)
+    def progress(row):
+        evidence.event(row['event'], **{k: v for k, v in row.items() if k != 'event'})
+        print(json.dumps(row, ensure_ascii=False, allow_nan=False), flush=True)
+    learner.progress = progress
+    progress(dict(event='training_resume', completed_episodes=len(learner.completed_episode_ids),
+                  next_episode=len(learner.completed_episode_ids)+1,
+                  learner_update=learner.update_count, checkpoint_source=str(source)))
     if getattr(args, 'demonstrations', ()):
         from .demonstrations import import_demonstrations
         result = import_demonstrations(learner, args.demonstrations, evidence=evidence)
@@ -359,6 +417,8 @@ def _run_learner(args, loaded, evidence):
     finally:
         try:
             service.close()
+            if service.recovery_checkpoint_path is None:
+                learner.save_checkpoint(learner.checkpoint_path)
         finally:
             try:
                 server.stop(grace=loaded.runtime.transport_timeout_s).wait()
@@ -440,6 +500,8 @@ def _run_actor_or_eval(args, loaded, evidence):
             policy=policy,
             telemetry=transport.telemetry, demonstration=args.role == 'demo')
         evidence.event('ready', policy_version=runtime.parameter_version)
+        if args.role == 'demo':
+            print('等待双键开始：两键都按住后全部松开，无需拨动旋帽。', flush=True)
         try:
             summary = runtime.run()
         except BaseException as error:
@@ -468,7 +530,10 @@ def main(argv=None):
             raise ValueError('Bounded ASCII run ID required')
         if args.role == 'learner' and args.allow_motion:
             raise ValueError('--allow-motion is illegal for learner')
+        if args.role != 'learner' and args.checkpoint_dir is not None:
+            raise ValueError('--checkpoint-dir is learner only')
         loaded = load_training_config(args.config, cli_allow_motion=bool(args.allow_motion))
+        loaded = with_clock_endpoint(args, loaded)
         if args.role == 'learner' and loaded.mode != 'train':
             raise ValueError('Learner requires train mode')
         if args.role == 'actor' and loaded.mode != 'train':
@@ -477,12 +542,16 @@ def main(argv=None):
             raise ValueError('Eval requires the checkpoint training profile')
         manifest = loaded.write_manifest(args.output, run_id=args.run_id, role=args.role)
         evidence = RunEvidenceWriter(args.output, manifest, role=args.role)
+        if args.clock_socket is not None:
+            evidence.event('clock_endpoint', socket=str(args.clock_socket),
+                           expected_master=loaded.commissioning.expected_master)
         if args.role in ('actor', 'eval', 'demo') and not loaded.motion_permitted:
             evidence.finish('motion_not_permitted')
             return 2
         try:
             _validate_cli(args, loaded)
         except (ValueError, PermissionError) as error:
+            print(bounded_error(error), file=sys.stderr)
             evidence.finish('preflight_failed', error=error)
             return 2
         try:
@@ -496,6 +565,7 @@ def main(argv=None):
             evidence.finish('operator_interrupt')
             return 130
         except BaseException as error:
+            print(bounded_error(error), file=sys.stderr)
             evidence.finish('stop_unconfirmed' if getattr(error, 'stop_unconfirmed', False)
                             else 'failed', error=error)
             return 1

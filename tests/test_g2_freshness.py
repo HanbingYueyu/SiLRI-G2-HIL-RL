@@ -37,7 +37,7 @@ def snapshot(**changes):
                   offset_at_reference_ns=18_000_000_000., drift_ppm=0.,
                   residual_ns=0., path_delay_ns=0, empirical_error_ns=2_000_000.,
                   wall_minus_mono_ns=ORIGIN, created_mono_ns=NOW,
-                  last_sample_mono_ns=NOW, valid_until_ns=NOW+2_500_000_000)
+                  last_sample_mono_ns=NOW, valid_until_ns=NOW+4_500_000_000)
     values.update(changes)
     return ClockSnapshot(**values)
 
@@ -46,6 +46,31 @@ def observation():
     return dict(state=np.array([0., 0., 0., 0., 0., 0., 1.], dtype=np.float32),
                 left_wrist=np.zeros((2, 3, 3), dtype=np.uint8),
                 right_aux=np.zeros((2, 3, 3), dtype=np.uint8))
+
+
+@pytest.mark.parametrize('fault', [None, 'joint', 'tf', 'mapping', 'pose', 'read'])
+def test_independent_stop_feedback_needs_state_but_not_camera(fault):
+    snap = snapshot(valid_until_ns=NOW-1) if fault == 'mapping' else snapshot()
+    guard = ObservationFreshnessGuard(SimpleNamespace(read=lambda: snap), limits(),
+                                      monotonic_ns=lambda: NOW)
+    info = evidence()
+    info['joint_timestamp_ns'] = info['source_timestamp_ns']['joint']
+    del info['source_timestamp_ns']
+    del info['camera_timestamp_ns']
+    if fault == 'joint':
+        info['joint_timestamp_ns'] -= 100_000_000
+    if fault == 'tf':
+        info['tf_queries'][1]['timestamp_ns'] -= 100_000_000
+    if fault == 'pose':
+        info['tf_position_error_m'] = .1
+    if fault == 'read':
+        info['read_start_monotonic_ns'] -= 100_000_000
+    if fault:
+        with pytest.raises(RuntimeError, match='Independent stop feedback rejected'):
+            guard.validate_stop_feedback(info)
+    else:
+        assert guard.validate_stop_feedback(info) is True
+    assert guard.previous_source_ns == {}
 
 
 def evidence(**source_changes):
@@ -213,7 +238,7 @@ def test_drift_is_inverted_and_uncertainty_propagated_outward(rig, drift, stamp,
 def test_mapping_error_grows_with_extrapolation_before_any_source_check(rig):
     rig.snapshot = replace(rig.snapshot, reference_mono_ns=NOW-1_000_000_000,
                            last_sample_mono_ns=NOW-1_000_000_000,
-                           valid_until_ns=NOW+1_500_000_000,
+                           valid_until_ns=NOW+3_500_000_000,
                            empirical_error_ns=4_900_000.)
     assert rig.guard(observation(), evidence(), None)
     assert rig.guard.last_decision.mapping_error_s == .005
@@ -223,7 +248,7 @@ def test_mapping_error_grows_with_extrapolation_before_any_source_check(rig):
 
 
 def test_expired_mapping_rejects_before_missing_source_metadata(rig):
-    rig.now += 2_500_000_001
+    rig.now += 4_500_000_001
     assert not rig.guard(observation(), {}, None)
     assert rig.guard.last_decision.code == 'mapping_expired'
     assert rig.guard.previous_source_ns == {}
@@ -384,9 +409,20 @@ def test_mapping_failure_has_a_stable_diagnostic_without_stale_fallback(rig):
     assert rig.guard.previous_source_ns == before
 
 
+@pytest.mark.parametrize('reason,code', [('warming_up','mapping_warming_up'),
+                                       ('lease_expired','mapping_expired'),
+                                       ('master_changed','mapping_unavailable')])
+def test_monitor_transient_reason_is_preserved(rig, reason, code):
+    def read():
+        raise ValueError('Clock snapshot is unhealthy: '+reason)
+    rig.client.read = read
+    assert not rig.guard(observation(), evidence(), None)
+    assert rig.guard.last_decision.code == code
+
+
 def test_lease_exact_boundary_is_accepted_and_one_nanosecond_later_rejected(rig):
-    rig.snapshot = replace(rig.snapshot, reference_mono_ns=NOW-2_500_000_000,
-                           last_sample_mono_ns=NOW-2_500_000_000, valid_until_ns=NOW)
+    rig.snapshot = replace(rig.snapshot, reference_mono_ns=NOW-4_500_000_000,
+                           last_sample_mono_ns=NOW-4_500_000_000, valid_until_ns=NOW)
     assert rig.guard(observation(), evidence(), None)
     rig.now += 1
     assert not rig.guard(observation(), evidence(), None)
@@ -396,10 +432,10 @@ def test_lease_exact_boundary_is_accepted_and_one_nanosecond_later_rejected(rig)
 def test_clock_window_raw_ptp_offset_is_consumed_without_second_utc_correction(rig):
     snap = rig.snapshot
     window = ClockWindow(snap.expected_master, snap.boot_id, snap.session_id)
-    window.feed_properties('currentUtcOffset 37\ncurrentUtcOffsetValid 0\n'
-                           'leap61 0\nleap59 0\nptpTimescale 1', 6_000_000_000)
     window.feed_ptp('selected best master clock '+snap.expected_master,
                     6_000_000_000, ORIGIN+6_000_000_000)
+    window.feed_properties('currentUtcOffset 37\ncurrentUtcOffsetValid 0\n'
+                           'leap61 0\nleap59 0\nptpTimescale 1', 6_000_000_000)
     for seconds in range(6, 21, 2):
         window.feed_ptp(f'ptp4l[{seconds}.000000000]: master offset 55000000000 '
                         's2 freq 0 path delay 0', seconds*1_000_000_000,
@@ -412,7 +448,7 @@ def test_clock_window_raw_ptp_offset_is_consumed_without_second_utc_correction(r
 def test_nonzero_drift_at_shifted_reference_changes_mapped_source_age(rig):
     # offset(ref=19s)=18s, +100ppm -> offset(19.99s)=18.000099s.
     rig.snapshot = replace(rig.snapshot, drift_ppm=100., reference_mono_ns=19_000_000_000,
-                           last_sample_mono_ns=19_000_000_000, valid_until_ns=21_500_000_000)
+                           last_sample_mono_ns=19_000_000_000, valid_until_ns=23_500_000_000)
     assert rig.guard(observation(), evidence(**dict.fromkeys(SOURCES, SOURCE_NOW-10_099_000)), None)
     assert rig.guard.last_decision.source_intervals_ns['joint'] == (19_987_899_789, 19_992_100_211)
 

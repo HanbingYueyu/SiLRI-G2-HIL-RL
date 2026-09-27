@@ -591,16 +591,28 @@ class RealActorRuntime:
                         self.coordinator.intervention()
                         if self.coordinator.observe_start_frame():
                             context = self.coordinator.context
+                            if self.demonstration:
+                                print('双键已识别，正在连接观测与运动后端...', flush=True)
                             env = self.env_factory(self.config, self.coordinator)
                             self._env = env
                             self.current_observation, _ = env.reset(options={'context': context})
                             episode_start_pose = tuple(self.current_observation['state'])
+                            if self.demonstration:
+                                print('人工采集已开始：SpaceMouse 控制，Y 成功 / F 失败。', flush=True)
                             _policy_observation(self.current_observation, 'cpu',
                                                 self.config.observation.image_size)
                     time.sleep(self.config.runtime.operator_poll_interval_s)
                     continue
                 if env is None:
                     raise RuntimeError('Running episode has no commissioned environment')
+                if self.demonstration:
+                    # Button-only start is valid, but no axis data means no
+                    # transition yet. Do not label default zeros as fresh input.
+                    self.coordinator.intervention()
+                    intervention = self.coordinator.intervention
+                    if not (intervention.gate.fresh or intervention.verified_neutral):
+                        time.sleep(self.config.runtime.operator_poll_interval_s)
+                        continue
                 before = env.refresh_observation()
                 self.current_observation = before
                 context = self.coordinator.context
@@ -667,6 +679,7 @@ class RealActorRuntime:
                 self.freshness_rejects += 1
                 code = ('feedback_lease' if message.startswith('Feedback freshness') else
                         message.partition(': ')[2] or 'unknown')
+                code = getattr(error, 'code', None) or code
                 context = self.coordinator.context
                 try:
                     self._emit('freshness_reject',

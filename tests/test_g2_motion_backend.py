@@ -37,6 +37,114 @@ class Port:
         self.stopped = True
 
 
+@pytest.mark.parametrize('code,retry', [('mapping_warming_up',True),
+                                      ('mapping_expired',True),
+                                      ('mapping_unavailable',False)])
+def test_mapping_startup_wait_is_transient_only(code, retry):
+    reader = Reader()
+    port = Port(reader)
+    class Guard:
+        calls = 0
+        last_decision = FreshnessDecision(code, 'fixture')
+        def __call__(self, *args):
+            self.calls += 1
+            return self.calls == 2
+    guard = Guard()
+    driver = backend(reader,port,observation_guard=guard,startup_mapping_wait_s=1.)
+    try:
+        if retry:
+            driver.observe()
+            with pytest.raises(RuntimeError, match=code):
+                driver.observe()
+            assert guard.calls == 3
+        else:
+            with pytest.raises(RuntimeError, match=code):
+                driver.observe()
+            assert guard.calls == 1
+        assert not port.sent
+    finally:
+        driver.close()
+
+
+def test_startup_discards_old_camera_without_sending_then_never_retries_live():
+    reader = Reader()
+    port = Port(reader)
+    class Guard:
+        calls = 0
+        last_decision = FreshnessDecision('camera_stale:left_wrist', 'old startup frame')
+        def __call__(self, *args):
+            self.calls += 1
+            return self.calls == 2
+    guard = Guard()
+    driver = backend(reader, port, observation_guard=guard, allow_motion=True,
+                     startup_camera_wait_s=2.)
+    try:
+        driver.observe()
+        assert guard.calls == 2 and not port.sent
+        with pytest.raises(RuntimeError, match='camera_stale'):
+            driver.observe()
+        assert guard.calls == 3
+    finally:
+        driver.close()
+
+
+def test_bound_method_preserves_freshness_rejection_code():
+    reader = Reader()
+    port = Port(reader)
+    class Lease:
+        last_decision = FreshnessDecision('camera_stale:left_wrist', 'old camera')
+        def accept(self, *args):
+            return False
+    driver = backend(reader, port, observation_guard=Lease().accept, allow_motion=True)
+    try:
+        with pytest.raises(RuntimeError, match='camera_stale:left_wrist'):
+            driver.observe()
+    finally:
+        driver.close()
+
+
+def test_precommand_pose_read_does_not_wait_for_another_camera_frame():
+    reader = Reader()
+    reader.state[0] = .5
+    port = Port(reader)
+    calls = []
+    original = reader.observe
+    def observe():
+        calls.append('camera')
+        return original()
+    def control_pose():
+        calls.append('pose')
+        return reader.state.copy()
+    reader.observe = observe
+    reader.read_control_pose = control_pose
+    def revalidate(obs, info):
+        calls.append('revalidate')
+        return True
+    driver = backend(reader, port, allow_motion=True, reference_guard=revalidate)
+    try:
+        predecessor = driver.observe()
+        reader.state[0] = .502
+        driver.execute_from((1, 0, 0, 0, 0, 0), predecessor)
+        assert calls == ['camera', 'pose', 'revalidate', 'camera']
+        assert port.sent[0].position_m[0] == pytest.approx(.51)
+    finally:
+        driver.close()
+
+
+def test_fast_pose_path_still_rejects_expired_predecessor():
+    reader = Reader()
+    reader.read_control_pose = lambda: reader.state.copy()
+    port = Port(reader)
+    driver = backend(reader, port, allow_motion=True, reference_guard=lambda *args: False)
+    try:
+        predecessor = driver.observe()
+        with pytest.raises(RuntimeError, match='Policy input expired'):
+            driver.execute_from((0.,)*6, predecessor)
+        assert not port.sent
+    finally:
+        driver.close()
+
+
 def backend(reader, port, *, observation_guard=None, outcome=None, **kwargs):
     from g2_local.motion_backend import MotionBackend
     config = LocalTaskConfig(action_scale=(.01,)*6, workspace_low=(-1,)*3,workspace_high=(1,)*3)

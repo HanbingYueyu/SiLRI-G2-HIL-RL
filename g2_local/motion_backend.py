@@ -24,6 +24,12 @@ class PoseTarget:
     orientation_xyzw: tuple
 
 
+class ObservationRejected(RuntimeError):
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
 class MotionBackend:
     name = 'gdk_motion'
 
@@ -31,7 +37,8 @@ class MotionBackend:
                  command_timeout, send_timeout, step_period, allow_motion=False,
                  stop_timeout=1., send_rate_hz=50., local_envelope=None,
                  reference_guard=None, before_command=None,
-                 policy_position_drift_m=.005, policy_rotation_drift_rad=.02):
+                 policy_position_drift_m=.005, policy_rotation_drift_rad=.02,
+                 startup_camera_wait_s=0., startup_mapping_wait_s=0.):
         config.validate_motion()
         if type(allow_motion) is not bool:
             raise ValueError('Explicit boolean motion permission required')
@@ -40,6 +47,12 @@ class MotionBackend:
         if not math.isfinite(step_period) or not 0 < step_period < command_timeout:
             raise ValueError('Step period must be positive and below command lease')
         self.reader, self.config = reader, config
+        if not math.isfinite(startup_camera_wait_s) or not 0 <= startup_camera_wait_s <= 10:
+            raise ValueError('Startup camera wait must be in [0,10] seconds')
+        self.startup_camera_wait_s = startup_camera_wait_s
+        if not math.isfinite(startup_mapping_wait_s) or not 0 <= startup_mapping_wait_s <= 120:
+            raise ValueError('Startup mapping wait must be in [0,120] seconds')
+        self.startup_mapping_wait_s = startup_mapping_wait_s
         for value in (policy_position_drift_m, policy_rotation_drift_rad):
             if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
                 raise ValueError('Policy pose drift limits must be positive and finite')
@@ -84,13 +97,21 @@ class MotionBackend:
         if self.observation_guard(obs, info, after) is not True:
             message = 'Source observation freshness not confirmed'
             try:
-                code = self.observation_guard.last_decision.code
+                owner = getattr(self.observation_guard, '__self__', self.observation_guard)
+                code = owner.last_decision.code
             except Exception:
                 code = None
             if (type(code) is str and 0 < len(code) <= 128 and code.isascii() and
                     all(character.isalnum() or character in '_:-.' for character in code)):
                 message += f': {code}'
-            raise RuntimeError(message)
+            if code in ('camera_stale:left_wrist', 'camera_stale:right_aux'):
+                decision = owner.last_decision
+                ages = dict(getattr(decision, 'age_intervals_s', {}))
+                message += (f'; age_intervals_s={ages}; '
+                            f'read_s={info.get("read_duration_s")}; '
+                            f'camera_acquire_s={info.get("camera_acquire_s")}; '
+                            f'camera_decode_s={info.get("camera_decode_s")}')
+            raise ObservationRejected(message, code)
         self.stream.check()  # Camera may have blocked past the target lease.
         if self.local_envelope is not None and self.episode_reference is not None:
             self.local_envelope.check(pose, self.episode_reference)
@@ -121,7 +142,33 @@ class MotionBackend:
 
     def observe(self):
         try:
-            return self._read()
+            mapping_deadline = time.monotonic() + self.startup_mapping_wait_s
+            camera_deadline = None
+            camera_attempts = 0
+            announced = False
+            while True:
+                try:
+                    return self._read()
+                except ObservationRejected as error:
+                    if self._last_accepted is not None or self.stream.sequence != 0:
+                        raise
+                    if error.code in ('mapping_expired', 'mapping_warming_up'):
+                        deadline, interval = mapping_deadline, .1
+                    elif error.code in ('camera_stale:left_wrist', 'camera_stale:right_aux'):
+                        if camera_deadline is None:
+                            camera_deadline = time.monotonic()+self.startup_camera_wait_s
+                        camera_attempts += 1
+                        if camera_attempts >= 5:
+                            raise
+                        deadline, interval = camera_deadline, .02
+                    else:
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise
+                    if not announced:
+                        print(f'启动观测尚未就绪（{error.code}），有限等待恢复；尚未发送运动命令。', flush=True)
+                        announced = True
+                    time.sleep(min(interval, max(0., deadline-time.monotonic())))
         except Exception:
             self._abort()
             raise
@@ -143,12 +190,34 @@ class MotionBackend:
                 if reference is None or not np.array_equal(
                         predecessor['state'], reference[0]['state']):
                     raise ValueError('Execution predecessor does not match accepted policy input')
-            before = self._read()
+            read_pose = getattr(self.reader, 'read_control_pose', None)
+            if reference is not None and self.reference_guard is not None and callable(read_pose):
+                # The policy predecessor already contains both camera frames.
+                # Waiting for another pair here needlessly ages that input.
+                # Read only drift feedback; revalidate the ORIGINAL timestamped
+                # observation below, never relabel it with a newer timestamp.
+                with self.reader_lock:
+                    if self.stopped or self.closed:
+                        raise RuntimeError('Motion backend stopped')
+                    self.stream.check()
+                    pose_feedback = vector(read_pose(), 7)
+                    if abs(np.linalg.norm(pose_feedback[3:])-1.) > .01:
+                        raise ValueError('Invalid observed quaternion')
+                    self.stream.check()
+                before = {'state': pose_feedback}
+                if self.local_envelope is not None and self.episode_reference is not None:
+                    self.local_envelope.check(pose_feedback, self.episode_reference)
+            else:
+                before = self._read()
             # New feedback is still checked, but does not silently change action origin.
             plan_target(before['state'], (0.,)*6, self.config)
             if reference is not None and self.reference_guard is not None:
                 if self.reference_guard(*reference) is not True:
-                    raise RuntimeError('Policy input expired before command; action discarded')
+                    owner = getattr(self.reference_guard, '__self__', None)
+                    decision = getattr(owner, 'last_decision', None)
+                    code = getattr(decision, 'code', 'unknown')
+                    raise RuntimeError('Policy input expired before command; action discarded: '
+                                       + str(code)[:128])
             origin = before['state'] if reference is None else reference[0]['state']
             position_drift = float(np.linalg.norm(np.asarray(before['state'][:3])-origin[:3]))
             rotation_drift = float((Rotation.from_quat(before['state'][3:]) *

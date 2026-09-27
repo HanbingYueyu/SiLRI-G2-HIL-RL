@@ -16,6 +16,16 @@ def test_workspace_clipping_records_effective_action():
     assert executed == pytest.approx((.5,0,0,0,0,0))
 
 
+@pytest.mark.parametrize('sign', [-1., 1.])
+def test_full_scale_small_steps_stay_inside_exact_normalized_bounds(sign):
+    from g2_local.motion import plan_target
+    cfg = LocalTaskConfig(action_scale=(.0015,)*3+(.026,)*3,
+                          workspace_low=(-1.,)*3, workspace_high=(1.,)*3)
+    _, effective = plan_target((.57,.17,.89,0,0,0,1), (sign,)*3+(0.,)*3, cfg)
+    assert all(-1. <= value <= 1. for value in effective)
+    assert effective[:3] == pytest.approx((sign,)*3)
+
+
 def test_rotation_increment_is_in_base_frame():
     from g2_local.motion import plan_target
     from scipy.spatial.transform import Rotation

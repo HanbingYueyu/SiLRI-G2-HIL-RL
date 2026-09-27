@@ -199,6 +199,12 @@ class ObservationFreshnessGuard:
         try:
             snapshot = self._client.read()
         except Exception as error:
+            # Only these explicit transient monitor states are restartable at
+            # startup. Identity/schema/transport failures must not be retried.
+            transient = {'Clock snapshot is unhealthy: warming_up': 'mapping_warming_up',
+                         'Clock snapshot is unhealthy: lease_expired': 'mapping_expired'}
+            if type(error) is ValueError and str(error) in transient:
+                raise _Rejected(transient[str(error)], str(error)) from error
             raise _Rejected('mapping_unavailable', f'{type(error).__name__}: {error}') from error
         now = self._now()
         if type(now) is not int or not 0 < now <= MAX_REPORT_INTEGER:
@@ -223,6 +229,47 @@ class ObservationFreshnessGuard:
     def revalidate(self, obs, info):
         """Recheck an already accepted policy input's age without source progress."""
         return self.__call__(obs, info, check_progress=False)
+
+    def validate_stop_feedback(self, info):
+        """Validate a newly read measured hold, independently of camera evidence.
+
+        This never renews the normal command lease or accepts an observation.
+        Mapping and joint/TF acquisition ages must still satisfy their limits.
+        """
+        with self._lock:
+            try:
+                snapshot, now = self._read_mapping()
+                _pose(info['motion_pose'], 'motion_pose')
+                start = _timestamp(info['read_start_monotonic_ns'], 'read_start')
+                wall = _timestamp(info['read_start_wall_ns'], 'read_wall')
+                if not 0 <= now-start <= self._limits.state_age_s*1e9:
+                    raise ValueError('stop feedback read expired')
+                if abs(wall-start-snapshot.wall_minus_mono_ns) > MAX_WALL_JUMP_NS:
+                    raise ValueError('stop feedback clock origin changed')
+                error = (_decimal(snapshot.empirical_error_ns) +
+                         Fraction(max(0, now-snapshot.reference_mono_ns)*MAX_DRIFT_PPM, 1_000_000))
+                if error > _decimal(self._limits.mapping_error_s)*1e9:
+                    raise ValueError('stop mapping error exceeds limit')
+                query = info['tf_queries'][1]
+                if (query['target'], query['source']) != ('arm_l_end_link', 'base_link'):
+                    raise ValueError('stop TF direction mismatch')
+                _pose(query['pose'], 'tf_pose')
+                denominator = 1-_decimal(snapshot.drift_ppm)/1_000_000
+                for name, stamp in (('joint', info['joint_timestamp_ns']), ('tf', query['timestamp_ns'])):
+                    stamp = _timestamp(stamp, name)
+                    center = snapshot.reference_mono_ns + (
+                        stamp-snapshot.wall_minus_mono_ns-snapshot.reference_mono_ns+
+                        _decimal(snapshot.offset_at_reference_ns))/denominator
+                    earliest = center-error/denominator
+                    if earliest > now or now-earliest > _decimal(self._limits.state_age_s)*1e9:
+                        raise ValueError('stop feedback stale or future: '+name)
+                for name in ('tf_position_error_m', 'tf_rotation_error_rad'):
+                    if _finite(info[name], name) > getattr(self._limits, name):
+                        raise ValueError('stop '+name+' exceeds limit')
+                self._snapshot = snapshot
+                return True
+            except (_Rejected, KeyError, TypeError, ValueError, OverflowError) as error:
+                raise RuntimeError('Independent stop feedback rejected: '+str(error)) from error
 
     def __call__(self, obs, info, after=None, *, check_progress=True) -> bool:
         with self._lock:

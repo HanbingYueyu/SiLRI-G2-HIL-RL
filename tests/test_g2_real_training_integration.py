@@ -44,10 +44,14 @@ def _config():
         # A long fake lease keeps the functional proof independent of CPU speed.
         control_mode=1, command_timeout_s=10., send_timeout_s=.5,
         stop_timeout_s=.5, reader_timeout_s=.1, command_lifetime_s=.1,
-        send_rate_hz=25., adapter_root=Path('/isolated/fake-adapter'))
+        send_rate_hz=25., adapter_root=Path('/isolated/fake-adapter'),
+        local_envelope=None, policy_position_drift_m=.005,
+        policy_rotation_drift_rad=.02)
     runtime = RuntimeConfig(17, 'cpu', '127.0.0.1', 1, 4, 2., 5., 5., .02, 10., .001)
     optimization = OptimizationConfig(8, 4, 1, 1, 1, 1, 1e-4, 1e-4,
-                                      1e-4, 1e-4, 2, 1, 1)
+                                      1e-4, 1e-4, 2, 1, 1,
+                                      beta_pretrain_steps=1, beta_min_demo_episodes=1,
+                                      beta_min_human_transitions=1)
     return SimpleNamespace(task=task, motion=motion,
                            observation=SimpleNamespace(image_size=128, camera_rois={}),
                            intervention=InterventionConfig((-2, -1, -3), 0, 1,
@@ -78,7 +82,7 @@ class FakeClock:
         now = time.monotonic_ns()
         self.sequence += 1
         self.expired_reads += int(self.fault == 'clock_expired')
-        sample = now - 3_000_000_000 if self.fault == 'clock_expired' else now
+        sample = now - PTP_LEASE_NS - 1_000_000_000 if self.fault == 'clock_expired' else now
         return ClockSnapshot(
             schema=1, sequence=self.sequence, healthy=True, reason='ok',
             boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
@@ -219,6 +223,17 @@ def _learner_process(connection, checkpoint):
     config = _config()
     learner = RealLearnerRuntime(config=config, run_id=RUN_ID,
                                  checkpoint_path=checkpoint)
+    # This network test starts with one complete fixture demonstration, as the
+    # real workflow starts with imported demos. Do not bypass beta readiness.
+    from test_g2_real_learner import _row
+    seed = _row(human=True)
+    seed['done'] = True
+    seed['complementary_info'].update(
+        run_id=RUN_ID, config_hash=CONFIG_HASH, episode_id='bootstrap',
+        transition_id=RUN_ID+'/bootstrap/0', success_label=True)
+    learner.ingest([seed], count_episodes=False)
+    learner.imported_demo_episodes.add('bootstrap')
+    assert learner.pretrain_behavior()
     service = GrpcLearnerService(learner)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     services_pb2_grpc.add_LearnerServiceServicer_to_server(service, server)
@@ -328,10 +343,26 @@ class FormalRig:
                     self.evidence_write_triggered = True
                     raise OSError('isolated evidence write failure')
 
+            context_count = 0
+            parameter_deadline = None
+            def next_context():
+                nonlocal context_count, parameter_deadline
+                # Simulate the operator's reset interval, but wait on actual
+                # downloaded parameters, not a sleep or a fabricated version.
+                if self.fault is None and context_count == 1 and runtime.parameter_version == 0:
+                    if parameter_deadline is None:
+                        parameter_deadline = time.monotonic() + 5.
+                    if time.monotonic() >= parameter_deadline:
+                        raise TimeoutError('Learner did not return updated parameters')
+                    return None
+                value = next(contexts, None)
+                context_count += int(value is not None)
+                return value
+
             runtime = RealActorRuntime(
                 config=config, run_id=RUN_ID, config_hash=CONFIG_HASH,
                 coordinator=coordinator,
-                context_source=SimpleNamespace(read_new=lambda: next(contexts, None)),
+                context_source=SimpleNamespace(read_new=next_context),
                 transport=transport, env_factory=env_factory, telemetry=telemetry)
             self.actor_runtime = runtime
             if self.fault == 'learner_disconnect':
@@ -364,7 +395,8 @@ class FormalRig:
             self.hardware_imports.extend(_hardware_imports())
         restored = self.resume().learner
         self.confirmed_actions = [tuple(row['complementary_info']['executed_action'])
-                                  for row in restored.records]
+                                  for row in restored.records
+                                  if row['complementary_info']['episode_id'] != 'bootstrap']
         self.command_port = SimpleNamespace(executed_actions=[action
             for port in self.ports for action in port.executed_actions])
         return SimpleNamespace(actor=actor, learner=self.learner_result,
@@ -393,15 +425,17 @@ def test_formal_actor_learner_path_updates_and_resumes_without_synthetic_backend
     assert summary.actor.transitions_sent == 4
     assert summary.actor.episodes_completed == 2
     assert summary.actor.interventions == 2
-    assert summary.learner.online_replay == 4
-    assert summary.learner.human_replay == 2
+    assert summary.learner.online_replay == 5
+    assert summary.learner.human_replay == 3
     assert summary.learner.version > 0
+    assert summary.actor.final_parameter_version > 0
     assert summary.records and len(rig.command_port.executed_actions) == 4
     assert np.allclose(rig.command_port.executed_actions, rig.confirmed_actions,
                        atol=1e-4)
     assert all(row['complementary_info']['synthetic'] is False
                for row in summary.records)
-    assert [row['complementary_info']['transition_id'] for row in summary.records] == [
+    assert [row['complementary_info']['transition_id'] for row in summary.records
+            if row['complementary_info']['episode_id'] != 'bootstrap'] == [
         'formal-isolated/episode-0/0', 'formal-isolated/episode-0/1',
         'formal-isolated/episode-1/0', 'formal-isolated/episode-1/1']
     assert any(tuple(row['complementary_info']['selected_action']) !=
@@ -413,7 +447,7 @@ def test_formal_actor_learner_path_updates_and_resumes_without_synthetic_backend
     assert all(clock.closed for clock in rig.clocks)
     resumed = rig.resume()
     assert resumed.actor_state == 'WAITING_FOR_RESET'
-    assert len(resumed.learner.records) == 4
+    assert len(resumed.learner.records) == 5
 
 
 @pytest.mark.parametrize('fault', ('clock_expired', 'hid_unplug', 'learner_disconnect',

@@ -66,6 +66,7 @@ def rig(monkeypatch, tmp_path):
     class Controller:
         def __init__(self, gdk, robot, *, allow_motion):
             assert allow_motion is False
+            self.robot = robot
         def checked_arm_state(self):
             check('arm')
             return (0.,) * 14
@@ -109,6 +110,61 @@ def rig(monkeypatch, tmp_path):
     yield state
     for reader in readers:
         reader.close()
+
+
+def test_robot_feedback_and_sender_do_not_enter_same_sdk_object_concurrently(rig, monkeypatch):
+    import threading
+
+    reading = threading.Event()
+    release = threading.Event()
+    sending = threading.Event()
+    attempted = threading.Event()
+    errors = []
+
+    def get_joint_states():
+        reading.set()
+        if not release.wait(2):
+            raise TimeoutError('test did not release feedback')
+        return {'timestamp': 1003}
+
+    def send(request):
+        sending.set()
+        return 0
+
+    monkeypatch.setattr(sys.modules['agibot_gdk'], 'Robot', lambda: NS(
+        get_joint_states=get_joint_states, end_effector_pose_control=send))
+    reader = rig.make()
+    assert reader.controller.robot is reader.robot
+
+    def run_read():
+        try:
+            reader.robot.get_joint_states()
+        except Exception as error:
+            errors.append(error)
+
+    def run_send():
+        attempted.set()
+        try:
+            reader.controller.robot.end_effector_pose_control(object())
+        except Exception as error:
+            errors.append(error)
+
+    feedback = threading.Thread(target=run_read)
+    writer = threading.Thread(target=run_send)
+    feedback.start()
+    try:
+        assert reading.wait(1)
+        writer.start()
+        assert attempted.wait(1)
+        assert not sending.wait(.05), 'SDK read and target send overlapped'
+    finally:
+        release.set()
+        feedback.join(2)
+        if writer.ident is not None:
+            writer.join(2)
+    assert not feedback.is_alive() and not writer.is_alive()
+    assert not errors
+    assert sending.is_set()
 
 
 def test_observe_exposes_all_source_times_without_changing_policy_observation(rig):
@@ -166,6 +222,53 @@ def test_reader_waits_for_both_tf_directions_on_startup(rig):
     assert reader.tf is rig.tf
     assert rig.tf.calls == [('base_link', 'arm_l_end_link')] * 3 + [
         ('arm_l_end_link', 'base_link')]
+
+
+def test_waiting_for_right_camera_refreshes_left_candidate(rig):
+    reader = rig.make()
+    reader.observe()
+    get_frame = reader.camera.get_latest_image
+    calls = {1: 0, 2: 0}
+    def delayed_right(stream, timeout):
+        calls[stream] += 1
+        result = get_frame(stream, timeout)
+        result.timestamp_ns += calls[stream] * 100 if stream == 1 else (200 if calls[2] >= 2 else 0)
+        return result
+    reader.camera.get_latest_image = delayed_right
+    reader.observe()
+    assert reader.last_info['camera_timestamp_ns'] == dict(left_wrist=1201, right_aux=1202)
+
+
+def test_advancing_but_mismatched_pair_is_refreshed_before_decode(rig):
+    reader = rig.make()
+    reader.camera_pair_max_skew_s = .05
+    get_frame = reader.camera.get_latest_image
+    calls = {1: 0, 2: 0}
+    def image(stream, timeout):
+        calls[stream] += 1
+        result = get_frame(stream, timeout)
+        result.timestamp_ns = 1_000_000_000 + (170_000_000 if stream == 1 or calls[2] > 1 else 0)
+        return result
+    reader.camera.get_latest_image = image
+    reader.observe()
+    assert reader.last_info['camera_timestamp_ns'] == dict(left_wrist=1_170_000_000, right_aux=1_170_000_000)
+
+
+def test_persistent_camera_skew_times_out_without_committing_frames(rig):
+    reader = rig.make()
+    reader.observe()
+    previous = reader.last_info
+    stamps = dict(reader.last_stamps)
+    reader.camera_pair_max_skew_s = .05
+    get_frame = reader.camera.get_latest_image
+    def image(stream, timeout):
+        result = get_frame(stream, timeout)
+        result.timestamp_ns += 200_000_000 if stream == 1 else 100
+        return result
+    reader.camera.get_latest_image = image
+    with pytest.raises(TimeoutError, match='Camera pair unavailable'):
+        reader.observe()
+    assert reader.last_info is previous and reader.last_stamps == stamps
 
 
 @pytest.mark.parametrize('target', ['base_link', 'arm_l_end_link'])

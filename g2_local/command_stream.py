@@ -149,4 +149,5 @@ class CommandStream:
         if any(t is not None and t.is_alive() for t in (self.writer, self.watchdog)):
             raise TimeoutError('SDK send/hold still in flight; physical stop unconfirmed')
         if self.stop_fault is not None:
-            raise RuntimeError('Measured hold failed; physical stop unconfirmed') from self.stop_fault
+            raise RuntimeError('Measured hold failed; physical stop unconfirmed: '
+                               + str(self.stop_fault)) from self.stop_fault

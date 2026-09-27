@@ -23,5 +23,11 @@ def plan_target(measured_pose, action, config):
     position = np.clip(pose[:3] + proposal[:3]*scale[:3], low, high)
     quaternion = (Rotation.from_rotvec(proposal[3:]*scale[3:]) *
                   Rotation.from_quat(pose[3:])).as_quat()
-    effective = np.concatenate(((position-pose[:3])/scale[:3], proposal[3:]))
+    # Subtracting nearby positions can turn a valid full-scale input into
+    # 1.0000000000000009. Bound only numerical roundoff at this planning exit;
+    # transition validation remains strict for arbitrary driver outputs.
+    translation = (position-pose[:3])/scale[:3]
+    if np.any(np.abs(translation) > 1. + 1e-10):
+        raise ValueError('Effective translation exceeds normalized bounds')
+    effective = np.concatenate((np.clip(translation, -1., 1.), proposal[3:]))
     return tuple(np.concatenate((position, quaternion))), tuple(effective)

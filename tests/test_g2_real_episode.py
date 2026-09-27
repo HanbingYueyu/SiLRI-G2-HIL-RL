@@ -161,7 +161,7 @@ def test_conflicting_terminal_keys_abort_without_transition():
     assert machine.context is None
 
 
-def test_stale_hid_report_cannot_start_chord():
+def test_button_chord_does_not_require_fresh_axis_reports():
     machine = waiting_episode()
     machine.offer_context(context())
     machine.intervention.gate = SimpleNamespace(fresh=False)
@@ -171,7 +171,20 @@ def test_stale_hid_report_cannot_start_chord():
     machine.intervention.gate.fresh = True
     machine.intervention.last_frame = SimpleNamespace(buttons=(False, False),
                                                        pressed=(), ready=True)
-    assert machine.observe_start_frame() is False
+    assert machine.observe_start_frame() is True
+
+
+def test_first_button_report_starts_without_any_axis_report():
+    machine = waiting_episode()
+    machine.offer_context(context())
+    machine.intervention.gate.fresh = False
+    # CompactReports omits pressed edges on its very first button packet.
+    machine.intervention.last_frame = SimpleNamespace(
+        buttons=(True, True), pressed=(), ready=False)
+    assert not machine.observe_start_frame()
+    machine.intervention.last_frame = SimpleNamespace(
+        buttons=(False, False), pressed=(), ready=False)
+    assert machine.observe_start_frame()
 
 
 def test_direct_start_bypass_is_unavailable():

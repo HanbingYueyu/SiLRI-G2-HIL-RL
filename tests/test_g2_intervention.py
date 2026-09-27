@@ -24,12 +24,74 @@ def explicit_config():
                               release_hold_s=.25, report_max_age_s=.2)
 
 
+def test_translation_does_not_require_unused_rotation_report_refresh():
+    reader = Reader()
+    reader.frame = frame(axes=(.6, 0, 0, .4, 0, 0), stamps=(1., .1))
+    source = spacemouse.DemonstrationIntervention(reader, explicit_config(), clock=lambda: 1.)
+    active, action = source()
+    assert active and action[0] > 0 and action[3:] == (0., 0., 0.)
+    reader.frame = frame(axes=(.6, 0, 0, .4, 0, 0), stamps=(1., .1), buttons=(True, False))
+    with pytest.raises(RuntimeError, match='stale nonzero'):
+        source()
+
+
+def test_demo_without_axis_reports_holds_then_accepts_first_fresh_movement():
+    reader = Reader()
+    reader.frame = frame(stamps=(None, None), ready=False)
+    source = spacemouse.DemonstrationIntervention(reader, explicit_config(), clock=lambda: 1.)
+    assert source() == (True, (0.,)*6)
+    reader.frame = frame(axes=(.6, 0, 0, 0, 0, 0))
+    active, action = source()
+    assert active and action[0] > 0
+    reader.frame = frame(axes=(.6, 0, 0, 0, 0, 0), stamps=(0., 0.))
+    with pytest.raises((RuntimeError, ValueError)):
+        source()
+
+
+@pytest.mark.parametrize('initial_stamps', [(None, None), (1., None), (1., 1.)])
+def test_initial_missing_reports_wait_before_episode_but_fail_during_episode(initial_stamps):
+    reader = Reader()
+    reader.frame = frame(stamps=initial_stamps, ready=False)
+    source = spacemouse.AutomaticIntervention(reader, explicit_config(), clock=lambda: 1.)
+    source.require_fresh = lambda: False
+    assert source() == (False, None)
+    assert source.fault is None and not source.gate.fresh
+    reader.frame = frame()
+    assert source() == (False, None)
+    source.require_fresh = lambda: True
+    reader.frame = frame(stamps=(None, None), ready=False)
+    with pytest.raises(ValueError, match='unavailable'):
+        source()
+
+
 def automatic_source():
     reader = Reader()
     now = [1.]
     source = spacemouse.AutomaticIntervention(reader, explicit_config(), clock=lambda: now[0])
     assert source() == (False, None)
     return source, reader, now
+
+
+def test_stale_motion_before_start_waits_without_authorizing_input():
+    source, reader, now = automatic_source()
+    source.require_fresh = lambda: False
+    reader.frame = frame(axes=(.6,0,0,0,0,0))
+    now[0] = 2.
+    assert source() == (False, None)
+    assert source.fault is None and not source.gate.input_valid
+    reader.frame = frame(stamps=(2.,2.))
+    assert source() == (False, None)
+    assert source.gate.fresh
+
+
+def test_verified_zero_survives_button_only_reports_while_waiting():
+    source, reader, now = automatic_source()
+    source.require_fresh = lambda: False
+    now[0] = 2.
+    reader.frame = frame(buttons=(True, False))
+    source()
+    assert source.verified_neutral
+    assert not source.gate.fresh
 
 
 def engaged_source():
@@ -133,6 +195,22 @@ def test_stale_zero_without_prior_observation_cannot_authorize_policy():
     reader = Reader()
     source = spacemouse.AutomaticIntervention(reader, explicit_config(), clock=lambda: 5.)
     with pytest.raises(RuntimeError, match='stale neutral'):
+        source()
+
+
+def test_demo_zero_report_received_across_startup_delay_is_zero_only():
+    reader = Reader()
+    now = [5.]
+    source = spacemouse.DemonstrationIntervention(reader, explicit_config(), clock=lambda: now[0])
+    # Real complete zero reports, but already older than the motion lease.
+    assert source() == (True, (0.,)*6)
+    assert source.verified_neutral and not source.gate.fresh
+    now[0] = 10.
+    assert source() == (True, (0.,)*6)
+    reader.frame = frame(axes=(.6, 0, 0, 0, 0, 0), stamps=(10., 10.))
+    assert source()[1][0] > 0
+    now[0] = 11.
+    with pytest.raises(RuntimeError, match='stale nonzero'):
         source()
 
 

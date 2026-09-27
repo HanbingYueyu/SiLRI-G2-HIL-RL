@@ -185,6 +185,15 @@ class ClockWindow:
                     return
             self._last_ptp_mono_ns = sample['mono_ns']
 
+            if (self._samples and
+                    sample['mono_ns'] - self._samples[-1]['mono_ns'] > MAX_PTP_GAP_NS):
+                # Raw arrival continuity was checked above. Quarantined fit
+                # outliers can still leave a gap in the accepted sample set;
+                # that is a stale fit window, not a broken PTP transport.
+                # Revoke the old mapping and require a complete fresh warm-up.
+                self._mapping = None
+                self._samples.clear()
+
             candidate = list(self._samples)
             candidate.append(sample)
             mapping = None
@@ -234,6 +243,12 @@ class ClockWindow:
         self._validate_ns(mono_ns)
         with self._lock:
             if self._fault is not None:
+                return
+            # Before remote-master discovery, PMC describes the local clock,
+            # not the expected robot clock. Do not cache or validate that
+            # unrelated dataset. Remain unhealthy until a subsequent query
+            # after discovery supplies valid properties and the fit is ready.
+            if not self._actual_master:
                 return
             try:
                 properties = parse_time_properties(raw)

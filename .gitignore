@@ -29,6 +29,9 @@ runtime/
 .coverage.*
 htmlcov/
 *.py[cod]
+# Rebuilt locally against the installed SDK; sources remain tracked.
+/g2_local/_gdk_safe_stop*.so
+/g2_local/_gdk_safe_stop*.so.json
 *.egg-info/
 build/
 dist/

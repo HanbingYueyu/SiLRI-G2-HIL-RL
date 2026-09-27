@@ -47,6 +47,26 @@ class Evidence:
         self.events.append((name, values))
 
 
+@pytest.mark.parametrize('ending,label', [('success', '成功'), ('failure', '失败'),
+                                         ('limit', '步数到限')])
+def test_completed_demo_prints_saved_result(tmp_path, capsys, ending, label):
+    writer = DemonstrationWriter(tmp_path/'demo', config=config(), run_id='run-1')
+    writer.append(demo_row())
+    assert capsys.readouterr().out == ''
+    row = demo_row(1, terminal=True)
+    if ending == 'failure':
+        row['complementary_info']['success_label'] = False
+        row['reward'] = -1.
+    elif ending == 'limit':
+        row['done'], row['truncated'] = False, True
+        row['complementary_info']['success_label'] = None
+        row['reward'] = -.05
+    writer.append(row)
+    text = capsys.readouterr().out
+    assert label in text and '已保存' in text and '2 步' in text
+    assert len(list((tmp_path/'demo').glob('*/complete.json'))) == 1
+
+
 def test_complete_demo_imports_human_actions_pixels_and_resumes_without_duplicates(tmp_path):
     torch.set_num_threads(2)
     cfg = config()
@@ -155,6 +175,7 @@ def test_offline_validation_cli_reports_complete_episode(tmp_path, capsys):
     row['complementary_info']['config_hash'] = cfg.config_hash
     path = tmp_path / 'demo'
     DemonstrationWriter(path, config=cfg, run_id='run-1').append(row)
+    capsys.readouterr()  # Discard fixture writer's operator-facing save message.
     assert validate(['--config', str(TEMPLATE), '--dataset', str(path)]) == 0
     summary = json.loads(capsys.readouterr().out)
     assert summary['transitions'] == summary['episodes'] == summary['successes'] == 1

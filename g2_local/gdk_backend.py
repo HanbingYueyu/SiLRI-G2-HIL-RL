@@ -8,6 +8,28 @@ import numpy as np
 from .contract import vector
 
 
+class _SerializedRobot:
+    """Serialize calls to one non-thread-safe SDK Robot, shared by reader/sender.
+
+    Lock individual Robot calls, not camera acquisition or PTP IPC. The command
+    port also holds this reentrant lock across its final checks and target send,
+    so waiting for feedback cannot send a target after watchdog cancellation.
+    """
+    def __init__(self, robot):
+        self._robot = robot
+        self._sdk_call_lock = threading.RLock()
+
+    def __getattr__(self, name):
+        method = getattr(self._robot, name)
+        if not callable(method):
+            return method
+
+        def call(*args, **kwargs):
+            with self._sdk_call_lock:
+                return method(*args, **kwargs)
+        return call
+
+
 def source_timestamp_ns(value):
     if (isinstance(value, bool) or not isinstance(value, (int, np.integer)) or
             value <= 0):
@@ -91,7 +113,8 @@ class GdkCommandPort:
     A blocked SDK call cannot be interrupted by this Python lock.
     """
     def __init__(self, controller, *, expected_mode, allow_motion=False,
-                 freshness_guard=None, life_time_s=.1):
+                 freshness_guard=None, life_time_s=.1, stop_pose_provider=None,
+                 safe_stop_request=None):
         if type(expected_mode) is not int or expected_mode not in (1, 3):
             raise ValueError('Explicit control mode 1 or 3 required')
         if type(allow_motion) is not bool:
@@ -104,12 +127,23 @@ class GdkCommandPort:
         self.expected_mode = expected_mode
         self.enabled = allow_motion
         self.guard = freshness_guard
+        if stop_pose_provider is not None and not callable(stop_pose_provider):
+            raise ValueError('Stop pose provider must be callable')
+        self.stop_pose_provider = stop_pose_provider
+        if safe_stop_request is not None and not callable(safe_stop_request):
+            raise ValueError('Safe stop request must be callable')
+        self.safe_stop_request = safe_stop_request
+        self.safe_stop_acknowledged = False
+        self.safe_stop_error = None
+        self.stop_attempted = False
         self.life_time = life_time_s
         self.stopped = False
         self.attempted = False
         self.stop_failure = None
         self.cancel_event = None
         self.lock = threading.RLock()
+        self._sdk_lock = getattr(getattr(controller, 'robot', None),
+                                 '_sdk_call_lock', threading.RLock())
 
     def bind_cancel_event(self, cancel_event):
         if not callable(getattr(cancel_event, 'is_set', None)):
@@ -123,11 +157,13 @@ class GdkCommandPort:
         if self.cancel_event is not None and self.cancel_event.is_set():
             raise RuntimeError('Command stream halted before SDK target send')
 
-    def _check(self):
+    def _check_health(self):
         self.controller.checked_arm_state()
         status = self.controller.motion_status_summary()
         if status['control_mode'] != self.expected_mode or status['error_code'] != 0:
             raise RuntimeError(f'Unhealthy or changed control mode: {status}')
+    def _check(self):
+        self._check_health()
         if self.guard() is not True:
             raise RuntimeError('Feedback freshness not explicitly confirmed')
 
@@ -141,7 +177,7 @@ class GdkCommandPort:
         self.controller._send_left_cartesian_pose(target, self.life_time)
 
     def send(self, target):
-        with self.lock:
+        with self.lock, self._sdk_lock:
             if not self.enabled:
                 raise PermissionError('Motion disabled; no GDK command sent')
             if self.stopped:
@@ -158,20 +194,43 @@ class GdkCommandPort:
 
     def stop(self):
         with self.lock:
-            if self.stopped:
+            if self.stop_attempted:
                 if self.stop_failure is not None:
                     raise RuntimeError('physical stop unconfirmed after failed send') from self.stop_failure
                 return
+            self.stop_attempted = True
             self.stopped = True
             if not self.enabled or not self.attempted:
+                if self.stop_failure is not None:
+                    raise RuntimeError('physical stop unconfirmed after failed send') from self.stop_failure
                 return
             try:
-                self._check()
-                measured = self.controller.read_end_effector_pose('arm_l_end_link')
-                self._check()
+                if self.stop_pose_provider is None:
+                    self._check()
+                    measured = self.controller.read_end_effector_pose('arm_l_end_link')
+                    self._check()
+                else:
+                    self._check_health()
+                    measured = self.stop_pose_provider()
+                    self._check_health()
                 self._write(measured)
+                self.stop_failure = None
             except Exception as error:
                 self.stop_failure = error
+                # This request does not depend on the failed pose/PTP guard.
+                # Never resume targets or claim physical stop from an SDK ACK.
+                if self.safe_stop_request is not None:
+                    try:
+                        result = self.safe_stop_request()
+                        if type(result) is not int or result != 0:
+                            raise RuntimeError('Invalid SAFE_STOP acknowledgement')
+                        self.safe_stop_acknowledged = True
+                    except Exception as stop_error:
+                        self.safe_stop_error = stop_error
+                    detail = ('left SAFE_STOP acknowledged; physical stop unconfirmed'
+                              if self.safe_stop_acknowledged else
+                              f'left SAFE_STOP failed: {self.safe_stop_error}; physical stop unconfirmed')
+                    raise RuntimeError(detail) from error
                 raise RuntimeError('physical stop unconfirmed: measured hold failed') from error
 
 
@@ -198,6 +257,7 @@ class GdkReader:
         self.gdk = gdk
         self.decode = decode_color_rgb
         self.timeout_s = timeout_s
+        self.camera_pair_max_skew_s = None
         self.closed = True
         self.last_stamps = {}
         self.last_info = {}
@@ -207,7 +267,7 @@ class GdkReader:
             self.closed = False
             if gdk.gdk_init() != gdk.GDKRes.kSuccess:
                 raise RuntimeError('GDK initialization failed')
-            self.robot = gdk.Robot()
+            self.robot = _SerializedRobot(gdk.Robot())
             self.controller = G2Controller(gdk, self.robot, allow_motion=allow_motion)
             self.streams = {'left_wrist': gdk.CameraType.kHandLeftColor,
                             'right_aux': gdk.CameraType.kHandRightColor}
@@ -224,32 +284,87 @@ class GdkReader:
                 raise RuntimeError(f'GDK initialization cleanup failed: {type(error).__name__}: {error}') from error
             raise
 
+    def read_control_pose(self):
+        """Read-only drift feedback; does not wait for or consume camera frames.
+
+        This is not an observation/freshness approval. The caller must still
+        revalidate the timestamped predecessor before submitting any target.
+        """
+        if self.closed:
+            raise RuntimeError('Reader is closed')
+        self.controller.checked_arm_state()
+        return measured_pose(self.controller.read_end_effector_pose('arm_l_end_link'))
+
+    def read_stop_feedback(self):
+        """Independent measured hold evidence; no camera call, no commands."""
+        start = time.monotonic_ns()
+        wall_start = time.time_ns()
+        pose = self.read_control_pose()
+        evidence = tf_motion_evidence(self.tf, pose)
+        evidence.update(joint_timestamp_ns=source_timestamp_ns(self.robot.get_joint_states()['timestamp']),
+                        read_start_monotonic_ns=start, read_start_wall_ns=wall_start,
+                        motion_pose=pose.tolist())
+        return evidence
+
     def observe(self):
         if self.closed:
             raise RuntimeError('Reader is closed')
         start_mono = time.monotonic_ns()
         start_wall = time.time_ns()
         start_sdk = source_timestamp_ns(self.gdk.Clock.now_ns())
+        obs = {}
+        stamps = {}
+        frames = {}
+        deadline = time.monotonic() + self.timeout_s
+        pair_deadline = None
+        camera_calls = {key: 0 for key in self.streams}
+        camera_wait_s = {key: 0. for key in self.streams}
+        camera_max_call_s = {key: 0. for key in self.streams}
+        repeats = {key: 0 for key in self.streams}
+        while True:
+            # Refresh BOTH candidates while waiting, rather than pinning the
+            # left frame while the right stream catches up. Decode only the
+            # final pair; original capture timestamps remain unchanged.
+            for key, stream in self.streams.items():
+                call_start = time.monotonic()
+                frame = self.camera.get_latest_image(stream, 100.)
+                elapsed = time.monotonic()-call_start
+                camera_calls[key] += 1
+                camera_wait_s[key] += elapsed
+                camera_max_call_s[key] = max(camera_max_call_s[key], elapsed)
+                stamp = source_timestamp_ns(frame.timestamp_ns)
+                repeats[key] += int(stamp == stamps.get(key))
+                frames[key], stamps[key] = frame, stamp
+            pending = [key for key in stamps if stamps[key] <= self.last_stamps.get(key, 0)]
+            skew_ns = max(stamps.values()) - min(stamps.values())
+            mismatched = (self.camera_pair_max_skew_s is not None and
+                          skew_ns > self.camera_pair_max_skew_s * 1e9)
+            if not pending and not mismatched:
+                break
+            if mismatched:
+                if pair_deadline is None:
+                    pair_deadline = min(deadline, time.monotonic()+.05)
+                if time.monotonic() >= pair_deadline:
+                    raise TimeoutError(f'Camera pair unavailable: skew_ms={skew_ns/1e6:.3f}; '
+                                       f'limit_ms={self.camera_pair_max_skew_s*1000:.3f}; '
+                                       f'camera_calls={camera_calls}; repeated_frames={repeats}; '
+                                       f'sdk_total_s={camera_wait_s}; sdk_max_call_s={camera_max_call_s}; '
+                                       f'capture_timestamps_ns={stamps}')
+            elif pair_deadline is not None and time.monotonic() >= pair_deadline:
+                raise TimeoutError(f'Camera pair did not advance before pairing deadline: {pending}')
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f'No advancing camera timestamp: {pending}')
+            time.sleep(.005)
+        acquired_mono = time.monotonic_ns()
+        for key, frame in frames.items():
+            obs[key] = self.decode(frame, self.gdk)
+        decoded_mono = time.monotonic_ns()
         self.controller.checked_arm_state()
         pose = measured_pose(self.controller.read_end_effector_pose('arm_l_end_link'))
         state_received = time.monotonic_ns()
         if np.any(np.abs(pose) > np.finfo(np.float32).max):
             raise ValueError('Invalid measured pose for float32 observation')
-        state = pose.astype(np.float32)
-        obs = {'state': state}
-        stamps = {}
-        for key, stream in self.streams.items():
-            deadline = time.monotonic() + self.timeout_s
-            while True:
-                frame = self.camera.get_latest_image(stream, 100.)
-                stamp = source_timestamp_ns(frame.timestamp_ns)
-                if stamp > self.last_stamps.get(key, 0):
-                    break
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f'No advancing camera timestamp: {key}')
-                time.sleep(.005)
-            obs[key] = self.decode(frame, self.gdk)
-            stamps[key] = stamp
+        obs['state'] = pose.astype(np.float32)
         sources = dict(stamps, joint=source_timestamp_ns(self.robot.get_joint_states()['timestamp']))
         evidence = tf_motion_evidence(self.tf, pose)
         sources['tf'] = evidence['tf_queries'][1]['timestamp_ns']
@@ -264,6 +379,10 @@ class GdkReader:
                     read_end_sdk_clock_ns=end_sdk, sdk_clock_ns=end_sdk,
                     motion_pose=pose.tolist(), state_received_monotonic_ns=state_received,
                     received_monotonic_ns=end_mono, read_duration_s=(end_mono - start_mono) / 1e9,
+                    camera_acquire_s=(acquired_mono-start_mono)/1e9,
+                    camera_decode_s=(decoded_mono-acquired_mono)/1e9,
+                    camera_calls=camera_calls, camera_repeated_frames=repeats,
+                    camera_sdk_total_s=camera_wait_s, camera_sdk_max_call_s=camera_max_call_s,
                     motion_status=status, backend='gdk_read_only')
         self.last_stamps = stamps
         self.last_info = info

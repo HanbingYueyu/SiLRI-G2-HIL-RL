@@ -48,7 +48,7 @@ def healthy_snapshot(*, sequence=1, **changes):
         wall_minus_mono_ns=1_700_000_000_000_000_000,
         created_mono_ns=now_ns,
         last_sample_mono_ns=last_sample_ns,
-        valid_until_ns=last_sample_ns + 2_500_000_000,
+        valid_until_ns=last_sample_ns + 4_500_000_000,
     )
     values.update(changes)
     return ClockSnapshot(**values)

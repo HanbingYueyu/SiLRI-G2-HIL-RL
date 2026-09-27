@@ -89,7 +89,7 @@ def test_complete_evidence_produces_retrospective_mapping_not_live_permission():
     assert r['scale'] == 'raw_ptp'
     assert r['properties']['currentUtcOffsetValid'] == 0
     assert not r['valid_for_live_use'] and not r['motion_authorized']
-    assert r['mapping']['expires_ns'] == 120_500_000_000
+    assert r['mapping']['expires_ns'] == 122_500_000_000
 
 
 @pytest.mark.parametrize('bad', ['missing_properties', 'scale_change', 'collection_error',

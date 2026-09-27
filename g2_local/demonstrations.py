@@ -102,6 +102,13 @@ class DemonstrationWriter:
             _publish(directory / 'complete.json', canonical_json({
                 'episode_id': episode_id, 'sha256': episode['hashes']}))
             episode['closed'] = True
+            label = info.get('success_label')
+            result = ('成功（Y）' if label is True else '失败（F）' if label is False
+                      else '步数到限（未标记成功）' if row['truncated'] else '回合结束')
+            print(f'\n{result}：回合已保存，共 {len(episode["hashes"])} 步。'
+                  f'\n保存目录：{directory}'
+                  '\n按 Ctrl+C 退出采集；人工拔出到可观测位置，由上游视觉复位。'
+                  '\n无需固定上抬 5 cm；退出上游运动程序后，重新运行采集命令。', flush=True)
 
 
 def load_demo_episodes(path, *, config):
@@ -181,7 +188,7 @@ def import_demonstrations(learner, paths, *, evidence):
                             episode_id=episode_id,
                             transition_id=f'{learner.run_id}/{episode_id}/{info["step_id"]}')
                 rows.append(row)
-            result = learner.ingest(rows)
+            result = learner.ingest(rows, count_episodes=False)
             # Only fully validated contiguous imports satisfy initialization.
             with learner._lock:
                 learner.imported_demo_episodes.add(episode_id)

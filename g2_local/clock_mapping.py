@@ -24,11 +24,16 @@ MIN_PTP_SPAN_NS = 10_000_000_000
 MAX_PTP_GAP_NS = 4_000_000_000
 MAX_PATH_DELAY_NS = 1_000_000
 MAX_DRIFT_PPM = 100
-MAX_RESIDUAL_NS = 1_000_000
+# Software-timestamp jitter is included in empirical_error_ns, not discarded.
+# 2 ms base + 1.5 ms residual + 1 ms path + 0.45 ms extrapolation <= 5 ms.
+MAX_RESIDUAL_NS = 1_500_000
 MAX_PTP_DELIVERY_LEAD_NS = 1_000_000
 MAX_PTP_DELIVERY_DELAY_NS = 500_000_000
 MAX_WALL_JUMP_NS = 1_000_000
-PTP_LEASE_NS = 2_500_000_000
+# Reports arrive every ~2 s. Allow one quarantined report plus 0.5 s jitter;
+# extrapolation still accumulates 100 ppm error and consumers enforce 5 ms.
+# Evidence comparison: docs/g2-official-control-findings-20260926.md.
+PTP_LEASE_NS = 4_500_000_000
 MAPPING_BASE_ERROR_NS = 2_000_000
 TIME_PROPERTY_NAMES = ('currentUtcOffset', 'currentUtcOffsetValid',
                        'leap61', 'leap59', 'ptpTimescale')

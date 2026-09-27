@@ -229,6 +229,11 @@ def test_properties_failures_stop_monitor_and_publish_unhealthy(tmp_path, launch
     monkeypatch.setattr(module, '_PMC_TIMEOUT_S', .15)
     launch[0]['pmc'] = script
     item = runtime(tmp_path)
+    # Properties are attributable to the robot only after master discovery.
+    mono = time.monotonic_ns()
+    item.window.feed_ptp(
+        f'ptp4l: selected best master clock {item.window.expected_master}',
+        mono, time.time_ns())
     assert item.run() == 2
     assert item.provider().reason == reason
     assert item.provider().healthy is False

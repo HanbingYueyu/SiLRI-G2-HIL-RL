@@ -13,6 +13,8 @@ def source_digest(root):
     for name in ('g2_local', 'lerobot/src/lerobot', 'rl_envs', 'rl_envs_sim'):
         paths.update(path for path in (root/name).rglob('*.py')
                      if not {'.git', '.venv', '__pycache__'}.intersection(path.parts))
+    paths.update((root/'g2_local/native').glob('*.cpp'))
+    paths.update((root/'g2_local').glob('_gdk_safe_stop*.so'))
     for path in sorted(paths):
         digest.update(str(path.relative_to(root)).encode()+b'\0')
         digest.update(path.read_bytes())

@@ -68,6 +68,29 @@ def test_duplicate_does_not_mutate_replay_or_update_budget():
     assert learner.snapshot_counts() == before
 
 
+def test_episode_checkpoint_and_resume_excludes_demonstrations(tmp_path):
+    learner = _learner()
+    learner.checkpoint_path = tmp_path / 'checkpoint.pt'
+    def terminal(index):
+        row = _row()
+        row['done'] = True
+        row['complementary_info'].update(episode_id=f'ep-{index}',
+            transition_id=f'run-1/ep-{index}/0', success_label=True)
+        return row
+    learner.ingest([terminal('demo')], count_episodes=False)
+    for index in range(1, 10):
+        learner.ingest([terminal(index)])
+    assert not learner.checkpoint_path.exists()
+    learner.ingest([terminal(10)])
+    restored = load_checkpoint(learner.checkpoint_path, expected_run_id='run-1',
+                               expected_config_hash='hash-1').runtime
+    assert restored.snapshot_counts()['completed_episodes'] == 10
+    restored.ingest([terminal(10)])
+    assert restored.snapshot_counts()['completed_episodes'] == 10
+    restored.ingest([terminal(11)])
+    assert restored.snapshot_counts()['completed_episodes'] == 11
+
+
 def test_invalid_row_in_batch_leaves_all_replay_untouched():
     learner = _learner()
     bad = _row(1)
@@ -161,6 +184,37 @@ def test_online_update_waits_for_beta_then_uses_configured_utd():
     assert len(learner.update_for_interactions()) == 4
     assert learner.version == 4
     assert learner.update_for_interactions() == []
+
+
+def test_delayed_actor_updates_preserve_phase_on_resume(tmp_path):
+    torch.set_num_threads(2)
+    config = _config(optimization=replace(_config().optimization,
+                                          actor_update_interval=2))
+    learner = RealLearnerRuntime(config=config, run_id='run-1')
+    learner.imported_demo_episodes.add('fixture-complete-demo')
+    learner.ingest([_row(human=True)])
+    initial_actor = {k: v.clone() for k, v in learner.policy.actor.state_dict().items()}
+    progress = []
+    learner.progress = progress.append
+    first = learner.update_once()
+    assert 'critic' in first and 'actor' not in first
+    assert progress[-1]['actor_loss'] is None and progress[-1]['actor_updated'] is False
+    assert progress[-1]['critic_loss'] == first['critic']
+    assert not learner.optimizers['actor'].state
+    assert all(torch.equal(v, learner.policy.actor.state_dict()[k])
+               for k, v in initial_actor.items())
+    path = learner.save_checkpoint(tmp_path / 'delayed.pt')
+    restored = load_checkpoint(path, expected_run_id='run-1', expected_config_hash='hash-1')
+    assert restored.config.optimization.actor_update_interval == 2
+    second = restored.update_once()
+    assert 'actor' in second
+    assert any(not torch.equal(v, restored.policy.actor.state_dict()[k])
+               for k, v in initial_actor.items())
+    third = restored.update_once()
+    assert 'actor' not in third
+    restored.update_once()
+    for name, steps in [('critic', 4), ('actor', 2), ('lagrange', 4)]:
+        assert {int(state['step']) for state in restored.optimizers[name].state.values()} == {steps}
 
 
 def test_human_update_advances_expert_and_actor_optimizer():
