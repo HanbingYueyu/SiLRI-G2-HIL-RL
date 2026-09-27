@@ -19,7 +19,7 @@
 
 - 本机配置：`runtime/train-fixed-fridge-20260927.json`。
 - 配置 hash：`56293dcce0e4e1c24011d6e44a20981383313f1fa503f9b25e580c0c96e95cdd`。
-- 当前种子/run ID：`offline-pretrain-20260927-04`，30 条兼容示范、4042 步。
+- 当前种子/run ID：`offline-pretrain-20260927-06`，30 条兼容示范、4042 步。
 - `runtime/` 不随仓库发布；此文档列出本机核对值，不冒充远端克隆可独立读取的产物。
 - 示范导入校验 `demonstration_contract`（含 observation/ROI、task、intervention、相关 motion 字段）；不同完整配置 hash 可以在兼容契约下显式导入，不等于允许混用不同 ROI。
 - checkpoint 恢复仍核对实际配置和算法身份，文档版本名不能绕过校验。改 ROI 后须重新确认数据兼容性及重建对应种子，不重解释旧像素。

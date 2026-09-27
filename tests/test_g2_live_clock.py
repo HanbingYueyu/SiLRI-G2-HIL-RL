@@ -129,7 +129,7 @@ def test_new_sample_refits_and_moves_only_the_ptp_derived_lease():
     assert second.offset_at_reference_ns == pytest.approx(18_000_160_000, abs=1)
 
 
-def test_quarantined_sample_gap_rewarms_without_latching_transport_failure():
+def test_one_quarantined_report_plus_millisecond_jitter_can_refit():
     window = healthy_window()
     # Raw reports remain 2 seconds apart; only the fit rejects the 18s outlier.
     window.feed_ptp(offset_line(18, 55_100_000_000),
@@ -137,9 +137,8 @@ def test_quarantined_sample_gap_rewarms_without_latching_transport_failure():
     window.feed_ptp(offset_line(20.001, 55_000_180_010),
                     20_011_000_000, wall(20_011_000_000))
     snap = window.snapshot(20_100_000_000, wall(20_100_000_000))
-    assert not snap.healthy
-    assert snap.reason == 'warming_up'
-    assert snap.valid_until_ns == 0
+    assert snap.healthy
+    assert snap.reference_mono_ns == 20_001_000_000
     for index in range(1, 8):
         ns = 20_001_000_000 + index * 2_000_000_000
         window.feed_ptp(offset_line(ns / 1e9, 55_000_180_010 + index * 20_000),

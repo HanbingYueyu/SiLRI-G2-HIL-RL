@@ -2,14 +2,14 @@
 
 ## 当前边界
 
-未启动真机 Actor。用户已提供低速停止后 3 秒 TF 稳定记录；下一步受监督闭环。不提供自动解锁。SDK 卡住或通信断开时软件不能保证停止，需现场急停。
+当前完整回合仍为 0。最新 `train-live-pn2pgrpe` 回传 36 条有效转移，其中人工接管 10 条；Learner 正常保存到 54 次更新（累计 accepted=4086、human=4052）。PTP 最后报告为单调时间 35267.993 s；4.5 秒租约到期后拒绝 successor，35274.722 s 的 ptp4l 报告 `ANNOUNCE_RECEIPT_TIMEOUT_EXPIRES`，监控因 ptp_fault 退出。需要抓包定位 PTP 断流原因，不再把本次问题归因于已修复的 4.001 秒拟合间隔容差。当前工具会话缺少 sudo 凭证，尚未抓包。checkpoint 路径仍为 `runtime/fixed-fridge-training-07/checkpoint.pt`；原迁移前文件保留。Actor 的 `stop_confirmed=false` 需现场确认机器人静止后再启动动作。
 
 ## 当前训练产物
 
 - **当前 1:2 配置已重新预训练并验证恢复：`actor_update_interval=2`，UTD=1；旧 `-01` 产物保留，不混用。**
 - 配置：`runtime/train-fixed-fridge-20260927.json`
-- run ID：`offline-pretrain-20260927-05`
-- checkpoint：`runtime/offline-pretrain-20260927-05/checkpoint.pt`；审查修复后重新生成，旧 -01/-02/-03 不混用。
+- run ID：`offline-pretrain-20260927-07`
+- checkpoint：`runtime/offline-pretrain-20260927-07/checkpoint.pt`；审查修复后重新生成，旧 -01/-02/-03 不混用。
 - 总 batch=16（在线 Replay 8＋人工 Replay 8）；累计真机回合不包含导入示范。每 10 回合和正常退出保存，原有每 1000 次更新的额外备份频率保留。
 - 结果：同目录 `result.json` 和 `events.jsonl`，30 回合/4042 步，β=500、Critic=10、Actor=5、λ=10；恢复后第 11 次仅更新 Critic/λ，验证未覆盖文件。代码/配置身份及优化器步数已核对。
 - 此配置与未来 Actor 共用，包含 `requested_motion=true`；离线预训练强制 `cli_allow_motion=False`，未授权运动。正式入口仍须 CLI 运动标志及有效现场证据。
@@ -20,14 +20,14 @@
 ```bash
 cd /home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL
 bash run_g2_python.sh -m g2_local.real_train learner \
-  --run-id offline-pretrain-20260927-05 \
+  --run-id offline-pretrain-20260927-07 \
   --config runtime/train-fixed-fridge-20260927.json \
-  --checkpoint runtime/offline-pretrain-20260927-05/checkpoint.pt \
-  --checkpoint-dir runtime/fixed-fridge-training \
+  --checkpoint runtime/offline-pretrain-20260927-07/checkpoint.pt \
+  --checkpoint-dir runtime/fixed-fridge-training-07 \
   --output "runtime/learner-live-$(date +%Y%m%d-%H%M%S)"
 ```
 
-Learner 不接触机器人。以后重复同一命令：优先读取 `runtime/fixed-fridge-training/checkpoint.pt`；只有第一次没有该文件才读取 `--checkpoint` 种子。不因最新文件损坏或身份不匹配而偷偷回退。目录加单写者锁，checkpoint 原子替换；不要删训练目录或更改 run ID。正常 Ctrl+C 等待保存完成，强制杀进程/断电只能恢复最后一次保存。
+Learner 不接触机器人。以后重复同一命令：优先读取 `runtime/fixed-fridge-training-07/checkpoint.pt`；只有第一次没有该文件才读取 `--checkpoint` 种子。不因最新文件损坏或身份不匹配而偷偷回退。目录加单写者锁，checkpoint 原子替换；不要删训练目录或更改 run ID。正常 Ctrl+C 等待保存完成，强制杀进程/断电只能恢复最后一次保存。
 
 终端每轮优化打印 `completed_episodes`、`learner_update`、`actor_loss`、`critic_loss`；累计回合 20 时 `next_episode=21`。Actor 未更新的轮次为 `actor_updated=false, actor_loss=null`，不复用旧值。第 10/20…回合和退出时打印 `checkpoint_saved`。尚未完成且没有终止转移的中断回合不算完成。
 

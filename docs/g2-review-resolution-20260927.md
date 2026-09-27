@@ -20,8 +20,15 @@
 
 ### 后续边界证据补充
 
-- `local_envelope_rejected` 事件记录 episode_id、stage、pose、episode_reference、平移/转角边界及拒绝原因。stage 区分 episode_reset、observation_read、pre_command_feedback、pre_command_target、successor_read；successor_read 表示本步命令已发送后读取，不把它写成“未执行”。事件在停止路径后写入，不改变原停止处理。
-- 每步 `action_mapping` 事件保存动作来源位姿、selected/executed、动作尺度、绝对边界及 XYZ 裁剪距离（米）。回合 summary 新增 workspace_clipping_count、workspace_subtolerance_count；几何诊断容差为 1 nm。归一化动作差异用 1e-7 容差，微差另计 action_numerical_difference_count。这些仅是统计容差，不放宽执行边界；无几何记录时不凭动作差推定 workspace 裁剪。
+**92504c5 复审的三项缺口已于本轮修正。** 验证不再只调用 `_check_local()`：使用实际 MotionBackend.execute/CommandStream、替身硬件验证发送前拒绝、已应答后 successor 越界、SDK 发送超时未确认、真实绝对 workspace 裁剪和 reset 绝对越界；Actor 运行失败/复位失败清空 context 后，事件仍保留 episode_id。相关检查共 84 项通过，未连接机器人。
+
+当前启动种子为 `offline-pretrain-20260927-06`：30 条/4042 步重新导入，β500、Critic10、Actor5，预算0；保存、恢复及第11次更新通过。启动命令与脚本已同步，旧种子保留但不混用。以下 -04/-05 记录为历史验证，不是当前启动版本。
+
+- `local_envelope_rejected` 记录局部边界；`absolute_workspace_rejected` 单独记录 reset/反馈位姿已超绝对空间。事件包含 episode_id、step_id、stage、被检查 pose、episode_reference（未锁定时为 null）、适用边界与原因。Actor 在 abort 清理前把身份附到异常，reset 失败也保留身份。
+- `episode_reset` 的实际拒绝来源是绝对 workspace 校验，不再用 pose 对自身的局部校验作证明。`successor_read` 表示本步已获得发送应答后读取失败，不等于动作未发送，也不保证硬件完成动作。
+- 动作映射在目标规划完成后、任何 submit 前构造。正常 step 写 `action_mapping`；失败写 `command_execution_failed`，边界事件也附 execution。字段含 selected_action、effective_action（计划的有效动作，不冒充物理实测动作）、origin_pose、裁剪距离、command_sequence 和发送应答时间。发送状态：not_submitted、submission_attempted_unconfirmed、submitted_unconfirmed、acknowledged，均指当前请求，不代表之前没有其他命令。
+- 提交/应答异常不擅自断言“未发送”；保留未知状态。successor 失败记录不生成普通 RL transition。无规划结果时 action_mapping=null，不借用上一条动作。
+- 几何统计保留 workspace_clipping_count/workspace_subtolerance_count，容差 1 nm；归一化动作差异容差 1e-7，微差另计。这些仅是诊断容差，不放宽边界。
 - 48 项相关回归和 3 项新增检查通过。因代码身份变化，重新生成 `offline-pretrain-20260927-05`，30 条/4042 步、预算0，保存/恢复及后续更新通过；启动脚本和命令已切换。未改算法、输入/动作契约或训练参数，未启动真机。
 
 - 针对导入、目标动作边界、保存期间心跳及恢复的相关检查：54 项通过；未运行机器人。

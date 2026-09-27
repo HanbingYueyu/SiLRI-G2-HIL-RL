@@ -201,6 +201,25 @@ def test_actor_uploads_driver_confirmed_action_with_identity():
     assert rig.coordinator.intervention.polls >= 1
 
 
+def test_first_policy_forward_is_warmed_before_fresh_action_observation():
+    rig = actor_rig()
+    calls = []
+    original = rig.runtime._infer
+    def infer(obs):
+        calls.append((rig.env.refresh_calls, rig.env.step_calls))
+        return original(obs)
+    rig.runtime._infer = infer
+    events = []
+    rig.runtime.telemetry = lambda kind, **fields: events.append((kind, fields))
+    rig.runtime.run(max_completed_steps=1)
+    assert len(calls) == 11
+    assert calls[:10] == [(0, 0)] * 10
+    assert calls[10] == (1, 0)
+    assert len(rig.transport.sent) == 1
+    warmup = next(fields for kind, fields in events if kind == 'policy_warmup')
+    assert warmup['discarded_actions'] == 10
+
+
 def test_y_after_successor_labels_previous_step_without_another_motion():
     rig = actor_rig()
     rig.runtime.config.task = SimpleNamespace(success_reward=10., failure_reward=-1.)

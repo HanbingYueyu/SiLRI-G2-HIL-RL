@@ -487,6 +487,26 @@ def test_close_waits_for_recovery_checkpoint_and_exposes_failure(monkeypatch, tm
             closer.join(5.)
 
 
+def test_stop_during_optimizer_does_not_become_background_failure(monkeypatch):
+    from g2_local import real_learner
+    learner = _learner()
+    learner.config.optimization = replace(learner.config.optimization, publish_interval=1)
+    learner.ingest([_row(human=True)])
+    learner.pretrain_behavior()
+    service = GrpcLearnerService(learner)
+    original = real_learner.train_batch
+    def stop_after_update(*args, **kwargs):
+        result = original(*args, **kwargs)
+        service._stop()
+        return result
+    monkeypatch.setattr(real_learner, 'train_batch', stop_after_update)
+    service._schedule()
+    service._worker.join(5.)
+    assert not service._worker.is_alive()
+    assert learner.update_count == 1
+    assert service.failure is None
+
+
 def test_background_optimizer_failure_closes_parameter_liveness(monkeypatch):
     from g2_local import real_learner
     learner = _learner()

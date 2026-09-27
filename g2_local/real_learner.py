@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from copy import deepcopy
 from collections import deque
 import os
+import logging
 from pathlib import Path
 import random
 import tempfile
@@ -26,6 +27,10 @@ from .provenance import ProvenanceRecords, compact_record, tensor_digest
 from .runtime import train_batch
 from .code_identity import algorithm_identity
 from .training_config import OptimizationConfig, RuntimeConfig, _open_owned_regular
+
+
+class LearnerStopped(RuntimeError):
+    """Expected lifecycle cancellation, distinct from optimizer failure."""
 
 
 @dataclass(frozen=True)
@@ -316,7 +321,7 @@ class RealLearnerRuntime:
     def publish_parameters(self):
         with self._update_lock, self._parameter_lock:
             if self.stopped.is_set():
-                raise RuntimeError('Learner stopped')
+                raise LearnerStopped('Learner stopped')
             state = {key: value.detach().cpu().clone()
                      for key, value in self.policy.actor.state_dict().items()}
             envelope = self._envelope(self.version, state)
@@ -357,7 +362,7 @@ class RealLearnerRuntime:
                 baseline_count = self.human_transitions_total
             while self.beta_pretrain_completed < opt.beta_pretrain_steps:
                 if self.stopped.is_set():
-                    raise RuntimeError('Learner stopped during beta pretraining')
+                    raise LearnerStopped('Learner stopped during beta pretraining')
                 with self._lock:
                     data = self.human_replay.sample(opt.human_batch_size)
                 metrics = train_batch(self.policy, self.optimizers, data, ('expert',))
@@ -369,14 +374,14 @@ class RealLearnerRuntime:
     def update_once(self):
         with self._update_lock:
             if self.stopped.is_set():
-                raise RuntimeError('Learner stopped')
+                raise LearnerStopped('Learner stopped')
             opt = self.config.optimization
             if not self.pretrain_behavior():
                 return None
             while self.human_transitions_total-self.beta_last_human_count >= opt.beta_update_interval:
                 for _ in range(opt.beta_update_steps):
                     if self.stopped.is_set():
-                        raise RuntimeError('Learner stopped during beta update')
+                        raise LearnerStopped('Learner stopped during beta update')
                     with self._lock:
                         beta_data = self.human_replay.sample(opt.human_batch_size)
                     self.beta_last_loss = train_batch(
@@ -625,7 +630,7 @@ class GrpcLearnerService(rpc.LearnerServiceServicer):
     def publish(self, envelope):
         with self._condition:
             if self.learner.stopped.is_set():
-                raise RuntimeError('Learner stopped')
+                raise LearnerStopped('Learner stopped')
             self._latest = envelope
             self._condition.notify_all()
 
@@ -669,7 +674,12 @@ class GrpcLearnerService(rpc.LearnerServiceServicer):
                 with self._condition:
                     if not self._work.is_set():
                         self._idle.set()
+        except LearnerStopped as error:
+            if not self.learner.stopped.is_set():
+                self.failure = error
+                self._stop()
         except BaseException as error:
+            logging.exception('Learner optimizer failed')
             self.failure = error
             self._stop()
         finally:

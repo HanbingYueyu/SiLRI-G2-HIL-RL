@@ -165,6 +165,8 @@ class EvalTransitionSink:
             self.evidence.event(kind, **fields)
         elif kind == 'stop':
             self.evidence.event('command_stop', **fields)
+        elif kind == 'policy_warmup':
+            self.evidence.event(kind, **fields)
 
     def finalize_unfinished(self, reason):
         for item in self._episodes.values():
@@ -442,7 +444,9 @@ def _run_learner_owned(args, loaded, evidence):
     if service.preservation_failure is not None:
         raise RuntimeError('Learner recovery checkpoint failed') from service.preservation_failure
     if service.failure is not None:
-        raise RuntimeError('Background learner optimization failed') from service.failure
+        evidence.event('learner_failure', error=bounded_error(service.failure))
+        raise RuntimeError('Background learner optimization failed: '
+                           + bounded_error(service.failure)) from service.failure
     return 0
 
 
@@ -451,12 +455,23 @@ def record_actor_failure(runtime, transport, evidence, role, error):
     if runtime.stop_confirmed is False:
         error.stop_unconfirmed = True
     tracker = transport.tracker if role == 'actor' else transport
+    context = getattr(getattr(runtime, 'coordinator', None), 'context', None)
+    episode_id = getattr(error, 'episode_id', getattr(context, 'episode_id', None))
+    step_id = getattr(error, 'step_id', None)
+    execution = getattr(error, 'execution_event', None)
+    if execution is not None:
+        try:
+            evidence.event('command_execution_failed', episode_id=episode_id,
+                           step_id=step_id, error=bounded_error(error), **execution)
+        except Exception:
+            logging.exception('Execution evidence write failed after stop')
     boundary = getattr(error, 'boundary_event', None)
     if boundary is not None:
         try:
-            context = getattr(getattr(runtime, 'coordinator', None), 'context', None)
-            evidence.event('local_envelope_rejected',
-                           episode_id=getattr(context, 'episode_id', None), **boundary)
+            evidence.event('absolute_workspace_rejected' if
+                           boundary.get('boundary_kind') == 'absolute_workspace' else
+                           'local_envelope_rejected', episode_id=episode_id,
+                           step_id=step_id, execution=execution, **boundary)
         except Exception:
             logging.exception('Boundary evidence write failed after stop')
     try:
@@ -468,6 +483,7 @@ def record_actor_failure(runtime, transport, evidence, role, error):
         evidence.event('actor_stopped', reason=runtime.stop_reason or 'actor_failure',
                        stop_confirmed=runtime.stop_confirmed is True,
                        freshness_rejects=runtime.freshness_rejects,
+                       inference_latency_s=getattr(error, 'inference_latency_s', None),
                        error=bounded_error(error))
     except BaseException:
         logging.exception('Actor stop evidence write failed after shutdown')

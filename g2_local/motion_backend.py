@@ -86,11 +86,24 @@ class MotionBackend:
             self.local_envelope.check(pose, reference)
         except ValueError as error:
             error.boundary_event = dict(
-                stage=stage, reason=str(error), pose=list(pose),
+                boundary_kind='local_envelope', stage=stage, reason=str(error), pose=list(pose),
                 episode_reference=list(reference),
                 translation_low_m=list(self.local_envelope.translation_low_m),
                 translation_high_m=list(self.local_envelope.translation_high_m),
                 rotation_max_rad=self.local_envelope.rotation_max_rad)
+            raise
+
+    def _plan(self, pose, action, stage):
+        try:
+            return plan_target(pose, action, self.config)
+        except ValueError as error:
+            if str(error) == 'Measured pose already outside configured workspace':
+                error.boundary_event = dict(
+                    boundary_kind='absolute_workspace', stage=stage, reason=str(error),
+                    pose=list(pose), episode_reference=(list(self.episode_reference)
+                        if self.episode_reference is not None else None),
+                    workspace_low=list(self.config.workspace_low),
+                    workspace_high=list(self.config.workspace_high))
             raise
 
     def _read_locked(self, *, after=None):
@@ -142,10 +155,12 @@ class MotionBackend:
                 raise RuntimeError('Reconstruct backend before starting another episode')
             pose = vector(observation['state'], 7)
             # Zero-action planning also validates the fixed absolute workspace.
-            plan_target(pose, (0.,)*6, self.config)
+            self._plan(pose, (0.,)*6, 'episode_reset')
             self._check_local(pose, 'episode_reset', reference=pose)
             self.episode_reference = pose
-        except Exception:
+        except Exception as error:
+            error.execution_event = dict(send_status='not_submitted', command_sequence=None,
+                                        command_sent_monotonic_ns=None, action_mapping=None)
             self._abort()
             raise
 
@@ -196,6 +211,9 @@ class MotionBackend:
             raise PermissionError('Motion disabled; no command submitted')
         if not self.execute_lock.acquire(blocking=False):
             raise RuntimeError('Concurrent execute is not supported')
+        execution = dict(send_status='not_submitted', command_sequence=None,
+                         command_sent_monotonic_ns=None, action_mapping=None)
+        self.last_execution_timing = {}
         try:
             if self.local_envelope is not None and self.episode_reference is None:
                 raise RuntimeError('Episode reference required before motion')
@@ -225,7 +243,7 @@ class MotionBackend:
             else:
                 before = self._read()
             # New feedback is still checked, but does not silently change action origin.
-            plan_target(before['state'], (0.,)*6, self.config)
+            self._plan(before['state'], (0.,)*6, 'pre_command_feedback')
             if reference is not None and self.reference_guard is not None:
                 if self.reference_guard(*reference) is not True:
                     owner = getattr(self.reference_guard, '__self__', None)
@@ -241,39 +259,41 @@ class MotionBackend:
                     rotation_drift > self.policy_rotation_drift_rad):
                 raise RuntimeError(f'Policy pose drift exceeded: {position_drift:.6f} m, '
                                    f'{rotation_drift:.6f} rad; re-observe before rearming')
-            pose, effective = plan_target(origin, action, self.config)
+            pose, effective = self._plan(origin, action, 'pre_command_target')
+            candidate_xyz = (np.asarray(origin[:3]) + np.clip(action, -1., 1.)[:3] *
+                             np.asarray(self.config.action_scale[:3]))
+            execution['action_mapping'] = dict(
+                origin_pose=list(origin), selected_action=list(action),
+                effective_action=list(effective),
+                workspace_low=list(self.config.workspace_low),
+                workspace_high=list(self.config.workspace_high),
+                action_scale=list(self.config.action_scale),
+                workspace_clip_m=np.maximum(np.maximum(
+                    np.asarray(self.config.workspace_low)-candidate_xyz,
+                    candidate_xyz-np.asarray(self.config.workspace_high)), 0.).tolist())
             if self.local_envelope is not None:
                 self._check_local(pose, 'pre_command_target')
             if self.before_command is not None:
                 self.before_command()
+            execution['send_status'] = 'submission_attempted_unconfirmed'
             sequence = self.stream.submit(PoseTarget(pose[:3], pose[3:]))
+            execution.update(send_status='submitted_unconfirmed', command_sequence=sequence)
             sent_at = self.stream.wait_sent(sequence, timeout=self.stream.command_timeout)
+            execution.update(send_status='acknowledged', command_sent_monotonic_ns=round(sent_at*1e9))
             self.stream.halt.wait(max(0., sent_at+self.step_period-time.monotonic()))
             self.stream.check()
             after = self._read(after=sent_at)
             self.last_execution_timing = dict(
-                action_mapping=dict(
-                    origin_pose=list(origin), selected_action=list(action),
-                    executed_action=list(effective),
-                    workspace_low=list(self.config.workspace_low),
-                    workspace_high=list(self.config.workspace_high),
-                    action_scale=list(self.config.action_scale),
-                    workspace_clip_m=np.maximum(
-                        np.maximum(np.asarray(self.config.workspace_low) -
-                                   (np.asarray(origin[:3]) + np.clip(action, -1., 1.)[:3] *
-                                    np.asarray(self.config.action_scale[:3])),
-                                   (np.asarray(origin[:3]) + np.clip(action, -1., 1.)[:3] *
-                                    np.asarray(self.config.action_scale[:3])) -
-                                   np.asarray(self.config.workspace_high)), 0.).tolist()),
+                **execution,
                 policy_position_drift_m=position_drift,
                 policy_rotation_drift_rad=rotation_drift,
-                command_sent_monotonic_ns=round(sent_at*1e9),
                 successor_received_monotonic_ns=time.monotonic_ns())
             decision = coerce_outcome(self.outcome(after))
             self.stream.check()
             return StepResult(after, effective, decision.reward, decision.terminated,
                               decision.reward_source, decision.success_label)
-        except Exception:
+        except Exception as error:
+            error.execution_event = deepcopy(execution)
             self._abort()
             raise
         finally:

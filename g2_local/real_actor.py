@@ -341,6 +341,7 @@ class RealActorRuntime:
         self.transport = transport
         self.env_factory = env_factory
         self.demonstration = demonstration
+        self._policy_warmed = False
         if demonstration and policy is not None:
             raise ValueError('Demonstration must not load a policy')
         self.policy = None if demonstration else (policy or create_policy(config.runtime.device)).eval()
@@ -595,7 +596,24 @@ class RealActorRuntime:
                                 print('双键已识别，正在连接观测与运动后端...', flush=True)
                             env = self.env_factory(self.config, self.coordinator)
                             self._env = env
-                            self.current_observation, _ = env.reset(options={'context': context})
+                            try:
+                                self.current_observation, _ = env.reset(options={'context': context})
+                                if not self.demonstration and not self._policy_warmed:
+                                    started = self.clock()
+                                    # CUDA initialization must not consume the freshness
+                                    # budget of the observation used for a command.
+                                    for _ in range(10):
+                                        self._infer(self.current_observation)
+                                    self._policy_warmed = True
+                                    self._emit('policy_warmup', episode_id=context.episode_id,
+                                               discarded_actions=10,
+                                               duration_s=self.clock() - started)
+                                    # The running branch obtains a NEW observation;
+                                    # none of these actions may reach env.step/Replay.
+                            except Exception as error:
+                                error.episode_id = context.episode_id
+                                error.step_id = None
+                                raise
                             episode_start_pose = tuple(self.current_observation['state'])
                             if self.demonstration:
                                 print('人工采集已开始：SpaceMouse 控制，Y 成功 / F 失败。', flush=True)
@@ -634,6 +652,9 @@ class RealActorRuntime:
                         self._step_active = False
                         terminal_before_next_action(forced=error)
                         continue
+                    error.episode_id = token.episode_id
+                    error.step_id = token.step_id
+                    error.inference_latency_s = inference_latency_s
                     if self.coordinator.active_step_token == token:
                         try:
                             self.coordinator.abort_step(token)

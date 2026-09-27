@@ -21,7 +21,9 @@ MAX_REPORT_SECONDS = MAX_REPORT_INTEGER // 1_000_000_000
 UTC_OFFSET_S = 37
 MIN_PTP_SAMPLES = 8
 MIN_PTP_SPAN_NS = 10_000_000_000
-MAX_PTP_GAP_NS = 4_000_000_000
+# Two nominal 2 s reports plus bounded scheduler/timestamp jitter. This does
+# not extend the 4.5 s mapping lease or admit rejected samples into the fit.
+MAX_PTP_GAP_NS = 4_100_000_000
 MAX_PATH_DELAY_NS = 1_000_000
 MAX_DRIFT_PPM = 100
 # Software-timestamp jitter is included in empirical_error_ns, not discarded.
