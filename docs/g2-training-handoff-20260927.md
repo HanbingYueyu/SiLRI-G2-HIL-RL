@@ -8,8 +8,8 @@
 
 - **当前 1:2 配置已重新预训练并验证恢复：`actor_update_interval=2`，UTD=1；旧 `-01` 产物保留，不混用。**
 - 配置：`runtime/train-fixed-fridge-20260927.json`
-- run ID：`offline-pretrain-20260927-04`
-- checkpoint：`runtime/offline-pretrain-20260927-04/checkpoint.pt`；审查修复后重新生成，旧 -01/-02/-03 不混用。
+- run ID：`offline-pretrain-20260927-05`
+- checkpoint：`runtime/offline-pretrain-20260927-05/checkpoint.pt`；审查修复后重新生成，旧 -01/-02/-03 不混用。
 - 总 batch=16（在线 Replay 8＋人工 Replay 8）；累计真机回合不包含导入示范。每 10 回合和正常退出保存，原有每 1000 次更新的额外备份频率保留。
 - 结果：同目录 `result.json` 和 `events.jsonl`，30 回合/4042 步，β=500、Critic=10、Actor=5、λ=10；恢复后第 11 次仅更新 Critic/λ，验证未覆盖文件。代码/配置身份及优化器步数已核对。
 - 此配置与未来 Actor 共用，包含 `requested_motion=true`；离线预训练强制 `cli_allow_motion=False`，未授权运动。正式入口仍须 CLI 运动标志及有效现场证据。
@@ -20,9 +20,9 @@
 ```bash
 cd /home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL
 bash run_g2_python.sh -m g2_local.real_train learner \
-  --run-id offline-pretrain-20260927-04 \
+  --run-id offline-pretrain-20260927-05 \
   --config runtime/train-fixed-fridge-20260927.json \
-  --checkpoint runtime/offline-pretrain-20260927-04/checkpoint.pt \
+  --checkpoint runtime/offline-pretrain-20260927-05/checkpoint.pt \
   --checkpoint-dir runtime/fixed-fridge-training \
   --output "runtime/learner-live-$(date +%Y%m%d-%H%M%S)"
 ```

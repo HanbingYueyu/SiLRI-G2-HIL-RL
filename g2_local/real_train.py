@@ -152,6 +152,10 @@ class EvalTransitionSink:
     def telemetry(self, kind, **fields):
         if kind == 'step':
             self._timing[(fields['episode_id'], fields['step_id'])] = fields
+            mapping = fields.get('execution_timing', {}).get('action_mapping')
+            if mapping is not None:
+                self.evidence.event('action_mapping', episode_id=fields['episode_id'],
+                                    step_id=fields['step_id'], **mapping)
             return
         if kind == 'freshness_reject':
             self._freshness_rejects += 1
@@ -178,11 +182,22 @@ class EvalTransitionSink:
             item['length'] += 1
             item['assisted'] |= bool(info['is_intervention'])
             item['intervention_ratio'] += int(info['is_intervention'])
-            clipped = tuple(info['selected_action']) != tuple(info['executed_action'])
+            delta = max(abs(a-b) for a, b in zip(info['selected_action'], info['executed_action']))
+            clipped = delta > 1e-7
+            item.setdefault('action_numerical_difference_count', 0)
+            item['action_numerical_difference_count'] += int(0 < delta <= 1e-7)
             item['action_clipping_count'] += int(clipped)
             self._clipping += int(clipped)
             timing = self._timing.pop((episode_id, info['step_id']), None)
             if timing is not None:
+                mapping = timing.get('execution_timing', {}).get('action_mapping')
+                if mapping is not None:
+                    # 1 nm is a diagnostic tolerance, never a motion limit.
+                    distances = mapping['workspace_clip_m']
+                    item.setdefault('workspace_clipping_count', 0)
+                    item.setdefault('workspace_subtolerance_count', 0)
+                    item['workspace_clipping_count'] += int(max(distances) > 1e-9)
+                    item['workspace_subtolerance_count'] += int(0 < max(distances) <= 1e-9)
                 item['actor_latency_s'] = timing['inference_latency_s']
                 item['control_period_s'] = timing['control_period_s']
             if row['done'] or row['truncated']:
@@ -436,6 +451,14 @@ def record_actor_failure(runtime, transport, evidence, role, error):
     if runtime.stop_confirmed is False:
         error.stop_unconfirmed = True
     tracker = transport.tracker if role == 'actor' else transport
+    boundary = getattr(error, 'boundary_event', None)
+    if boundary is not None:
+        try:
+            context = getattr(getattr(runtime, 'coordinator', None), 'context', None)
+            evidence.event('local_envelope_rejected',
+                           episode_id=getattr(context, 'episode_id', None), **boundary)
+        except Exception:
+            logging.exception('Boundary evidence write failed after stop')
     try:
         tracker.finalize_unfinished('stop_unconfirmed' if runtime.stop_confirmed is False
                                     else 'actor_failure')

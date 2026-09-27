@@ -18,6 +18,12 @@
 
 ## 验证与清理
 
+### 后续边界证据补充
+
+- `local_envelope_rejected` 事件记录 episode_id、stage、pose、episode_reference、平移/转角边界及拒绝原因。stage 区分 episode_reset、observation_read、pre_command_feedback、pre_command_target、successor_read；successor_read 表示本步命令已发送后读取，不把它写成“未执行”。事件在停止路径后写入，不改变原停止处理。
+- 每步 `action_mapping` 事件保存动作来源位姿、selected/executed、动作尺度、绝对边界及 XYZ 裁剪距离（米）。回合 summary 新增 workspace_clipping_count、workspace_subtolerance_count；几何诊断容差为 1 nm。归一化动作差异用 1e-7 容差，微差另计 action_numerical_difference_count。这些仅是统计容差，不放宽执行边界；无几何记录时不凭动作差推定 workspace 裁剪。
+- 48 项相关回归和 3 项新增检查通过。因代码身份变化，重新生成 `offline-pretrain-20260927-05`，30 条/4042 步、预算0，保存/恢复及后续更新通过；启动脚本和命令已切换。未改算法、输入/动作契约或训练参数，未启动真机。
+
 - 针对导入、目标动作边界、保存期间心跳及恢复的相关检查：54 项通过；未运行机器人。
 - 新种子 `runtime/offline-pretrain-20260927-04/`：30 条/4042 步，β500、Critic10、Actor5；恢复后第11次更新通过，预算保持0。
 - 实际 Replay（在线1024、人工4042）单次保存测量：2.372 s，文件4,039,856,023字节；期间43次心跳，最大调用耗时0.0472 ms，进程峰值RSS约8.43 GiB（含加载/模型，不是保存增量）。不是p95/最坏延迟，也未测满队列持续上传；测量副本已移入回收站，正式种子保留。

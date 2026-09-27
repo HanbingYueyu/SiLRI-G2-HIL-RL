@@ -78,6 +78,21 @@ class MotionBackend:
         with self.reader_lock:
             return self._read_locked(after=after)
 
+    def _check_local(self, pose, stage, *, reference=None):
+        reference = self.episode_reference if reference is None else reference
+        if self.local_envelope is None or reference is None:
+            return
+        try:
+            self.local_envelope.check(pose, reference)
+        except ValueError as error:
+            error.boundary_event = dict(
+                stage=stage, reason=str(error), pose=list(pose),
+                episode_reference=list(reference),
+                translation_low_m=list(self.local_envelope.translation_low_m),
+                translation_high_m=list(self.local_envelope.translation_high_m),
+                rotation_max_rad=self.local_envelope.rotation_max_rad)
+            raise
+
     def _read_locked(self, *, after=None):
         if self.stopped or self.closed:
             raise RuntimeError('Motion backend stopped; reconstruct explicitly before rearming')
@@ -114,7 +129,7 @@ class MotionBackend:
             raise ObservationRejected(message, code)
         self.stream.check()  # Camera may have blocked past the target lease.
         if self.local_envelope is not None and self.episode_reference is not None:
-            self.local_envelope.check(pose, self.episode_reference)
+            self._check_local(pose, 'successor_read' if after is not None else 'observation_read')
         self._last_accepted = (deepcopy(obs), info)
         return deepcopy(obs)
 
@@ -128,7 +143,7 @@ class MotionBackend:
             pose = vector(observation['state'], 7)
             # Zero-action planning also validates the fixed absolute workspace.
             plan_target(pose, (0.,)*6, self.config)
-            self.local_envelope.check(pose, pose)
+            self._check_local(pose, 'episode_reset', reference=pose)
             self.episode_reference = pose
         except Exception:
             self._abort()
@@ -206,7 +221,7 @@ class MotionBackend:
                     self.stream.check()
                 before = {'state': pose_feedback}
                 if self.local_envelope is not None and self.episode_reference is not None:
-                    self.local_envelope.check(pose_feedback, self.episode_reference)
+                    self._check_local(pose_feedback, 'pre_command_feedback')
             else:
                 before = self._read()
             # New feedback is still checked, but does not silently change action origin.
@@ -228,7 +243,7 @@ class MotionBackend:
                                    f'{rotation_drift:.6f} rad; re-observe before rearming')
             pose, effective = plan_target(origin, action, self.config)
             if self.local_envelope is not None:
-                self.local_envelope.check(pose, self.episode_reference)
+                self._check_local(pose, 'pre_command_target')
             if self.before_command is not None:
                 self.before_command()
             sequence = self.stream.submit(PoseTarget(pose[:3], pose[3:]))
@@ -237,6 +252,19 @@ class MotionBackend:
             self.stream.check()
             after = self._read(after=sent_at)
             self.last_execution_timing = dict(
+                action_mapping=dict(
+                    origin_pose=list(origin), selected_action=list(action),
+                    executed_action=list(effective),
+                    workspace_low=list(self.config.workspace_low),
+                    workspace_high=list(self.config.workspace_high),
+                    action_scale=list(self.config.action_scale),
+                    workspace_clip_m=np.maximum(
+                        np.maximum(np.asarray(self.config.workspace_low) -
+                                   (np.asarray(origin[:3]) + np.clip(action, -1., 1.)[:3] *
+                                    np.asarray(self.config.action_scale[:3])),
+                                   (np.asarray(origin[:3]) + np.clip(action, -1., 1.)[:3] *
+                                    np.asarray(self.config.action_scale[:3])) -
+                                   np.asarray(self.config.workspace_high)), 0.).tolist()),
                 policy_position_drift_m=position_drift,
                 policy_rotation_drift_rad=rotation_drift,
                 command_sent_monotonic_ns=round(sent_at*1e9),
