@@ -352,6 +352,9 @@ class SiLRIPolicy(
     ) -> Tensor:
         with torch.no_grad():
             next_action_preds, *_ = self.actor_target(next_observations, next_observation_features)
+            # Match select_action: the environment never executes Gaussian tails
+            # beyond the normalized action support.
+            next_action_preds = next_action_preds.clamp(-1 + 1e-6, 1 - 1e-6)
 			
             q_targets = self.critic_forward(
                 observations=next_observations,

@@ -69,7 +69,9 @@ def _replay_state(buffer):
     def occupied(value):
         if isinstance(value, dict):
             return {key: occupied(tensor) for key, tensor in value.items()}
-        return value[:buffer.size].clone()
+        # save_checkpoint deep-copies these views under the update lock, after
+        # releasing the heartbeat lock. Avoid a second full replay allocation.
+        return value[:buffer.size]
     if buffer.initialized:
         for key in ('states', 'next_states', 'actions', 'rewards', 'dones',
                     'truncateds', 'complementary_info', 'episode_ends'):
@@ -261,17 +263,19 @@ class RealLearnerRuntime:
                     'online_position': self.online_replay.position,
                     'human_position': self.human_replay.position}
 
-    def ingest(self, rows, *, count_episodes=True):
+    def ingest(self, rows, *, count_episodes=True, grant_interaction_credit=True):
         with self._update_lock, self._lock:
             if self.stopped.is_set():
                 raise RuntimeError('Learner stopped')
-            return self._ingest_prepared(self._prepare_rows(rows), count_episodes=count_episodes)
+            return self._ingest_prepared(self._prepare_rows(rows), count_episodes=count_episodes,
+                                        grant_interaction_credit=grant_interaction_credit)
 
     def _prepare_rows(self, rows):
         return tuple((validate_real_transition(row, self.run_id, self.config_hash).value,
                       _training_row(row), compact_record(row)) for row in rows)
 
-    def _ingest_prepared(self, prepared, *, accepted_before_stop=False, count_episodes=True):
+    def _ingest_prepared(self, prepared, *, accepted_before_stop=False, count_episodes=True,
+                         grant_interaction_credit=True):
         with self._update_lock, self._lock:
             if self.stopped.is_set() and not accepted_before_stop:
                 raise RuntimeError('Learner stopped')
@@ -293,7 +297,8 @@ class RealLearnerRuntime:
                     self.completed_episode_ids.add(record['complementary_info']['episode_id'])
                 accepted += 1
             self.accepted_transitions += accepted
-            self._interaction_budget += accepted * self.config.optimization.utd_ratio
+            if grant_interaction_credit:
+                self._interaction_budget += accepted * self.config.optimization.utd_ratio
             completed = len(self.completed_episode_ids)
             if completed != previous_episodes and self.progress is not None:
                 self.progress(dict(event='episode_completed', completed_episodes=completed,
@@ -457,7 +462,11 @@ class RealLearnerRuntime:
     def save_checkpoint(self, path: Path) -> Path:
         with self._update_lock:
             with self._lock, self._parameter_lock:
-                payload = deepcopy(self._payload())
+                payload = self._payload()
+            # The update lock keeps replay/weights stable. Heartbeats only mutate
+            # the scalar message sequence, already captured above; do not hold
+            # their lock during a multi-GB replay copy or disk I/O.
+            payload = deepcopy(payload)
             path = Path(path)
             if not path.parent.is_dir() or path.is_symlink():
                 raise ValueError('Checkpoint parent must exist and target cannot be a symlink')

@@ -188,7 +188,9 @@ def import_demonstrations(learner, paths, *, evidence):
                             episode_id=episode_id,
                             transition_id=f'{learner.run_id}/{episode_id}/{info["step_id"]}')
                 rows.append(row)
-            result = learner.ingest(rows, count_episodes=False)
+            # Offline updates are explicitly scheduled by the pretraining entry;
+            # importing historical data must not create future online UTD debt.
+            result = learner.ingest(rows, count_episodes=False, grant_interaction_credit=False)
             # Only fully validated contiguous imports satisfy initialization.
             with learner._lock:
                 learner.imported_demo_episodes.add(episode_id)

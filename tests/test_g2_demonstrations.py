@@ -79,6 +79,7 @@ def test_complete_demo_imports_human_actions_pixels_and_resumes_without_duplicat
     learner = RealLearnerRuntime(config=cfg, run_id='training-2')
     evidence = Evidence()
     assert import_demonstrations(learner, [path], evidence=evidence)['accepted'] == 2
+    assert learner.snapshot_counts()['budget'] == 0
     assert len(learner.human_replay) == len(learner.online_replay) == 2
     assert len(learner.imported_demo_episodes) == 1
     assert learner.human_replay.actions[0, 0].item() == pytest.approx(.4)
