@@ -15,7 +15,8 @@ def test_freshness_and_recovery():
     assert gate.update(frame(axes=(.55,0,0,0,0,0), stamps=(1.4,1.4)), now=1.4).blocked
     assert not gate.update(frame(stamps=(1.4,1.4)), now=1.4).blocked
     gate.update(frame(stamps=(1.4,1.4), buttons=(False,True)), now=1.4)
-    assert gate.update(frame(axes=(.55,0,0,0,0,0), stamps=(1.4,1.4), buttons=(False,True)), now=1.4).action == pytest.approx((0,0,0,0,.5,0))
+    # The left button enables rotation without disabling translation.
+    assert gate.update(frame(axes=(.55,0,0,0,0,0), stamps=(1.4,1.4), buttons=(False,True)), now=1.4).action == pytest.approx((.5,0,0,0,0,0))
 
 
 @pytest.mark.parametrize('stamps', [(None,None), (2.,2.), (float('nan'),1.)])

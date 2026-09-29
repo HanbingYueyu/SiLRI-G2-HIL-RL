@@ -13,14 +13,29 @@ from .real_actor import validate_real_transition
 from .training_config import _open_owned_regular, _thaw, canonical_json
 
 
+# Fields that decide what a stored demonstration *means*: observation/ROI,
+# SpaceMouse semantics, action scale and direction, and the executable
+# workspace.  Training-time knobs (episode step limit, reward values) are
+# excluded on purpose: they are re-applied from the *current* config when the
+# data is imported, so tuning them must not invalidate already collected human
+# demonstrations.
+_CONTRACT_TASK_KEYS = ('action_scale', 'control_hz', 'ee_rpy_range_rad', 'ee_xyz_range_m',
+                       'fix_gripper', 'reward_source', 'target_xy_range_m')
+_CONTRACT_MOTION_KEYS = ('control_mode', 'local_envelope', 'workspace_high', 'workspace_low')
+# Sanity bound for a stored episode index.  Deliberately independent of the
+# tunable task.max_episode_steps: the training horizon may be shortened or
+# lengthened later without making existing demonstrations unreadable.
+_MAX_DEMONSTRATION_STEPS = 20000
+
+
 def demonstration_contract(config):
-    """Allow optimizer/device changes, never silently reinterpret task data."""
+    """Allow optimizer/device/reward/horizon changes, never reinterpret task data."""
     payload = _thaw(config.canonical_payload)
-    contract = {key: payload[key] for key in ('task', 'observation', 'intervention')}
-    contract['motion'] = {key: payload['motion'][key] for key in
-                          ('workspace_low', 'workspace_high', 'control_mode')}
-    if 'local_envelope' in payload['motion']:
-        contract['motion']['local_envelope'] = payload['motion']['local_envelope']
+    motion = payload['motion']
+    contract = {'task': {key: payload['task'][key] for key in _CONTRACT_TASK_KEYS},
+                'observation': payload['observation'],
+                'intervention': payload['intervention'],
+                'motion': {key: motion[key] for key in _CONTRACT_MOTION_KEYS if key in motion}}
     return hashlib.sha256(canonical_json(contract)).hexdigest()
 
 
@@ -107,8 +122,9 @@ class DemonstrationWriter:
                       else '步数到限（未标记成功）' if row['truncated'] else '回合结束')
             print(f'\n{result}：回合已保存，共 {len(episode["hashes"])} 步。'
                   f'\n保存目录：{directory}'
-                  '\n按 Ctrl+C 退出采集；人工拔出到可观测位置，由上游视觉复位。'
-                  '\n无需固定上抬 5 cm；退出上游运动程序后，重新运行采集命令。', flush=True)
+                  '\nY/F 标记后采集程序会退出并执行安全预复位：末端先沿 +Z 50 mm，再沿 +Y 100 mm。'
+                  '\n预复位成功后会调用《常用命令.md》第 6 节原命令进行视觉复位；完成后重新运行采集命令。',
+                  flush=True)
 
 
 def load_demo_episodes(path, *, config):
@@ -139,7 +155,7 @@ def load_demo_episodes(path, *, config):
                 type(completed['episode_id']) is not str or
                 directory.name != hashlib.sha256(completed['episode_id'].encode()).hexdigest() or
                 type(completed['sha256']) is not list or
-                not 0 < len(completed['sha256']) <= config.task.max_episode_steps):
+                not 0 < len(completed['sha256']) <= _MAX_DEMONSTRATION_STEPS):
             raise ValueError('Invalid demonstration episode index')
         rows = []
         for index, digest in enumerate(completed['sha256']):
@@ -152,11 +168,13 @@ def load_demo_episodes(path, *, config):
             if (info['episode_id'] != completed['episode_id'] or info['step_id'] != index or
                     bool(row['done'] or row['truncated']) != (index == len(completed['sha256']) - 1)):
                 raise ValueError('Invalid demonstration step/terminal boundary')
-            expected_reward = (config.task.success_reward if info['success_label'] is True else
-                               config.task.failure_reward if info['success_label'] is False else
-                               config.task.step_reward)
-            if row['reward'] != expected_reward:
-                raise ValueError('Demonstration reward does not match task labels')
+            # Reward values are a training-time knob, not part of the stored
+            # data contract.  The durable labels are success_label/done/
+            # truncated, so re-derive the reward from the *current* config
+            # instead of the collection-time value written on disk.
+            row['reward'] = (config.task.success_reward if info['success_label'] is True else
+                             config.task.failure_reward if info['success_label'] is False else
+                             config.task.step_reward)
             rows.append(row)
         found = True
         yield manifest, rows

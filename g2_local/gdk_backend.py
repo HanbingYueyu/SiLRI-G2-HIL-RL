@@ -8,6 +8,10 @@ import numpy as np
 from .contract import vector
 
 
+class CameraUnavailable(TimeoutError):
+    """No qualified camera observation arrived within the bounded reader wait."""
+
+
 class _SerializedRobot:
     """Serialize calls to one non-thread-safe SDK Robot, shared by reader/sender.
 
@@ -261,6 +265,12 @@ class GdkReader:
         self.closed = True
         self.last_stamps = {}
         self.last_info = {}
+        # Upstream-style freshness: the local monotonic time at which each
+        # source's robot timestamp last *changed*.  A repeated, frozen or
+        # cached frame keeps its previous value, so its age keeps growing
+        # without any robot-clock-to-local-clock mapping.
+        self._source_stamp = {}
+        self._source_changed_mono = {}
         try:
             # Own the initialization attempt: even an interrupted/failed SDK
             # init may have allocated resources before control returns here.
@@ -295,6 +305,9 @@ class GdkReader:
         self.controller.checked_arm_state()
         return measured_pose(self.controller.read_end_effector_pose('arm_l_end_link'))
 
+    def observe_with_timeout(self, timeout_s):
+        return self.observe(timeout_s=timeout_s)
+
     def read_stop_feedback(self):
         """Independent measured hold evidence; no camera call, no commands."""
         start = time.monotonic_ns()
@@ -306,28 +319,64 @@ class GdkReader:
                         motion_pose=pose.tolist())
         return evidence
 
-    def observe(self):
+    def observe(self, *, timeout_s=None):
         if self.closed:
             raise RuntimeError('Reader is closed')
+        timeout_s = self.timeout_s if timeout_s is None else timeout_s
+        if (type(timeout_s) not in (int, float) or not math.isfinite(timeout_s) or
+                not 0 < timeout_s <= self.timeout_s):
+            raise ValueError('Invalid camera observation timeout')
         start_mono = time.monotonic_ns()
         start_wall = time.time_ns()
         start_sdk = source_timestamp_ns(self.gdk.Clock.now_ns())
         obs = {}
         stamps = {}
         frames = {}
-        deadline = time.monotonic() + self.timeout_s
-        pair_deadline = None
+        deadline = time.monotonic() + timeout_s
         camera_calls = {key: 0 for key in self.streams}
         camera_wait_s = {key: 0. for key in self.streams}
         camera_max_call_s = {key: 0. for key in self.streams}
         repeats = {key: 0 for key in self.streams}
+        last_camera_error = None
         while True:
             # Refresh BOTH candidates while waiting, rather than pinning the
             # left frame while the right stream catches up. Decode only the
             # final pair; original capture timestamps remain unchanged.
             for key, stream in self.streams.items():
                 call_start = time.monotonic()
-                frame = self.camera.get_latest_image(stream, 100.)
+                remaining_s = deadline-call_start
+                if remaining_s <= 0:
+                    if len(stamps) == len(self.streams):
+                        skew_ns = max(stamps.values())-min(stamps.values())
+                        if (self.camera_pair_max_skew_s is not None and
+                                skew_ns > self.camera_pair_max_skew_s*1e9):
+                            raise CameraUnavailable(
+                                f'Camera pair unavailable: skew_ms={skew_ns/1e6:.3f}; '
+                                f'limit_ms={self.camera_pair_max_skew_s*1000:.3f}; '
+                                f'camera_calls={camera_calls}; repeated_frames={repeats}; '
+                                f'sdk_total_s={camera_wait_s}; '
+                                f'sdk_max_call_s={camera_max_call_s}; '
+                                f'capture_timestamps_ns={stamps}')
+                    message = (f'Camera acquisition exceeded its bounded wait: '
+                               f'camera_calls={camera_calls}; repeated_frames={repeats}')
+                    if last_camera_error is not None:
+                        raise CameraUnavailable(message) from last_camera_error
+                    raise CameraUnavailable(message)
+                try:
+                    remaining_ms = max(.1, remaining_s*1000.)
+                    frame = self.camera.get_latest_image(stream, min(100., remaining_ms))
+                except Exception as error:
+                    elapsed = time.monotonic()-call_start
+                    last_camera_error = error
+                    camera_calls[key] += 1
+                    camera_wait_s[key] += elapsed
+                    camera_max_call_s[key] = max(camera_max_call_s[key], elapsed)
+                    if time.monotonic() >= deadline:
+                        raise CameraUnavailable(
+                            f'Camera image acquisition failed before deadline: camera={key}; '
+                            f'calls={camera_calls}; repeated_frames={repeats}') from error
+                    time.sleep(.005)
+                    break
                 elapsed = time.monotonic()-call_start
                 camera_calls[key] += 1
                 camera_wait_s[key] += elapsed
@@ -335,25 +384,27 @@ class GdkReader:
                 stamp = source_timestamp_ns(frame.timestamp_ns)
                 repeats[key] += int(stamp == stamps.get(key))
                 frames[key], stamps[key] = frame, stamp
-            pending = [key for key in stamps if stamps[key] <= self.last_stamps.get(key, 0)]
+            else:
+                last_camera_error = None
+            if last_camera_error is not None:
+                if time.monotonic() >= deadline:
+                    raise CameraUnavailable(
+                        f'Camera image acquisition failed before deadline: '
+                        f'camera_calls={camera_calls}; repeated_frames={repeats}') from last_camera_error
+                continue
             skew_ns = max(stamps.values()) - min(stamps.values())
             mismatched = (self.camera_pair_max_skew_s is not None and
                           skew_ns > self.camera_pair_max_skew_s * 1e9)
-            if not pending and not mismatched:
+            if not mismatched:
                 break
             if mismatched:
-                if pair_deadline is None:
-                    pair_deadline = min(deadline, time.monotonic()+.05)
-                if time.monotonic() >= pair_deadline:
-                    raise TimeoutError(f'Camera pair unavailable: skew_ms={skew_ns/1e6:.3f}; '
-                                       f'limit_ms={self.camera_pair_max_skew_s*1000:.3f}; '
-                                       f'camera_calls={camera_calls}; repeated_frames={repeats}; '
-                                       f'sdk_total_s={camera_wait_s}; sdk_max_call_s={camera_max_call_s}; '
-                                       f'capture_timestamps_ns={stamps}')
-            elif pair_deadline is not None and time.monotonic() >= pair_deadline:
-                raise TimeoutError(f'Camera pair did not advance before pairing deadline: {pending}')
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f'No advancing camera timestamp: {pending}')
+                if time.monotonic() >= deadline:
+                    raise CameraUnavailable(
+                        f'Camera pair unavailable: skew_ms={skew_ns/1e6:.3f}; '
+                        f'limit_ms={self.camera_pair_max_skew_s*1000:.3f}; '
+                        f'camera_calls={camera_calls}; repeated_frames={repeats}; '
+                        f'sdk_total_s={camera_wait_s}; sdk_max_call_s={camera_max_call_s}; '
+                        f'capture_timestamps_ns={stamps}')
             time.sleep(.005)
         acquired_mono = time.monotonic_ns()
         for key, frame in frames.items():
@@ -368,11 +419,17 @@ class GdkReader:
         sources = dict(stamps, joint=source_timestamp_ns(self.robot.get_joint_states()['timestamp']))
         evidence = tf_motion_evidence(self.tf, pose)
         sources['tf'] = evidence['tf_queries'][1]['timestamp_ns']
+        observed_mono = time.monotonic_ns()
+        for key, stamp in sources.items():
+            if self._source_stamp.get(key) != stamp:
+                self._source_stamp[key] = stamp
+                self._source_changed_mono[key] = observed_mono
         status = self.controller.motion_status_summary()
         end_sdk = source_timestamp_ns(self.gdk.Clock.now_ns())
         end_wall = time.time_ns()
         end_mono = time.monotonic_ns()
         info = dict(evidence, camera_timestamp_ns=dict(stamps), source_timestamp_ns=sources,
+                    source_changed_monotonic_ns=dict(self._source_changed_mono),
                     read_start_monotonic_ns=start_mono, read_start_wall_ns=start_wall,
                     read_start_sdk_clock_ns=start_sdk,
                     read_end_monotonic_ns=end_mono, read_end_wall_ns=end_wall,
@@ -382,6 +439,9 @@ class GdkReader:
                     camera_acquire_s=(acquired_mono-start_mono)/1e9,
                     camera_decode_s=(decoded_mono-acquired_mono)/1e9,
                     camera_calls=camera_calls, camera_repeated_frames=repeats,
+                    camera_reused_frames={
+                        key: int(stamps[key] <= self.last_stamps.get(key, 0))
+                        for key in self.streams},
                     camera_sdk_total_s=camera_wait_s, camera_sdk_max_call_s=camera_max_call_s,
                     motion_status=status, backend='gdk_read_only')
         self.last_stamps = stamps

@@ -210,7 +210,12 @@ def test_failed_transaction_retains_only_previous_success_and_no_camera_commit(r
     rig.fault = fault
     if fault.startswith('tf_'):
         rig.tf.fail_target = 'base_link' if fault == 'tf_forward' else 'arm_l_end_link'
-    with pytest.raises(RuntimeError):
+    if fault.startswith('camera_'):
+        from g2_local.gdk_backend import CameraUnavailable
+        expected = CameraUnavailable
+    else:
+        expected = RuntimeError
+    with pytest.raises(expected):
         reader.observe()
     assert reader.last_info is previous and reader.last_info == snapshot
     assert reader.last_stamps == stamps
@@ -224,7 +229,7 @@ def test_reader_waits_for_both_tf_directions_on_startup(rig):
         ('arm_l_end_link', 'base_link')]
 
 
-def test_waiting_for_right_camera_refreshes_left_candidate(rig):
+def test_reader_returns_recent_frames_without_waiting_for_both_to_advance(rig):
     reader = rig.make()
     reader.observe()
     get_frame = reader.camera.get_latest_image
@@ -236,7 +241,21 @@ def test_waiting_for_right_camera_refreshes_left_candidate(rig):
         return result
     reader.camera.get_latest_image = delayed_right
     reader.observe()
-    assert reader.last_info['camera_timestamp_ns'] == dict(left_wrist=1201, right_aux=1202)
+    assert reader.last_info['camera_timestamp_ns'] == dict(left_wrist=1101, right_aux=1002)
+    assert calls == {1: 1, 2: 1}
+
+
+def test_recent_repeated_camera_frames_are_returned_without_waiting_for_progress(rig):
+    reader = rig.make()
+    reader.observe()
+    previous_stamps = dict(reader.last_stamps)
+
+    observation = reader.observe(timeout_s=.02)
+
+    assert set(observation) == {'state', 'left_wrist', 'right_aux'}
+    assert reader.last_stamps == previous_stamps
+    assert reader.last_info['camera_reused_frames'] == {
+        'left_wrist': 1, 'right_aux': 1}
 
 
 def test_advancing_but_mismatched_pair_is_refreshed_before_decode(rig):
@@ -252,6 +271,67 @@ def test_advancing_but_mismatched_pair_is_refreshed_before_decode(rig):
     reader.camera.get_latest_image = image
     reader.observe()
     assert reader.last_info['camera_timestamp_ns'] == dict(left_wrist=1_170_000_000, right_aux=1_170_000_000)
+
+
+def test_transient_camera_skew_waits_for_bounded_recovery(rig):
+    from g2_local import gdk_backend
+
+    reader = rig.make()
+    reader.camera_pair_max_skew_s = .05
+    get_frame = reader.camera.get_latest_image
+    calls = {1: 0, 2: 0}
+    start = gdk_backend.time.monotonic()
+
+    def image(stream, timeout):
+        calls[stream] += 1
+        result = get_frame(stream, timeout)
+        elapsed = gdk_backend.time.monotonic() - start
+        result.timestamp_ns = 2_000 + int(elapsed * 1000)
+        if elapsed < .06 and stream == 1:
+            result.timestamp_ns += 200_000_000
+        return result
+
+    reader.camera.get_latest_image = image
+    reader.observe()
+
+    assert calls[1] > 1 and calls[2] > 1
+    assert reader.last_info['camera_timestamp_ns']['left_wrist'] == \
+        reader.last_info['camera_timestamp_ns']['right_aux']
+
+
+def test_transient_camera_sdk_failure_is_retried_without_committing_partial_read(rig):
+    reader = rig.make()
+    get_frame = reader.camera.get_latest_image
+    calls = {1: 0, 2: 0}
+
+    def image(stream, timeout):
+        calls[stream] += 1
+        if stream == 1 and calls[stream] == 1:
+            raise OSError('temporary camera transport hiccup')
+        return get_frame(stream, timeout)
+
+    reader.camera.get_latest_image = image
+    reader.observe()
+
+    assert calls[1] == 2 and calls[2] == 1
+    assert reader.last_stamps == {'left_wrist': 1001, 'right_aux': 1002}
+
+
+def test_camera_pair_timeout_can_be_shortened_for_active_command(rig):
+    from g2_local.gdk_backend import CameraUnavailable
+
+    reader = rig.make()
+    reader.camera_pair_max_skew_s = .05
+    get_frame = reader.camera.get_latest_image
+
+    def image(stream, timeout):
+        result = get_frame(stream, timeout)
+        result.timestamp_ns += 200_000_000 if stream == 1 else 100
+        return result
+
+    reader.camera.get_latest_image = image
+    with pytest.raises(CameraUnavailable, match='Camera pair unavailable'):
+        reader.observe(timeout_s=.02)
 
 
 def test_persistent_camera_skew_times_out_without_committing_frames(rig):
@@ -293,7 +373,6 @@ def test_invalid_quaternion_in_either_tf_or_motion_rejects_transaction(rig, whic
 
 
 def test_tf_errors_use_fixed_sdk_direction_even_if_other_direction_is_closer(rig):
-    from g2_local.clock_probe import sample_gdk
     reader = rig.make()
     rig.tf.poses[0] = [.1, .2, .3, 0, 0, 0, -1]
     rig.tf.poses[1] = [.4, .6, .3, 0, 0, 1, 0]
@@ -301,11 +380,6 @@ def test_tf_errors_use_fixed_sdk_direction_even_if_other_direction_is_closer(rig
     info = reader.last_info
     assert info['tf_position_error_m'] == pytest.approx(.5)
     assert info['tf_rotation_error_rad'] == pytest.approx(np.pi)
-    row = sample_gdk(reader, reader.tf)
-    assert row['tf_queries'] == info['tf_queries']
-    assert row['timestamps']['tf'] == 1004
-    assert row['tf_position_error_m'] == info['tf_position_error_m']
-    assert row['tf_rotation_error_rad'] == info['tf_rotation_error_rad']
 
 
 @pytest.mark.parametrize('source', ['left_wrist', 'right_aux', 'joint', 'tf_forward',

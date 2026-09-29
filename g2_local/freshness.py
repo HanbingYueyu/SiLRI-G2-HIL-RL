@@ -92,6 +92,12 @@ def _evidence(info, snapshot, now):
             info['read_start_wall_ns'] > info['read_end_wall_ns'] or
             info['read_duration_s'] != (end-start)/1e9):
         raise ValueError('Inconsistent read clock evidence')
+    if snapshot is None:
+        start_origin = info['read_start_wall_ns']-info['read_start_monotonic_ns']
+        end_origin = info['read_end_wall_ns']-info['read_end_monotonic_ns']
+        if abs(start_origin-end_origin) > MAX_WALL_JUMP_NS:
+            raise ValueError('Read wall-minus-monotonic origin changed within one read')
+        return stamps
     for side in ('start', 'end'):
         origin = info[f'read_{side}_wall_ns']-info[f'read_{side}_monotonic_ns']
         if abs(origin-snapshot.wall_minus_mono_ns) > MAX_WALL_JUMP_NS:
@@ -171,12 +177,20 @@ class ObservationFreshnessGuard:
     the observation nor owns/operates any command or stop interface.
     """
 
-    def __init__(self, client, limits: FreshnessLimits, *, monotonic_ns=None):
-        if not callable(getattr(client, 'read', None)):
+    def __init__(self, client=None, limits: FreshnessLimits = None, *, monotonic_ns=None,
+                 skip_tf_progress=False, local=False):
+        if type(local) is not bool:
+            raise ValueError('local must be boolean')
+        if local:
+            if client is not None:
+                raise ValueError('Local freshness mode does not use a snapshot client')
+        elif not callable(getattr(client, 'read', None)):
             raise ValueError('A snapshot client is required')
         if type(limits) is not FreshnessLimits:
             raise ValueError('Explicit FreshnessLimits are required')
         self._client, self._limits = client, limits
+        self._local = local
+        self._skip_tf_progress = skip_tf_progress
         self._now = time.monotonic_ns if monotonic_ns is None else monotonic_ns
         if not callable(self._now):
             raise ValueError('A monotonic clock is required')
@@ -238,6 +252,20 @@ class ObservationFreshnessGuard:
         """
         with self._lock:
             try:
+                if self._local:
+                    now = self._now()
+                    _pose(info['motion_pose'], 'motion_pose')
+                    start = _timestamp(info['read_start_monotonic_ns'], 'read_start')
+                    if not 0 <= now-start <= self._limits.state_age_s*1e9:
+                        raise ValueError('stop feedback read expired')
+                    query = info['tf_queries'][1]
+                    if (query['target'], query['source']) != ('arm_l_end_link', 'base_link'):
+                        raise ValueError('stop TF direction mismatch')
+                    _pose(query['pose'], 'tf_pose')
+                    for name in ('tf_position_error_m', 'tf_rotation_error_rad'):
+                        if _finite(info[name], name) > getattr(self._limits, name):
+                            raise ValueError('stop '+name+' exceeds limit')
+                    return True
                 snapshot, now = self._read_mapping()
                 _pose(info['motion_pose'], 'motion_pose')
                 start = _timestamp(info['read_start_monotonic_ns'], 'read_start')
@@ -275,14 +303,17 @@ class ObservationFreshnessGuard:
         with self._lock:
             diagnostics = {}
             try:
-                snapshot, now = self._read_mapping()
-                diagnostics['snapshot_sequence'] = snapshot.sequence
-                # Same 100 ppm forward extrapolation allowance as DiagnosticMapping.
-                error = (_decimal(snapshot.empirical_error_ns) +
-                         Fraction(max(0, now-snapshot.reference_mono_ns)*MAX_DRIFT_PPM, 1_000_000))
-                diagnostics['mapping_error_s'] = float(error/1_000_000_000)
-                if error > _decimal(self._limits.mapping_error_s)*1_000_000_000:
-                    raise _Rejected('mapping_error', 'Extrapolated empirical error exceeds limit')
+                if self._local:
+                    snapshot, now = None, self._now()
+                    error = 0
+                else:
+                    snapshot, now = self._read_mapping()
+                    diagnostics['snapshot_sequence'] = snapshot.sequence
+                    error = (_decimal(snapshot.empirical_error_ns) +
+                             Fraction(max(0, now-snapshot.reference_mono_ns)*MAX_DRIFT_PPM, 1_000_000))
+                    diagnostics['mapping_error_s'] = float(error/1_000_000_000)
+                    if error > _decimal(self._limits.mapping_error_s)*1_000_000_000:
+                        raise _Rejected('mapping_error', 'Extrapolated empirical error exceeds limit')
                 stamps = _evidence(info, snapshot, now)
                 sent_ns = None
                 if after is not None:
@@ -291,9 +322,18 @@ class ObservationFreshnessGuard:
                     sent_ns = math.ceil(Fraction(after)*1_000_000_000)
                     if sent_ns > now:
                         raise ValueError('after is later than local monotonic time')
-                denominator = 1-_decimal(snapshot.drift_ppm)/1_000_000
                 intervals, ages = {}, {}
-                for source in SOURCES:
+                if self._local:
+                    changed = info['source_changed_monotonic_ns']
+                    if type(changed) is not dict or set(changed) != set(SOURCES):
+                        raise ValueError('Exactly four source receipt times required')
+                    for source in SOURCES:
+                        receipt = _timestamp(changed[source], source)
+                        if not 0 <= receipt <= now:
+                            raise ValueError('Source receipt time is not in the past')
+                        intervals[source] = (receipt, receipt)
+                        ages[source] = (now-receipt, now-receipt)
+                for source in (() if self._local else SOURCES):
                     # Snapshot offset is wall-minus-raw-PTP: ClockWindow already
                     # subtracts the 37-second correction. Invert its affine model
                     # source = origin + t - offset_ref - drift*(t-reference).
@@ -321,11 +361,13 @@ class ObservationFreshnessGuard:
                 left, right = intervals['left_wrist'], intervals['right_aux']
                 skew = max(left[1]-right[0], right[1]-left[0])
                 diagnostics['camera_skew_s'] = float(skew/1_000_000_000)
-                if skew > _decimal(self._limits.camera_skew_s)*1_000_000_000:
-                    raise _Rejected('camera_skew', 'Worst-case camera separation exceeds limit')
                 for source in SOURCES:
+                    if source == 'tf' and self._skip_tf_progress:
+                        continue
                     previous = self._previous_source_ns.get(source)
                     if check_progress and previous is not None and stamps[source] <= previous:
+                        if source in SOURCES[:2] and stamps[source] == previous:
+                            continue
                         code = 'source_frozen:' if stamps[source] == previous else 'source_reversed:'
                         raise _Rejected(code+source, f'{source} timestamp did not strictly advance')
                 if sent_ns is not None:

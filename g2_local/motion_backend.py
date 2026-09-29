@@ -71,6 +71,8 @@ class MotionBackend:
                                     send_timeout=send_timeout, stop_timeout=stop_timeout,
                                     rate_hz=send_rate_hz)
         self.stopped = self.closed = False
+        self.stop_confirmed = None
+        self.stop_error = None
         self.execute_lock = threading.Lock()
         self.reader_lock = threading.RLock()
 
@@ -110,7 +112,15 @@ class MotionBackend:
         if self.stopped or self.closed:
             raise RuntimeError('Motion backend stopped; reconstruct explicitly before rearming')
         self.stream.check()
-        obs = self.reader.observe()
+        read_started = time.monotonic()
+        bounded_observe = getattr(self.reader, 'observe_with_timeout', None)
+        if self.stream.sequence > 0 and callable(bounded_observe):
+            # Let normal camera scheduling jitter span most of one command
+            # lease. Keep 20% of that lease for the sender/watchdog boundary.
+            obs = bounded_observe(min(.20, self.stream.command_timeout*.8))
+        else:
+            obs = self.reader.observe()
+        read_duration = time.monotonic() - read_started
         info = deepcopy(getattr(self.reader, 'last_info', {}))
         if set(obs) != {'state', *CAMERA_KEYS}:
             raise ValueError('Missing or unexpected observation fields')
@@ -140,11 +150,38 @@ class MotionBackend:
                             f'camera_acquire_s={info.get("camera_acquire_s")}; '
                             f'camera_decode_s={info.get("camera_decode_s")}')
             raise ObservationRejected(message, code)
-        self.stream.check()  # Camera may have blocked past the target lease.
+        try:
+            self.stream.check()  # Camera may have blocked past the target lease.
+        except RuntimeError as error:
+            fault = self.stream.fault
+            if (isinstance(fault, TimeoutError) and 'target lease expired' in str(fault)):
+                from .gdk_backend import CameraUnavailable
+                raise CameraUnavailable(
+                    f'Camera observation outlived command lease; read_s={read_duration:.6f}') from error
+            raise
         if self.local_envelope is not None and self.episode_reference is not None:
             self._check_local(pose, 'successor_read' if after is not None else 'observation_read')
         self._last_accepted = (deepcopy(obs), info)
         return deepcopy(obs)
+
+    def _read_successor(self, sent_at):
+        """Wait briefly for camera timestamps to cross the just-sent action."""
+        deadline = time.monotonic() + min(.20, self.stream.command_timeout*.8)
+        while True:
+            try:
+                return self._read(after=sent_at)
+            except ObservationRejected as error:
+                if error.code not in ('not_after_command:left_wrist',
+                                      'not_after_command:right_aux'):
+                    raise
+                if time.monotonic() >= deadline:
+                    from .gdk_backend import CameraUnavailable
+                    raise CameraUnavailable(
+                        f'No post-command camera frame within '
+                        f'{min(.20, self.stream.command_timeout*.8):.3f}s; '
+                        f'freshness_code={error.code}') from error
+                self.stream.check()
+                time.sleep(min(.01, max(0., deadline-time.monotonic())))
 
     def begin_episode(self, observation):
         """Latch the reset observation once; never move or re-anchor a live episode."""
@@ -167,7 +204,9 @@ class MotionBackend:
     def _abort(self):
         try:
             self.stop()
-        except Exception:
+        except Exception as error:
+            self.stop_confirmed = False
+            self.stop_error = error
             logging.exception('Stop unconfirmed while handling execution failure')
 
     def observe(self):
@@ -244,13 +283,6 @@ class MotionBackend:
                 before = self._read()
             # New feedback is still checked, but does not silently change action origin.
             self._plan(before['state'], (0.,)*6, 'pre_command_feedback')
-            if reference is not None and self.reference_guard is not None:
-                if self.reference_guard(*reference) is not True:
-                    owner = getattr(self.reference_guard, '__self__', None)
-                    decision = getattr(owner, 'last_decision', None)
-                    code = getattr(decision, 'code', 'unknown')
-                    raise RuntimeError('Policy input expired before command; action discarded: '
-                                       + str(code)[:128])
             origin = before['state'] if reference is None else reference[0]['state']
             position_drift = float(np.linalg.norm(np.asarray(before['state'][:3])-origin[:3]))
             rotation_drift = float((Rotation.from_quat(before['state'][3:]) *
@@ -275,6 +307,13 @@ class MotionBackend:
                 self._check_local(pose, 'pre_command_target')
             if self.before_command is not None:
                 self.before_command()
+            if reference is not None and self.reference_guard is not None:
+                if self.reference_guard(*reference) is not True:
+                    owner = getattr(self.reference_guard, '__self__', None)
+                    decision = getattr(owner, 'last_decision', None)
+                    code = getattr(decision, 'code', 'unknown')
+                    raise RuntimeError('Policy input expired before command; action discarded: '
+                                       + str(code)[:128])
             execution['send_status'] = 'submission_attempted_unconfirmed'
             sequence = self.stream.submit(PoseTarget(pose[:3], pose[3:]))
             execution.update(send_status='submitted_unconfirmed', command_sequence=sequence)
@@ -282,7 +321,7 @@ class MotionBackend:
             execution.update(send_status='acknowledged', command_sent_monotonic_ns=round(sent_at*1e9))
             self.stream.halt.wait(max(0., sent_at+self.step_period-time.monotonic()))
             self.stream.check()
-            after = self._read(after=sent_at)
+            after = self._read_successor(sent_at)
             self.last_execution_timing = dict(
                 **execution,
                 policy_position_drift_m=position_drift,
@@ -301,7 +340,15 @@ class MotionBackend:
 
     def stop(self):
         self.stopped = True
-        self.stream.stop()
+        try:
+            self.stream.stop()
+        except Exception as error:
+            self.stop_confirmed = False
+            self.stop_error = error
+            raise
+        else:
+            self.stop_confirmed = True
+            self.stop_error = None
 
     def close(self):
         if self.closed:

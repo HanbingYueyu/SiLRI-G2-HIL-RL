@@ -185,7 +185,7 @@ def test_failed_port_construction_releases_reader_then_clock():
     assert state.reader.closed and state.clock.closed
 
 
-def accepting_guard(client, limits):
+def accepting_guard(client, limits, **kwargs):
     def accept(obs, info, after):
         return True
     accept.revalidate = lambda obs, info: True

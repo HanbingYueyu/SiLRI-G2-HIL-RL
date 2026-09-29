@@ -1,83 +1,81 @@
-"""Operator-launched human demo with a session-owned read-only clock monitor."""
+"""Operator-launched human demo driven by a separately running clock monitor."""
 import json
 from pathlib import Path
-import signal
+import re
+import shlex
 import subprocess
 import sys
 import time
 import uuid
 
-from .clock_ipc import SnapshotClient
-from .real_actor_audit import _stop_monitor, _wait_for_healthy_monitor
 from .training_config import load_training_config
 
 
-def _startup_clock_failure(output):
-    """Only a recorded announce timeout permits a fresh startup session."""
-    try:
-        rows = [json.loads(line) for line in
-                (output / 'evidence.jsonl').read_text().splitlines()]
-    except (OSError, ValueError):
-        return 'unknown', False
-    exits = [row for row in rows if row.get('kind') == 'exit']
-    reason = exits[-1].get('reason', 'unknown') if exits else 'unknown'
-    timeout = any('UNCALIBRATED to LISTENING on ANNOUNCE_RECEIPT_TIMEOUT_EXPIRES'
-                  in row.get('raw', '') for row in rows if row.get('kind') == 'ptp')
-    return reason, reason == 'ptp_fault' and timeout
+def _upstream_reset_command(root):
+    """Read Section 6 verbatim and return its cwd and argv for shell-free call."""
+    candidates = (Path(root).parent / '常用命令.md', Path(root) / '常用命令.md')
+    document = next((path for path in candidates if path.is_file()), None)
+    if document is None:
+        raise FileNotFoundError('常用命令.md with Section 6 is required for visual reset')
+    text = document.read_text()
+    match = re.search(r'^## 6\. 上游起始位置\s*$([\s\S]*?)(?=^## |\Z)', text,
+                      flags=re.MULTILINE)
+    if match is None:
+        raise ValueError('Section 6 上游起始位置 was not found')
+    block = re.search(r'```bash\s*\n([\s\S]*?)\n```', match.group(1))
+    if block is None:
+        raise ValueError('Section 6 bash command block was not found')
+    command_text = block.group(1).replace(chr(92) + '\n', ' ')
+    tokens = shlex.split(command_text, comments=False, posix=True)
+    expected = ['cd', '/home/flyfuture/g2_hinge_assembly', '&&',
+                './scripts/run_gdk_sam3_python.sh',
+                'g2_adapter/run_bilateral_flow_gdk.py']
+    if (tokens[:len(expected)] != expected or '--allow-motion' not in tokens or
+            any(token in (';', '|', '>', '<', '&&', '||') for token in tokens[3:])):
+        raise ValueError('Section 6 must contain the unchanged G2 reset command')
+    return Path(tokens[1]), tokens[3:]
 
 
-def run(*, root=None, demo_main=None, shared_clock=None):
+def _run_post_demo_reset(root, config_path, command_runner):
+    # Read Section 6 for every labeled episode so operator edits take effect
+    # without copying stage names or numeric flags into SiLRI.
+    visual_cwd, visual_argv = _upstream_reset_command(root)
+    pre_reset = ['bash', str(Path(root) / 'run_g2_python.sh'),
+                 '-m', 'g2_local.pre_reset',
+                 '--config', str(config_path), '--allow-motion']
+    print('Y/F 回合已保存；先执行 +Z 5 cm、再 +Y 10 cm 的 SiLRI 受限位移。',
+          flush=True)
+    result = command_runner(pre_reset, cwd=root, check=False)
+    if result.returncode != 0:
+        print(f'预复位失败（退出码 {result.returncode}）；未调用第 6 节视觉复位命令。',
+              file=sys.stderr, flush=True)
+        return result.returncode or 1
+    print('位移完成；调用《常用命令.md》第 6 节原样的上游视觉复位命令。', flush=True)
+    result = command_runner(visual_argv, cwd=visual_cwd, check=False)
+    if result.returncode != 0:
+        print(f'第 6 节视觉复位命令失败（退出码 {result.returncode}）；停止流程。',
+              file=sys.stderr, flush=True)
+        return result.returncode or 1
+    print('视觉复位完成。退出上游程序后，重新运行人工采集命令采下一条。', flush=True)
+    return 0
+
+
+def run(*, root=None, demo_main=None, command_runner=None):
     root = Path(root) if root is not None else Path(__file__).resolve().parents[1]
-    source = root / 'runtime/site-demo.json'
+    command_runner = subprocess.run if command_runner is None else command_runner
+    source = root / 'runtime/train-fixed-fridge-20260928-camera-relaxed.json'
     config = load_training_config(source, cli_allow_motion=True)
     if not config.motion_permitted or config.motion.auto_reset.enabled:
         raise PermissionError('Demo permission missing or automatic reset enabled')
     run_id = 'demo-' + uuid.uuid4().hex[:12]
     session = root / 'runtime' / (run_id + '-launch')
     session.mkdir(mode=0o700)
-    monitor_output = Path('/tmp') / ('g2-' + run_id)
-    socket_path = Path(shared_clock) if shared_clock is not None else monitor_output / 'clock.sock'
     raw = json.loads(source.read_text())
-    raw['commissioning']['clock_socket'] = str(socket_path)
     config_path = session / 'config.json'
     with config_path.open('x') as stream:
         json.dump(raw, stream, ensure_ascii=False, indent=2)
     load_training_config(config_path, cli_allow_motion=True)
-    master = config.commissioning.expected_master
-    monitor = None
     try:
-        if shared_clock is None:
-            print('自动启动只读时钟监控；如提示请输入 sudo 密码。', flush=True)
-        deadline = time.monotonic() + 120.
-        for attempt in range(0 if shared_clock is not None else 3):
-            if attempt:
-                monitor_output = Path('/tmp') / ('g2-' + run_id + f'-retry{attempt}')
-                socket_path = monitor_output / 'clock.sock'
-            # No demo environment or command port exists during these retries.
-            monitor = subprocess.Popen([
-                sys.executable, '-m', 'g2_local.clock_monitor', '--master', master,
-                '--max-seconds', '1800', '--output', str(monitor_output)],
-                stdin=None, stdout=None, stderr=None, shell=False)
-            print(f'等待时钟就绪（总预算 120 秒，第 {attempt+1}/3 次）...', flush=True)
-            try:
-                _wait_for_healthy_monitor(
-                    monitor, socket_path, master=master,
-                    timeout_s=max(.001, deadline-time.monotonic()),
-                    client_factory=lambda **kw: SnapshotClient(
-                        kw['path'], timeout_s=kw['timeout_s'], expected_master=kw['expected_master']),
-                    now_fn=time.monotonic, sleep_fn=time.sleep)
-                break
-            except (RuntimeError, TimeoutError) as error:
-                reason, retryable = _startup_clock_failure(monitor_output)
-                if not retryable or attempt == 2 or time.monotonic() >= deadline:
-                    raise RuntimeError(f'{error}; monitor_reason={reason}; evidence={monitor_output}') from error
-                _stop_monitor(monitor)
-                monitor = None
-                print('启动时主时钟公告超时，自动新建只读时钟会话重连；尚未进入采集。', flush=True)
-        raw['commissioning']['clock_socket'] = str(socket_path)
-        with config_path.open('w') as stream:
-            json.dump(raw, stream, ensure_ascii=False, indent=2)
-        load_training_config(config_path, cli_allow_motion=True)
         if demo_main is None:
             from .real_train import main as demo_main
         print('时钟已就绪，直接等待双键开始；请保持夹持起点，并确保上游运动程序已退出。', flush=True)
@@ -91,31 +89,34 @@ def run(*, root=None, demo_main=None, shared_clock=None):
         with context_path.open('x') as stream:
             json.dump(context, stream)
         print('采集目录：', root/'runtime'/run_id, flush=True)
-        print('30 秒内两键都按住再全部松开开始；Y/F 结束，保存后 Ctrl+C 退出。', flush=True)
+        print('30 秒内两键都按住再全部松开开始；按 Y/F 结束并保存，随后自动执行机械位移和第 6 节视觉复位。', flush=True)
         # Keep the demo's own stop/cleanup path in this process.
-        return demo_main(['demo', '--run-id', run_id, '--config', str(config_path),
-                          '--output', str(root/'runtime'/run_id),
-                          '--context', str(context_path),
-                          '--hid-device', '/dev/spacemouse-compact', '--allow-motion'])
+        result = demo_main(['demo', '--run-id', run_id, '--config', str(config_path),
+                            '--output', str(root/'runtime'/run_id),
+                            '--context', str(context_path),
+                            '--hid-device', '/dev/spacemouse-compact', '--allow-motion',
+                            '--exit-after-labeled-demo'])
+        if result != 0:
+            return result
+        return _run_post_demo_reset(root, config_path, command_runner)
     except KeyboardInterrupt:
         return 130
-    finally:
-        # Only stop our child; never pkill or remove earlier evidence.
-        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
-        try:
-            _stop_monitor(monitor)
-        finally:
-            signal.signal(signal.SIGINT, previous)
 
 
 def main():
+    import argparse
     try:
-        from .demo_clock import ensure_clock
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.parse_args()
         root = Path(__file__).resolve().parents[1]
-        config = load_training_config(root / 'runtime/site-demo.json', cli_allow_motion=True)
+        config = load_training_config(
+            root / 'runtime/train-fixed-fridge-20260928-camera-relaxed.json',
+            cli_allow_motion=True)
         if not config.motion_permitted or config.motion.auto_reset.enabled:
             raise PermissionError('Demo permission missing or automatic reset enabled')
-        return run(root=root, shared_clock=ensure_clock(root, config.commissioning.expected_master))
+        # Freshness is local (see freshness.ObservationFreshnessGuard local mode):
+        # no clock process is started, read or required.
+        return run(root=root)
     except KeyboardInterrupt:
         return 130
     except Exception as error:

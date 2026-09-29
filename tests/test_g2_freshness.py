@@ -121,6 +121,19 @@ def test_policy_revalidation_checks_age_without_resetting_source_progress(rig):
     assert not rig.guard.revalidate(obs, info)
 
 
+def test_pre_reset_guard_accepts_repeated_fresh_tf_but_not_repeated_joint(rig):
+    guard = ObservationFreshnessGuard(rig.client, limits(),
+                                      monotonic_ns=lambda: rig.now,
+                                      skip_tf_progress=True)
+    obs = observation()
+    assert guard(obs, evidence()) is True
+    newer = SOURCE_NOW - 9_000_000
+    assert guard(obs, evidence(left_wrist=newer, right_aux=newer, joint=newer)) is True
+    assert guard(obs, evidence(left_wrist=newer+1, right_aux=newer+1,
+                               joint=newer)) is False
+    assert guard.last_decision.code == 'source_frozen:joint'
+
+
 @pytest.mark.parametrize('field', list(FreshnessLimits.__annotations__))
 @pytest.mark.parametrize('value', [True, False, 0, -1., float('nan'), float('inf'),
                                    -float('inf'), '0.1', np.float64(.1),
@@ -179,15 +192,18 @@ def test_future_uses_earliest_interval_boundary(rig, source):
     assert rig.guard.previous_source_ns == before
 
 
-def test_camera_skew_uses_worst_interval_separation(rig):
-    assert rig.guard(observation(), evidence(left_wrist=SOURCE_NOW-48_000_000,
-                                            right_aux=SOURCE_NOW-2_000_000), None)
-    assert not rig.guard(observation(), evidence(left_wrist=SOURCE_NOW-48_000_000,
-                                                right_aux=SOURCE_NOW-1_999_999), None)
-    assert rig.guard.last_decision.code == 'camera_skew'
+def test_camera_skew_is_diagnostic_and_does_not_reject_observation(rig):
+    assert rig.guard(observation(), evidence(left_wrist=SOURCE_NOW-90_000_000,
+                                            right_aux=SOURCE_NOW-90_000_000), None)
+    assert rig.guard(observation(), evidence(left_wrist=SOURCE_NOW-90_000_000,
+                                            right_aux=SOURCE_NOW-20_000_000,
+                                            joint=SOURCE_NOW-9_000_000,
+                                            tf=SOURCE_NOW-9_000_000), None)
+    assert rig.guard.last_decision.code == 'ok'
+    assert rig.guard.last_decision.camera_skew_s > .05
 
 
-@pytest.mark.parametrize('source', SOURCES)
+@pytest.mark.parametrize('source', SOURCES[2:])
 @pytest.mark.parametrize('delta,code', [(0, 'source_frozen:'), (-1, 'source_reversed:')])
 def test_each_source_must_advance_and_failure_is_transactional(rig, source, delta, code):
     assert rig.guard(observation(), evidence(), None)
@@ -198,6 +214,37 @@ def test_each_source_must_advance_and_failure_is_transactional(rig, source, delt
     assert rig.guard.last_decision.code == code+source
     assert rig.guard.previous_source_ns == before
     assert rig.guard(observation(), evidence(**dict.fromkeys(SOURCES, SOURCE_NOW-9_500_000)), None)
+
+
+@pytest.mark.parametrize('source', SOURCES[:2])
+def test_recent_camera_frame_may_be_reused_but_robot_state_must_progress(rig, source):
+    assert rig.guard(observation(), evidence(), None)
+    previous = rig.guard.previous_source_ns
+    stamps = dict.fromkeys(SOURCES, SOURCE_NOW-9_000_000)
+    stamps[source] = previous[source]
+
+    assert rig.guard(observation(), evidence(**stamps), None)
+    assert rig.guard.previous_source_ns[source] == previous[source]
+
+
+def test_reused_camera_frame_is_still_rejected_when_it_exceeds_age_limit(rig):
+    assert rig.guard(observation(), evidence(), None)
+    stamps = dict.fromkeys(SOURCES, SOURCE_NOW-9_000_000)
+    stamps['left_wrist'] = SOURCE_NOW-200_000_000
+
+    assert not rig.guard(observation(), evidence(**stamps), None)
+    assert rig.guard.last_decision.code == 'camera_stale:left_wrist'
+
+
+@pytest.mark.parametrize('source', SOURCES[:2])
+def test_reversed_camera_timestamps_are_still_rejected(rig, source):
+    assert rig.guard(observation(), evidence(), None)
+    previous = rig.guard.previous_source_ns
+    stamps = dict.fromkeys(SOURCES, SOURCE_NOW-9_000_000)
+    stamps[source] = previous[source]-1
+
+    assert not rig.guard(observation(), evidence(**stamps), None)
+    assert rig.guard.last_decision.code == 'source_reversed:'+source
 
 
 @pytest.mark.parametrize('source', SOURCES)
@@ -458,7 +505,7 @@ def test_concurrent_same_observation_can_be_committed_only_once(rig):
         results = list(pool.map(lambda _: rig.guard(observation(), evidence(), None), range(2)))
     assert sorted(results) == [False, True]
     assert rig.guard.previous_source_ns == dict.fromkeys(SOURCES, SOURCE_NOW-10_000_000)
-    assert rig.guard.last_decision.code == 'source_frozen:left_wrist'
+    assert rig.guard.last_decision.code == 'source_frozen:joint'
 
 
 def test_large_explicit_limits_are_legal_but_cannot_bypass_runtime_checks(rig):
@@ -480,3 +527,53 @@ def test_source_int64_max_boundary_is_valid_when_mapping_and_read_evidence_agree
                 read_end_sdk_clock_ns=maximum, sdk_clock_ns=maximum)
     assert rig.guard(observation(), info, None)
     assert rig.guard.last_decision.source_intervals_ns['joint'] == (19_988_000_000, 19_992_000_000)
+
+
+# ---------------------------------------------------------------- local mode
+# Upstream-style freshness: the age of a source is how long this process has
+# gone without a *new* timestamp from it; no robot-clock-to-local mapping.
+
+def local_info(*, receipt=None, **source_changes):
+    info = evidence(**source_changes)
+    info['source_changed_monotonic_ns'] = dict.fromkeys(
+        SOURCES, NOW-5_000_000 if receipt is None else receipt)
+    return info
+
+
+def test_local_mode_accepts_a_freshly_received_observation():
+    guard = ObservationFreshnessGuard(None, limits(), monotonic_ns=lambda: NOW, local=True)
+    assert guard(observation(), local_info()) is True
+    assert guard.last_decision.code == 'ok'
+
+
+def test_local_mode_rejects_a_repeated_frame_once_it_ages_out():
+    now = [NOW]
+    guard = ObservationFreshnessGuard(None, limits(),
+                                      monotonic_ns=lambda: now[0], local=True)
+    info = local_info()
+    assert guard(observation(), info) is True
+    now[0] = NOW + int(limits().camera_age_s*1e9) + 1
+    assert guard(observation(), info) is False
+    assert guard.last_decision.code == 'camera_stale:left_wrist'
+
+
+def test_local_mode_rejects_a_delayed_receipt_immediately():
+    guard = ObservationFreshnessGuard(None, limits(), monotonic_ns=lambda: NOW, local=True)
+    late = NOW - int(limits().camera_age_s*1e9) - 1
+    assert guard(observation(), local_info(receipt=late)) is False
+    assert guard.last_decision.code == 'camera_stale:left_wrist'
+
+
+def test_local_mode_still_requires_robot_timestamps_to_advance():
+    guard = ObservationFreshnessGuard(None, limits(),
+                                      monotonic_ns=lambda: NOW, local=True)
+    assert guard(observation(), local_info()) is True
+    assert guard(observation(), local_info()) is False
+    assert guard.last_decision.code == 'source_frozen:joint'
+
+
+def test_local_mode_rejects_a_successor_that_predates_the_command():
+    guard = ObservationFreshnessGuard(None, limits(),
+                                      monotonic_ns=lambda: NOW, local=True)
+    assert guard(observation(), local_info(), after=NOW/1e9) is False
+    assert guard.last_decision.code.startswith('not_after_command')

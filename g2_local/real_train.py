@@ -1,6 +1,7 @@
 """Operator-facing, fail-closed composition for real SiLRI train and eval."""
 
 import argparse
+from contextlib import ExitStack
 import fcntl
 from concurrent import futures
 from dataclasses import asdict, replace
@@ -38,6 +39,8 @@ def parser():
                      help='Actor/demo/eval only: current PTP endpoint, logged separately from task identity')
     cli.add_argument('--demonstrations', type=Path, action='append', default=[],
                      help='Learner only: import a complete local demonstration dataset; repeatable')
+    cli.add_argument('--exit-after-labeled-demo', action='store_true',
+                     help='Demo only: exit after saving a Y/F-labeled episode')
     return cli
 
 
@@ -330,6 +333,8 @@ class _TerminalInput:
 def _validate_cli(args, loaded):
     if getattr(args, 'demonstrations', ()) and args.role != 'learner':
         raise ValueError('--demonstrations is only valid for learner')
+    if getattr(args, 'exit_after_labeled_demo', False) and args.role != 'demo':
+        raise ValueError('--exit-after-labeled-demo is demo only')
     if args.role == 'learner' and (args.allow_motion or loaded.mode != 'train' or
                                    args.context or args.hid_device):
         raise ValueError('Learner accepts train mode only and cannot request motion or HID')
@@ -493,7 +498,7 @@ def _run_actor_or_eval(args, loaded, evidence):
     from .operator_control import EpisodeContextInbox
     from .real_episode import RealEpisodeCoordinator
     from .real_actor import GrpcActorTransport, RealActorRuntime
-    from .spacemouse import AutomaticIntervention, DemonstrationIntervention
+    from .spacemouse import AutomaticIntervention, ContinuousInputReader, DemonstrationIntervention
     from .motion_env import create_motion_env
     from .policy import create_policy
     frozen = None
@@ -504,7 +509,12 @@ def _run_actor_or_eval(args, loaded, evidence):
     if adapter_root not in sys.path:
         sys.path.insert(0, adapter_root)
     hid_type = import_gdk_runtime()
-    with _TerminalInput() as terminal, hid_type(str(args.hid_device)) as reader:
+    with ExitStack() as scope:
+        terminal = scope.enter_context(_TerminalInput())
+        device = scope.enter_context(hid_type(str(args.hid_device)))
+        # Demo HID reads keep running even while observation/motion is busy.
+        reader = (scope.enter_context(ContinuousInputReader(device))
+                  if args.role == 'demo' else device)
         intervention_type = DemonstrationIntervention if args.role == 'demo' else AutomaticIntervention
         intervention = intervention_type(reader, loaded.intervention)
         coordinator = RealEpisodeCoordinator(
@@ -537,7 +547,8 @@ def _run_actor_or_eval(args, loaded, evidence):
             coordinator=coordinator, context_source=context, transport=transport,
             env_factory=partial(create_motion_env, cli_allow_motion=args.allow_motion),
             policy=policy,
-            telemetry=transport.telemetry, demonstration=args.role == 'demo')
+            telemetry=transport.telemetry, demonstration=args.role == 'demo',
+            exit_after_labeled_demo=getattr(args, 'exit_after_labeled_demo', False))
         evidence.event('ready', policy_version=runtime.parameter_version)
         if args.role == 'demo':
             print('等待双键开始：两键都按住后全部松开，无需拨动旋帽。', flush=True)

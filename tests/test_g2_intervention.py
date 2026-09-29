@@ -1,4 +1,6 @@
 from types import SimpleNamespace
+import queue
+import threading
 import numpy as np
 import pytest
 from g2_local.env import G2LocalEnv, SyntheticBackend
@@ -31,8 +33,7 @@ def test_translation_does_not_require_unused_rotation_report_refresh():
     active, action = source()
     assert active and action[0] > 0 and action[3:] == (0., 0., 0.)
     reader.frame = frame(axes=(.6, 0, 0, .4, 0, 0), stamps=(1., .1), buttons=(True, False))
-    with pytest.raises(RuntimeError, match='stale nonzero'):
-        source()
+    assert source() == (True, (0.,) * 6)
 
 
 def test_demo_without_axis_reports_holds_then_accepts_first_fresh_movement():
@@ -46,6 +47,64 @@ def test_demo_without_axis_reports_holds_then_accepts_first_fresh_movement():
     reader.frame = frame(axes=(.6, 0, 0, 0, 0, 0), stamps=(0., 0.))
     with pytest.raises((RuntimeError, ValueError)):
         source()
+
+
+def test_demo_consumes_each_motion_report_once_without_age_abort():
+    reader = Reader()
+    now = [1.]
+    source = spacemouse.DemonstrationIntervention(reader, explicit_config(), clock=lambda: now[0])
+    reader.frame = frame(axes=(.6, 0, 0, 0, 0, 0), stamps=(1., 1.))
+    assert source()[1][0] > 0
+    now[0] = 2.
+    assert source() == (True, (0.,) * 6)
+    assert source.fault is None
+    reader.frame = frame(axes=(.6, 0, 0, 0, 0, 0), stamps=(2., 2.))
+    assert source()[1][0] > 0
+
+
+def test_demo_peek_does_not_consume_next_motion_report():
+    reader = Reader()
+    source = spacemouse.DemonstrationIntervention(reader, explicit_config(), clock=lambda: 10.)
+    reader.frame = frame(axes=(.6, 0, 0, 0, 0, 0), stamps=(1., 1.))
+    assert source.has_new_report()
+    assert source()[1][0] > 0
+    assert not source.has_new_report()
+
+
+def test_continuous_reader_receives_motion_while_main_thread_is_busy():
+    pending = queue.Queue()
+    observed = threading.Event()
+
+    class Device:
+        def __init__(self):
+            self.latest = frame()
+
+        def poll(self):
+            try:
+                self.latest = pending.get_nowait()
+                observed.set()
+            except queue.Empty:
+                pass
+            return self.latest
+
+    with spacemouse.ContinuousInputReader(Device()) as reader:
+        pending.put(frame(axes=(.6, 0, 0, 0, 0, 0), stamps=(2., 2.)))
+        assert observed.wait(1.)
+        assert reader.poll().axis_times == (2., 2.)
+
+
+def test_continuous_reader_propagates_device_disconnect():
+    disconnected = threading.Event()
+
+    class Device:
+        def poll(self):
+            disconnected.set()
+            raise OSError('device unplugged')
+
+    with spacemouse.ContinuousInputReader(Device()) as reader:
+        assert disconnected.wait(1.)
+        with pytest.raises(OSError, match='device unplugged'):
+            reader.poll()
 
 
 @pytest.mark.parametrize('initial_stamps', [(None, None), (1., None), (1., 1.)])
@@ -202,16 +261,15 @@ def test_demo_zero_report_received_across_startup_delay_is_zero_only():
     reader = Reader()
     now = [5.]
     source = spacemouse.DemonstrationIntervention(reader, explicit_config(), clock=lambda: now[0])
-    # Real complete zero reports, but already older than the motion lease.
+    # A silent zero never becomes a movement command, regardless of age.
     assert source() == (True, (0.,)*6)
-    assert source.verified_neutral and not source.gate.fresh
+    assert source.verified_neutral
     now[0] = 10.
     assert source() == (True, (0.,)*6)
     reader.frame = frame(axes=(.6, 0, 0, 0, 0, 0), stamps=(10., 10.))
     assert source()[1][0] > 0
     now[0] = 11.
-    with pytest.raises(RuntimeError, match='stale nonzero'):
-        source()
+    assert source() == (True, (0.,) * 6)
 
 
 def test_malformed_report_latches_and_invalidates_last_frame():

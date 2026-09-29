@@ -1,8 +1,52 @@
 """Normalized proposals only. No hardware control or implicit intervention."""
 from dataclasses import dataclass
 import math
+import threading
 import time
 from .contract import vector
+
+
+class ContinuousInputReader:
+    """Keep draining a nonblocking HID reader independently of motion/vision work."""
+
+    def __init__(self, reader, *, poll_interval_s=.005):
+        self.reader = reader
+        self.poll_interval_s = poll_interval_s
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._lock = threading.Lock()
+        self._frame = None
+        self._error = None
+        self._thread = threading.Thread(target=self._run, name='spacemouse-reader', daemon=True)
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                frame = self.reader.poll()
+            except BaseException as error:
+                with self._lock:
+                    self._error = error
+                self._ready.set()
+                return
+            with self._lock:
+                self._frame = frame
+            self._ready.set()
+            self._stop.wait(self.poll_interval_s)
+
+    def poll(self):
+        self._ready.wait()
+        with self._lock:
+            if self._error is not None:
+                raise self._error
+            return self._frame
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self._stop.set()
+        self._thread.join()
 
 
 @dataclass(frozen=True)
@@ -286,22 +330,62 @@ class AutomaticIntervention:
 
 
 class DemonstrationIntervention(AutomaticIntervention):
-    """Keep human authority while recording; neutral never hands to a policy."""
+    """Record only newly reported human motion; silence never repeats a command."""
 
     accept_observed_zero_hold = True
 
+    def has_new_report(self):
+        """Peek without consuming the report before the environment sends a step."""
+        frame = self.reader.poll()
+        if not frame.ready or len(frame.axis_times) != 2:
+            return False
+        stamps = tuple(frame.axis_times)
+        relevant = (0, 1) if frame.buttons[self.config.left_button] else (0,)
+        return self.last_stamps is None or any(
+            stamps[index] != self.last_stamps[index] for index in relevant)
+
     def __call__(self):
-        super().__call__()  # Retain the same live-read and fault checks.
-        if self.gate.fresh:
-            # Capture deliberate low-amplitude input below takeover threshold.
+        if self.fault is not None:
+            raise RuntimeError('Input fault latched; replace source before recovery')
+        try:
+            frame = self.reader.poll()
+            now = self.clock()
+            if not math.isfinite(now) or (self._last_now is not None and now < self._last_now):
+                raise ValueError('SpaceMouse clock moved backwards')
+            self._last_now = now
+            self.last_frame = frame
+            axes = vector(frame.axes, 6)
+            stamps = tuple(frame.axis_times)
+            if not frame.ready and self.last_stamps is None:
+                self.gate.fresh = False
+                self.verified_neutral = False
+                return True, (0.,) * 6
+            if (frame.ready is not True or len(stamps) != 2 or
+                    any(t is None or not math.isfinite(t) or t < 0 or t > now for t in stamps)):
+                raise ValueError('SpaceMouse report unavailable or malformed')
+            if self.last_stamps is not None and any(
+                    current < previous for current, previous in zip(stamps, self.last_stamps)):
+                raise ValueError('SpaceMouse report timestamp moved backwards')
+            relevant = (0, 1) if frame.buttons[self.config.left_button] else (0,)
+            new_report = self.last_stamps is None or any(
+                stamps[index] > self.last_stamps[index] for index in relevant)
+            self.last_stamps = stamps
+            self.verified_neutral = not any(value != 0 for value in axes)
+            self.gate.fresh = new_report
+            self.gate.input_valid = new_report
+            if not new_report:
+                return True, (0.,) * 6
+            self.gate.mapper.armed = True
             proposal = self.gate.mapper.update(
-                self.last_frame.axes,
-                left_pressed=self.last_frame.buttons[self.config.left_button], valid=True)
+                axes, left_pressed=frame.buttons[self.config.left_button], valid=True)
             return True, proposal.action
-        if self.verified_neutral:
-            return True, (0.,) * 6
-        # Waiting for a start chord cannot emit a movement command.
-        return True, (0.,) * 6
+        except Exception as error:
+            self.fault = str(error)
+            self.last_frame = None
+            self.last_stamps = None
+            self.verified_neutral = False
+            self.gate.invalidate()
+            raise
 
 
 class RotationCheck:

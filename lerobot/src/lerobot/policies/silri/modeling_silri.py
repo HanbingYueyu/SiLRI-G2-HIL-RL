@@ -867,10 +867,9 @@ def _convert_normalization_params_to_tensor(normalization_params: dict) -> dict:
 
 class MultivariateNormalDiag(MultivariateNormal):
     def __init__(self, loc, scale_diag):
-        # Create diagonal covariance matrix from scale_diag
-        covariance_matrix = torch.diag_embed(scale_diag)
-        # Initialize MultivariateNormal with loc and covariance_matrix
-        super().__init__(loc, covariance_matrix)
+        # ``scale_diag`` is the per-dimension standard deviation, matching
+        # the actor/expert ``std`` values at every call site.
+        super().__init__(loc, scale_tril=torch.diag_embed(scale_diag))
         
 
     def mode(self):
@@ -878,9 +877,7 @@ class MultivariateNormalDiag(MultivariateNormal):
 
     @property
     def stddev(self):
-        # Access parent class stddev property via MultivariateNormal
-        # stddev is the square root of the diagonal of the covariance matrix
-        return torch.sqrt(torch.diagonal(self.covariance_matrix, dim1=-2, dim2=-1))
+        return torch.diagonal(self.scale_tril, dim1=-2, dim2=-1)
 
     def entropy(self):
         # Use parent class entropy method

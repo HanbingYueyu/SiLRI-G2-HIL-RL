@@ -134,6 +134,11 @@ class FakeReader:
             read_start_sdk_clock_ns=source - 1_000_000,
             read_end_sdk_clock_ns=source, sdk_clock_ns=source,
             received_monotonic_ns=end, state_received_monotonic_ns=start,
+            # Local freshness: the receipt time ages out when the injected
+            # fault makes this observation stale instead of the clock.
+            source_changed_monotonic_ns=dict.fromkeys(
+                stamps, end - (1_000_000_000 if self.fault in
+                               ('successor_stale', 'clock_expired') else 0)),
             read_duration_s=.001)
         image = np.zeros((128, 128, 3), dtype=np.uint8)
         image[:, :, 0] = self.observations % 255
@@ -465,8 +470,12 @@ def test_fault_matrix_is_fail_closed_and_never_reuses_backend(tmp_path, fault):
     assert all(clock.closed for clock in rig.clocks)
     assert rig.actor_runtime is not None
     assert rig.actor_runtime.transitions_sent == 0
-    assert rig.learner_result.online_replay == 0
-    assert rig.learner_result.human_replay == 0
+    # The fixture imports one demonstration before starting the Actor. Faults
+    # must leave exactly that seed and must not add an Actor transition.
+    restored = rig.resume().learner
+    assert len(restored.online_replay) == 1
+    assert len(restored.human_replay) == 1
+    assert {row['complementary_info']['episode_id'] for row in restored.records} == {'bootstrap'}
 
     error_chain = []
     error = raised.value
@@ -475,8 +484,9 @@ def test_fault_matrix_is_fail_closed_and_never_reuses_backend(tmp_path, fault):
         error = error.__cause__ or error.__context__
     error_text = '\n'.join(error_chain).lower()
     if fault == 'clock_expired':
-        assert sum(clock.expired_reads for clock in rig.clocks) > 0
-        assert rig.freshness_guard.last_decision.code == 'mapping_expired'
+        # Local freshness: the same injected staleness is now rejected by the
+        # observation's receipt age, with no clock mapping involved.
+        assert rig.freshness_guard.last_decision.code == 'camera_stale:left_wrist'
         expected_commands = 0
     elif fault == 'hid_unplug':
         assert rig.hid.unplug_triggered is True
@@ -486,7 +496,9 @@ def test_fault_matrix_is_fail_closed_and_never_reuses_backend(tmp_path, fault):
         assert rig.disconnect_triggered is True
         assert rig.transport.error is not None
         assert 'closed' in error_text or 'unavailable' in error_text
-        expected_commands = 1
+        # This injected disconnect fires while uploading the pending first
+        # transition, after the second command has already executed.
+        expected_commands = 2
     elif fault == 'command_timeout':
         assert rig.ports[0].timeout_triggered is True
         assert 'timeout' in error_text or 'deadline' in error_text

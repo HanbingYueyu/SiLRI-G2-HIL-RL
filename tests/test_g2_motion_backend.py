@@ -198,6 +198,73 @@ def test_action_origin_is_policy_predecessor_not_new_feedback():
         driver.close()
 
 
+def test_active_command_uses_camera_budget_within_lease_while_startup_uses_reader_default():
+    reader = Reader()
+    timeouts = []
+    reader.observe_with_timeout = lambda timeout_s: timeouts.append(timeout_s) or reader.observe()
+    port = Port(reader)
+    driver = backend(reader, port, allow_motion=True)
+    try:
+        driver.observe()
+        assert timeouts == []
+        driver.execute((0,)*6)
+        assert timeouts == [.2]
+    finally:
+        driver.close()
+
+
+def test_successor_waits_briefly_for_camera_frames_after_command_send():
+    reader = Reader()
+    port = Port(reader)
+
+    class Guard:
+        def __init__(self):
+            self.after_calls = 0
+            self.last_decision = FreshnessDecision('ok', 'fixture')
+
+        def __call__(self, _obs, _info, after):
+            if after is None:
+                return True
+            self.after_calls += 1
+            if self.after_calls == 1:
+                self.last_decision = FreshnessDecision(
+                    'not_after_command:left_wrist', 'frame predates command')
+                return False
+            self.last_decision = FreshnessDecision('ok', 'new frame')
+            return True
+
+    guard = Guard()
+    driver = backend(reader, port, observation_guard=guard, allow_motion=True)
+    try:
+        result = driver.execute((0,)*6)
+        assert result.observation['state'].shape == (7,)
+        assert guard.after_calls == 2
+        assert len(port.sent) > 0
+    finally:
+        driver.close()
+
+
+def test_missing_post_command_camera_frame_uses_recoverable_camera_fault():
+    from g2_local.gdk_backend import CameraUnavailable
+
+    reader = Reader()
+    port = Port(reader)
+
+    class Guard:
+        last_decision = FreshnessDecision('not_after_command:left_wrist', 'frame predates command')
+
+        def __call__(self, _obs, _info, after):
+            return after is None
+
+    driver = backend(reader, port, observation_guard=Guard(), allow_motion=True)
+    try:
+        with pytest.raises(CameraUnavailable, match='post-command camera frame'):
+            driver.execute((0,)*6)
+        assert driver.stop_confirmed is True
+    finally:
+        driver.close()
+
+
 def test_expired_policy_predecessor_cannot_send():
     reader = Reader()
     port = Port(reader)
@@ -426,6 +493,8 @@ def test_guard_exception_fails_closed_before_send():
 
 
 def test_slow_camera_does_not_block_writer_but_lease_ends_step():
+    from g2_local.gdk_backend import CameraUnavailable
+
     reader = Reader()
     port = Port(reader)
     original = reader.observe
@@ -438,7 +507,7 @@ def test_slow_camera_does_not_block_writer_but_lease_ends_step():
     reader.observe = slow_observe
     driver = backend(reader, port, allow_motion=True)
     try:
-        with pytest.raises(RuntimeError, match='lease'):
+        with pytest.raises(CameraUnavailable, match='command lease'):
             driver.execute((0,)*6)
         assert len(port.sent) > 2
         assert port.stopped

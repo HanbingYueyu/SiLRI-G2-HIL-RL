@@ -115,6 +115,76 @@ def test_corrupt_or_incompatible_demo_rejected_before_replay_mutation(tmp_path):
     assert len(learner.online_replay) == 0
 
 
+def test_reward_and_horizon_tuning_keeps_demonstrations_valid(tmp_path):
+    """Reward values and the episode limit are training knobs, not data identity."""
+    cfg = config()
+    path = tmp_path / 'demo'
+    writer = DemonstrationWriter(path, config=cfg, run_id='run-1')
+    writer.append(demo_row())
+    writer.append(demo_row(1, terminal=True))
+    tuned = deepcopy(cfg)
+    tuned.canonical_payload['task'].update(max_episode_steps=350, success_reward=30.,
+                                           failure_reward=-2., step_reward=-.01)
+    tuned.task = SimpleNamespace(max_episode_steps=350, success_reward=30.,
+                                 failure_reward=-2., step_reward=-.01)
+    manifest, rows = next(iter(load_demo_episodes(path, config=tuned)))
+    assert manifest['run_id'] == 'run-1'
+    # Rewards are re-derived from the durable labels under the *current* config.
+    assert [row['reward'] for row in rows] == [-.01, 30.]
+    assert rows[-1]['done'] is True and rows[-1]['complementary_info']['success_label'] is True
+
+
+def test_episode_limit_below_stored_length_does_not_hide_data(tmp_path):
+    cfg = config()
+    path = tmp_path / 'demo'
+    writer = DemonstrationWriter(path, config=cfg, run_id='run-1')
+    writer.append(demo_row())
+    writer.append(demo_row(1, terminal=True))
+    shorter = deepcopy(cfg)
+    shorter.canonical_payload['task']['max_episode_steps'] = 1
+    shorter.task = SimpleNamespace(max_episode_steps=1, success_reward=10.,
+                                   failure_reward=-1., step_reward=-.05)
+    _manifest, rows = next(iter(load_demo_episodes(path, config=shorter)))
+    assert len(rows) == 2
+
+
+def _mutate_roi(payload):
+    payload['observation']['camera_rois']['left_wrist'][0] = 10
+
+
+def _mutate_image_size(payload):
+    payload['observation']['image_size'] = 256
+
+
+def _mutate_axis_map(payload):
+    payload['intervention']['axis_map'] = [-1, -2, -3, -5, -4, -6]
+
+
+def _mutate_workspace(payload):
+    payload['motion']['workspace_low'][0] = 0.5
+
+
+def _mutate_control_mode(payload):
+    payload['motion']['control_mode'] = 3
+
+
+def _mutate_action_scale(payload):
+    payload['task']['action_scale'][0] = 0.003
+
+
+@pytest.mark.parametrize('mutate', [_mutate_roi, _mutate_image_size, _mutate_axis_map,
+                                    _mutate_workspace, _mutate_control_mode,
+                                    _mutate_action_scale])
+def test_data_semantics_change_still_rejected(tmp_path, mutate):
+    cfg = config()
+    path = tmp_path / 'demo'
+    DemonstrationWriter(path, config=cfg, run_id='run-1').append(demo_row(terminal=True))
+    changed = deepcopy(cfg)
+    mutate(changed.canonical_payload)
+    with pytest.raises(ValueError, match='contract mismatch'):
+        list(load_demo_episodes(path, config=changed))
+
+
 def test_demo_neutral_keeps_human_authority_and_disconnect_raises():
     reader, now = Reader(), [1.]
     source = DemonstrationIntervention(reader, explicit_config(), clock=lambda: now[0])

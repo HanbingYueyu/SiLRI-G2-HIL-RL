@@ -93,6 +93,12 @@ class FakeCoordinator:
         self.running = False
         self.active_token = None
 
+    def abandon_episode_after_camera_fault(self, token=None):
+        self.running = False
+        self.context = None
+        self.active_token = None
+        self.completed_step_token = None
+
     def seal_episode(self, token):
         assert token.step_id == self.step_id - 1
         self.running = False
@@ -110,6 +116,7 @@ class FakeEnv:
         self.during_step = None
         self.close_error = None
         self.backend = SimpleNamespace(stop_calls=0)
+        self.backend.stop_confirmed = True
         self.closed = False
 
         def stop():
@@ -158,8 +165,12 @@ class FakeIntervention:
         self.polls += 1
         return False, None
 
+    def has_new_report(self):
+        return True
 
-def actor_rig(*, versions=((3, 8),), blocked=False, capacity=1):
+
+def actor_rig(*, versions=((3, 8),), blocked=False, capacity=1,
+              demonstration=False, exit_after_labeled_demo=False):
     policy, coordinator = FakePolicy(), FakeCoordinator()
     env = FakeEnv(coordinator)
     envs = []
@@ -181,7 +192,9 @@ def actor_rig(*, versions=((3, 8),), blocked=False, capacity=1):
             observation=SimpleNamespace(image_size=128)),
         run_id='run-1', config_hash='hash-1',
         coordinator=coordinator, context_source=SimpleNamespace(read_new=lambda: context),
-        transport=transport, env_factory=env_factory, policy=policy)
+        transport=transport, env_factory=env_factory,
+        policy=None if demonstration else policy, demonstration=demonstration,
+        exit_after_labeled_demo=exit_after_labeled_demo)
     return SimpleNamespace(runtime=runtime, policy=policy, env=env,
                            envs=envs, coordinator=coordinator, transport=transport)
 
@@ -199,6 +212,58 @@ def test_actor_uploads_driver_confirmed_action_with_identity():
     assert rig.env.closed
     assert rig.transport.closed
     assert rig.coordinator.intervention.polls >= 1
+
+
+def test_camera_fault_interrupts_episode_without_exiting_actor():
+    from g2_local.gdk_backend import CameraUnavailable
+
+    rig = actor_rig()
+    context2 = EpisodeContext('episode-2', (0., 0., 0.), 'visual', 'grasp',
+                              visual_reset_monotonic_ns=2)
+    contexts = iter((EpisodeContext('episode-1', (0., 0., 0.), 'visual', 'grasp',
+                                    visual_reset_monotonic_ns=1), context2))
+    rig.runtime.context_source = SimpleNamespace(read_new=lambda: next(contexts, None))
+    def fail_second_step():
+        if rig.env.step_calls == 2:
+            raise CameraUnavailable(
+                'Camera pair did not recover within the observation deadline')
+    rig.env.during_step = fail_second_step
+    events = []
+    rig.runtime.telemetry = lambda kind, **fields: events.append((kind, fields))
+
+    summary = rig.runtime.run(max_completed_steps=2)
+
+    assert summary.transitions_sent == 2
+    assert len(rig.transport.sent) == 2
+    interrupted, resumed = rig.transport.sent
+    assert interrupted['complementary_info']['episode_id'] == 'episode-1'
+    assert interrupted['truncated'] is True and interrupted['done'] is False
+    assert resumed['complementary_info']['episode_id'] == 'episode-2'
+    assert rig.env.closed
+    assert len(rig.envs) == 2 and rig.envs[1].closed
+    assert any(kind == 'camera_episode_interrupted' for kind, _ in events)
+
+
+@pytest.mark.parametrize('code', ['camera_stale:left_wrist', 'camera_skew'])
+def test_camera_freshness_rejection_returns_actor_to_reset_wait(code):
+    from g2_local.motion_backend import ObservationRejected
+
+    rig = actor_rig()
+    context2 = EpisodeContext('episode-2', (0., 0., 0.), 'visual', 'grasp',
+                              visual_reset_monotonic_ns=2)
+    contexts = iter((EpisodeContext('episode-1', (0., 0., 0.), 'visual', 'grasp',
+                                    visual_reset_monotonic_ns=1), context2))
+    rig.runtime.context_source = SimpleNamespace(read_new=lambda: next(contexts, None))
+    rig.env.during_step = lambda: (_ for _ in ()).throw(
+        ObservationRejected('Source observation freshness not confirmed: ' + code, code))
+    events = []
+    rig.runtime.telemetry = lambda kind, **fields: events.append((kind, fields))
+
+    rig.runtime.run(max_completed_steps=1)
+
+    assert len(rig.transport.sent) == 1
+    assert rig.transport.sent[0]['complementary_info']['episode_id'] == 'episode-2'
+    assert any(kind == 'camera_episode_interrupted' for kind, _ in events)
 
 
 def test_first_policy_forward_is_warmed_before_fresh_action_observation():
@@ -232,6 +297,35 @@ def test_y_after_successor_labels_previous_step_without_another_motion():
     assert row['done'] and row['reward'] == 10.
     assert row['complementary_info']['step_id'] == 0
     assert row['complementary_info']['success_label'] is True
+
+
+@pytest.mark.parametrize('label,expected', [('success', True), ('failure', False)])
+def test_labeled_demo_closes_actor_after_saving_y_or_f(label, expected):
+    rig = actor_rig(demonstration=True, exit_after_labeled_demo=True)
+    rig.runtime.config.task = SimpleNamespace(success_reward=10., failure_reward=-1.)
+    rig.coordinator.keys = SimpleNamespace(
+        poll=lambda: label if rig.env.step_calls == 1 else None)
+
+    summary = rig.runtime.run()
+
+    assert summary.transitions_sent == 1
+    assert summary.stop_reason == 'demo_labeled'
+    assert rig.runtime.stop_confirmed is True
+    assert rig.env.closed and rig.transport.closed
+    assert rig.env.step_calls == 1
+    assert rig.transport.sent[0]['done'] is True
+    assert rig.transport.sent[0]['complementary_info']['success_label'] is expected
+
+
+def test_unlabeled_time_limit_does_not_trigger_post_demo_exit():
+    rig = actor_rig(demonstration=True, exit_after_labeled_demo=True)
+    rig.env.truncate_first = True
+
+    rig.runtime.run(max_completed_steps=1)
+
+    assert rig.runtime.stop_event.is_set() is False
+    assert rig.transport.sent[0]['truncated'] is True
+    assert rig.transport.sent[0]['complementary_info']['success_label'] is None
 
 
 def test_terminal_from_final_send_gate_settles_pending_previous_transition():

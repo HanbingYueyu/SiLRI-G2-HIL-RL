@@ -228,3 +228,17 @@ class RealEpisodeCoordinator:
     def abort_step(self, token):
         self._validate_token(token)
         self._abort()
+
+    def abandon_episode_after_camera_fault(self, token=None):
+        """Return to reset-wait only after the motion backend confirmed its hold."""
+        if not self.running:
+            raise RuntimeError('No running episode to abandon')
+        if token is not None and (self._token is None or token != self._token):
+            raise RuntimeError('Camera fault does not match the active step')
+        self.state = 'WAITING_FOR_RESET'
+        self.context = None
+        self._token = None
+        self._completed_token = None
+        self._pending_terminal = None
+        self._step_id = 0
+        self.chord.reset()

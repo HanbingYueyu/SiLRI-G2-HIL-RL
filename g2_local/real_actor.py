@@ -332,7 +332,8 @@ class GrpcActorTransport:
 class RealActorRuntime:
     def __init__(self, *, config, run_id, config_hash, coordinator,
                  context_source, transport, env_factory, policy=None,
-                 clock=time.monotonic, telemetry=None, demonstration=False):
+                 clock=time.monotonic, telemetry=None, demonstration=False,
+                 exit_after_labeled_demo=False):
         self.config = config
         self.run_id = _identity_part(run_id, 'run_id')
         self.config_hash = _identity_part(config_hash, 'config_hash')
@@ -341,6 +342,11 @@ class RealActorRuntime:
         self.transport = transport
         self.env_factory = env_factory
         self.demonstration = demonstration
+        if type(exit_after_labeled_demo) is not bool:
+            raise ValueError('exit_after_labeled_demo must be boolean')
+        if exit_after_labeled_demo and not demonstration:
+            raise ValueError('Only a demonstration may exit after Y/F')
+        self.exit_after_labeled_demo = exit_after_labeled_demo
         self._policy_warmed = False
         if demonstration and policy is not None:
             raise ValueError('Demonstration must not load a policy')
@@ -533,7 +539,7 @@ class RealActorRuntime:
             self.transport.send_transition_batch((row,))
             self.transitions_sent += 1
             self.interventions += int(row['complementary_info']['is_intervention'])
-        def finish_episode(token, context, truncated):
+        def finish_episode(token, context, truncated, *, labeled=False):
             nonlocal env, previous_step_at
             self.episodes_completed += 1
             previous_step_at = None
@@ -547,6 +553,53 @@ class RealActorRuntime:
             reset_config = getattr(getattr(self.config, 'motion', None), 'auto_reset', None)
             if reset_config is not None and reset_config.enabled:
                 self._automatic_reset(episode_start_pose, context)
+            if self.exit_after_labeled_demo and labeled:
+                self.stop('demo_labeled')
+        def interrupt_camera_episode(error, token=None):
+            nonlocal env, pending, previous_step_at, episode_start_pose
+            from .gdk_backend import CameraUnavailable
+            is_camera_freshness_error = getattr(error, 'code', None) in (
+                'camera_stale:left_wrist', 'camera_stale:right_aux', 'camera_skew')
+            if (not isinstance(error, CameraUnavailable) and not is_camera_freshness_error) or env is None:
+                return False
+            backend = getattr(env, 'backend', None)
+            if getattr(backend, 'stop_confirmed', None) is not True:
+                return False
+            context = self.coordinator.context
+            if context is None:
+                return False
+            self.coordinator.abandon_episode_after_camera_fault(token)
+            discarded_step = (None if token is None else
+                              dict(episode_id=token.episode_id, step_id=token.step_id))
+            preserved_transition = None
+            if pending is not None:
+                row, _, _ = pending
+                row['done'] = False
+                row['truncated'] = True
+                validate_real_transition(row, self.run_id, self.config_hash)
+                upload(row)
+                preserved_transition = row['complementary_info']['transition_id']
+                pending = None
+            self._emit('camera_episode_interrupted',
+                       episode_id=context.episode_id,
+                       step_id=None if token is None else token.step_id,
+                       error=(f'{type(error).__name__}: {error}')[:512],
+                       stop_confirmed=True,
+                       discarded_inflight_step=discarded_step,
+                       preserved_transition_id=preserved_transition,
+                       requires_operator_scene_reset=True)
+            try:
+                env.close()
+            finally:
+                env = None
+                self._env = None
+                self.current_observation = None
+                previous_step_at = None
+                episode_start_pose = None
+            self.interrupted_episodes = getattr(self, 'interrupted_episodes', 0) + 1
+            print('相机观测中断：已确认测量保持，当前回合已截断；Actor继续运行，等待现场复位并提交新的 EpisodeContext。',
+                  flush=True)
+            return True
         def terminal_before_next_action(forced=None):
             nonlocal pending
             if pending is None:
@@ -569,7 +622,7 @@ class RealActorRuntime:
                        attribution='previous_successor_before_next_action')
             upload(row)
             pending = None
-            finish_episode(token, context, False)
+            finish_episode(token, context, False, labeled=True)
             return True
         try:
             while not self.stop_event.is_set():
@@ -613,6 +666,8 @@ class RealActorRuntime:
                             except Exception as error:
                                 error.episode_id = context.episode_id
                                 error.step_id = None
+                                if interrupt_camera_episode(error):
+                                    continue
                                 raise
                             episode_start_pose = tuple(self.current_observation['state'])
                             if self.demonstration:
@@ -624,14 +679,18 @@ class RealActorRuntime:
                 if env is None:
                     raise RuntimeError('Running episode has no commissioned environment')
                 if self.demonstration:
-                    # Button-only start is valid, but no axis data means no
-                    # transition yet. Do not label default zeros as fresh input.
-                    self.coordinator.intervention()
+                    # Peek only: env.step consumes the report immediately before
+                    # command submission. A pre-read here would lose that motion.
                     intervention = self.coordinator.intervention
-                    if not (intervention.gate.fresh or intervention.verified_neutral):
+                    if not (intervention.has_new_report() or intervention.verified_neutral):
                         time.sleep(self.config.runtime.operator_poll_interval_s)
                         continue
-                before = env.refresh_observation()
+                try:
+                    before = env.refresh_observation()
+                except Exception as error:
+                    if interrupt_camera_episode(error):
+                        continue
+                    raise
                 self.current_observation = before
                 context = self.coordinator.context
                 inference_started = self.clock()
@@ -651,6 +710,8 @@ class RealActorRuntime:
                     if isinstance(error, TerminalBeforeCommand) and pending is not None:
                         self._step_active = False
                         terminal_before_next_action(forced=error)
+                        continue
+                    if interrupt_camera_episode(error, token):
                         continue
                     error.episode_id = token.episode_id
                     error.step_id = token.step_id
@@ -683,7 +744,10 @@ class RealActorRuntime:
                 self.current_observation = after
                 if terminated or truncated:
                     upload(row)
-                    finish_episode(token, context, truncated)
+                    finish_episode(
+                        token, context, truncated,
+                        labeled=(row['complementary_info'].get('success_label')
+                                 in (True, False)))
                 else:
                     pending = (row, token, context)
                 if max_completed_steps is not None and completed >= max_completed_steps:

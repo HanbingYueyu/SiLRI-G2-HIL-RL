@@ -1,7 +1,7 @@
 import torch
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.silri.configuration_silri import SiLRIConfig
-from lerobot.policies.silri.modeling_silri import SiLRIPolicy
+from lerobot.policies.silri.modeling_silri import MultivariateNormalDiag, SiLRIPolicy
 
 
 def make_policy(images=False, num_discrete_actions=None):
@@ -24,6 +24,14 @@ def batch(images=False):
                     for key in ('left_wrist', 'right_aux')})
     return dict(state=obs, next_state=obs, action=torch.zeros(2, 6),
                 reward=torch.zeros(2), done=torch.zeros(2), is_intervention=torch.ones(2))
+
+
+def test_diagonal_distribution_scale_is_standard_deviation():
+    scale = torch.tensor([[.05, .1, .2]])
+    dist = MultivariateNormalDiag(loc=torch.zeros_like(scale), scale_diag=scale)
+
+    torch.testing.assert_close(dist.stddev, scale)
+    torch.testing.assert_close(dist.covariance_matrix, torch.diag_embed(scale.square()))
 
 
 def test_fixed_gripper_optimizers_and_all_losses():

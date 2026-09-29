@@ -50,6 +50,12 @@ class OwnedObservationSource:
     def observe(self):
         return self.reader.observe()
 
+    def observe_with_timeout(self, timeout_s):
+        bounded_observe = getattr(self.reader, 'observe_with_timeout', None)
+        if callable(bounded_observe):
+            return bounded_observe(timeout_s)
+        return self.reader.observe()
+
     @property
     def read_control_pose(self):
         return getattr(self.reader, 'read_control_pose', None)
@@ -64,21 +70,53 @@ class OwnedObservationSource:
             self.clock_client.close()
 
 
+class _LocalClock:
+    """No clock process: freshness comes from local receipt times.
+
+    Upstream G2 flow never converts robot timestamps into local time; it asks
+    how long this process has gone without a new frame.  Real time
+    synchronisation stays the operator's job (`ptp_hard.sh`), used for logging
+    and the GDK latency APIs, and is not needed for this check.
+    """
+
+    def close(self):
+        return None
+
+
 def _preflight_mode(controller, expected_mode):
     if type(expected_mode) is not int or expected_mode not in (1, 3):
         raise ValueError('Explicit control mode 1 or 3 required')
     controller.checked_arm_state()
     status = controller.motion_status_summary()
     if (type(status) is not dict or type(status.get('control_mode')) is not int or
-            status['control_mode'] != expected_mode or
             type(status.get('error_code')) is not int or status['error_code'] != 0):
         raise RuntimeError(f'Unhealthy or changed control mode: {status}')
+    if status['control_mode'] == expected_mode:
+        return
+    # The upstream visual flow may leave GDK in joint impedance mode 3.
+    # For a commissioned position-mode session, use its existing verified
+    # takeover API before constructing any command port or publishing targets.
+    if status['control_mode'] == 3 and expected_mode == 1:
+        switch = getattr(controller, 'enter_position_control', None)
+        if callable(switch):
+            print('检测到 control_mode=3；切换到 SiLRI 配置要求的 control_mode=1。', flush=True)
+            switch('SiLRI supervised motion startup')
+            controller.checked_arm_state()
+            status = controller.motion_status_summary()
+            if (type(status) is dict and type(status.get('control_mode')) is int and
+                    status['control_mode'] == expected_mode and
+                    type(status.get('error_code')) is int and status['error_code'] == 0):
+                return
+    raise RuntimeError(f'Unhealthy or changed control mode: {status}')
 
 
-def create_motion_env(config, coordinator, *, cli_allow_motion, factories=None) -> G2LocalEnv:
+def create_motion_env(config, coordinator, *, cli_allow_motion, factories=None,
+                      skip_tf_progress=False) -> G2LocalEnv:
     if (type(cli_allow_motion) is not bool or cli_allow_motion is not True or
             config.requested_motion is not True or config.motion_permitted is not True):
         raise PermissionError('commissioned motion permission is required')
+    if type(skip_tf_progress) is not bool:
+        raise ValueError('skip_tf_progress must be boolean')
     if config.commissioning.verify_files_and_hashes(config.freshness) is not True:
         raise PermissionError('commissioning evidence is not current')
     config.motion.limits.validate_motion()
@@ -86,6 +124,9 @@ def create_motion_env(config, coordinator, *, cli_allow_motion, factories=None) 
         raise ValueError('Explicit control mode 1 or 3 required')
     factories = MotionFactories.production() if factories is None else factories
 
+    # Freshness is local (see _LocalClock): nothing reads a clock in this
+    # process.  The legacy client factory stays only as the lifetime seam that
+    # owns reader/client teardown together.
     client = factories.clock_client(config.commissioning.clock_socket,
                                     config.commissioning.expected_master)
     source = None
@@ -96,17 +137,16 @@ def create_motion_env(config, coordinator, *, cli_allow_motion, factories=None) 
                                   timeout_s=config.motion.reader_timeout_s,
                                   allow_motion=True)
         source = OwnedObservationSource(reader, client)
-        if hasattr(reader, 'camera_pair_max_skew_s'):
-            # Acquisition prefilter only: the final guard still accounts for
-            # mapping uncertainty, age, progression and post-command ordering.
-            reader.camera_pair_max_skew_s = config.freshness.camera_skew_s
         _preflight_mode(source.controller, config.motion.control_mode)
-        observation_guard = ObservationFreshnessGuard(client, config.freshness)
+        observation_guard = (ObservationFreshnessGuard(None, config.freshness, local=True,
+                             skip_tf_progress=True) if skip_tf_progress else
+                             ObservationFreshnessGuard(None, config.freshness, local=True))
         lease = FreshnessLeaseGuard(observation_guard,
-                                    feedback_lease_s=config.motion.command_timeout_s)
+                                    feedback_lease_s=(config.motion.command_timeout_s +
+                                                      config.motion.send_timeout_s))
         stop_options = {}
         if callable(getattr(reader, 'read_stop_feedback', None)):
-            stop_guard = ObservationFreshnessGuard(client, config.freshness)
+            stop_guard = ObservationFreshnessGuard(None, config.freshness, local=True)
             def stop_pose_provider():
                 # Do not race an SDK read or release its resources under a hold.
                 if backend is None or not backend.reader_lock.acquire(
@@ -134,7 +174,7 @@ def create_motion_env(config, coordinator, *, cli_allow_motion, factories=None) 
                                 stop_timeout=config.motion.stop_timeout_s,
                                 send_rate_hz=config.motion.send_rate_hz,
                                 local_envelope=config.motion.local_envelope,
-                                reference_guard=observation_guard.revalidate,
+                                reference_guard=lease.revalidate,
                                 startup_camera_wait_s=2.,
                                 startup_mapping_wait_s=60.,
                                 policy_position_drift_m=config.motion.policy_position_drift_m,

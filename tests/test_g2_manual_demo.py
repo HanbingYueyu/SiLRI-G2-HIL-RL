@@ -4,72 +4,119 @@ from types import SimpleNamespace
 import pytest
 
 
-@pytest.mark.parametrize('failure', [None, 'clock', 'demo', 'interrupt', 'retry', 'exhausted'])
-def test_session_owns_unique_clock_and_cleans_it_on_all_exits(tmp_path, monkeypatch, failure):
+SECTION_SIX = '''## 6. 上游起始位置
+
+```bash
+cd /home/flyfuture/g2_hinge_assembly && \\
+./scripts/run_gdk_sam3_python.sh g2_adapter/run_bilateral_flow_gdk.py \\
+  --from-stage right_to_lr1 --through-stage left_to_teach_start \\
+  --allow-motion
+```
+'''
+
+
+@pytest.mark.parametrize('failure', [None, 'demo', 'interrupt'])
+def test_demo_consumes_the_operator_clock_and_never_spawns_one(
+        tmp_path, monkeypatch, failure):
+    """Time synchronisation runs in its own terminal; collection only consumes it."""
     from g2_local import manual_demo as launch
     root = tmp_path
     (root / 'runtime').mkdir()
-    source = root / 'runtime/site-demo.json'
-    original = {'commissioning': {'clock_socket': '/old/clock.sock'}}
+    source = root / 'runtime/train-fixed-fridge-20260928-camera-relaxed.json'
+    original = {'task': {'control_hz': 30, 'max_episode_steps': 900},
+                'commissioning': {'clock_socket': '/old/clock.sock'}}
     source.write_text(json.dumps(original))
+    (root / '常用命令.md').write_text(SECTION_SIX)
     monkeypatch.setattr(launch, 'load_training_config', lambda *a, **k: SimpleNamespace(
         motion_permitted=True, motion=SimpleNamespace(auto_reset=SimpleNamespace(enabled=False)),
         commissioning=SimpleNamespace(expected_master='044052.fffe.000010')))
-    monitors, stopped, configs = [], [], []
-    def popen(argv, **kwargs):
-        assert argv[2] == 'g2_local.clock_monitor'
-        assert not kwargs.get('start_new_session', False)
-        process = SimpleNamespace(argv=argv)
-        monitors.append(process)
-        return process
-    def wait(process, path, **kwargs):
-        assert path.parent == launch.Path(process.argv[-1])
-        if failure == 'clock':
-            raise TimeoutError('not healthy')
-        if failure == 'exhausted' or (failure == 'retry' and '-retry' not in str(path)):
-            raise RuntimeError('clock exited: 2')
-    if failure in ('retry', 'exhausted'):
-        monkeypatch.setattr(launch, '_startup_clock_failure', lambda output: ('ptp_fault', True))
+    clock = tmp_path / 'clock.sock'
+    clock.touch()
+    configs, commands = [], []
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Collection must never start a clock monitor')
+
+    monkeypatch.setattr(launch.subprocess, 'Popen', forbidden)
+
     def demo(argv):
         path = launch.Path(argv[argv.index('--config') + 1])
         config = json.loads(path.read_text())
-        assert config['commissioning']['clock_socket'] == str(
-            launch.Path(monitors[-1].argv[-1]) / 'clock.sock')
+        assert config['task']['control_hz'] == 30
         context = launch.Path(argv[argv.index('--context') + 1])
         assert json.loads(context.read_text())['visual_reset_monotonic_ns'] > 0
+        assert '--exit-after-labeled-demo' in argv
         configs.append(path)
         if failure == 'demo':
             raise RuntimeError('demo failed')
         if failure == 'interrupt':
             raise KeyboardInterrupt
         return 0
-    monkeypatch.setattr(launch.subprocess, 'Popen', popen)
-    monkeypatch.setattr(launch, '_wait_for_healthy_monitor', wait)
-    monkeypatch.setattr(launch, '_stop_monitor', lambda p: stopped.append(p))
-    def unexpected_input(*args):
-        raise AssertionError('Launcher must not require an Enter confirmation')
-    monkeypatch.setattr('builtins.input', unexpected_input)
-    for _ in range(2):
-        if failure in ('clock', 'demo', 'exhausted'):
-            with pytest.raises((TimeoutError, RuntimeError)):
-                launch.run(root=root, demo_main=demo)
-        else:
-            assert launch.run(root=root, demo_main=demo) == (130 if failure == 'interrupt' else 0)
-    assert stopped == monitors
-    assert monitors[0].argv[-1] != monitors[1].argv[-1]
+
+    def command_runner(argv, **kwargs):
+        commands.append((argv, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    if failure == 'demo':
+        with pytest.raises(RuntimeError):
+            launch.run(root=root, demo_main=demo,
+                       command_runner=command_runner)
+    else:
+        assert launch.run(root=root, demo_main=demo,
+                          command_runner=command_runner) == (
+            130 if failure == 'interrupt' else 0)
+    # The session copy carries the operator's socket; the base config is untouched.
     assert json.loads(source.read_text()) == original
-    assert len(configs) == (0 if failure in ('clock', 'exhausted') else 2)
-    assert len(monitors) == (6 if failure == 'exhausted' else 4 if failure == 'retry' else 2)
+    assert len(configs) == 1
+    if failure is None:
+        pre_reset, visual_reset = commands
+        assert pre_reset[0][2:5] == ['-m', 'g2_local.pre_reset', '--config']
+        assert pre_reset[0][-1] == '--allow-motion'
+        assert pre_reset[1]['cwd'] == root
+        assert visual_reset[0] == [
+            './scripts/run_gdk_sam3_python.sh',
+            'g2_adapter/run_bilateral_flow_gdk.py',
+            '--from-stage', 'right_to_lr1', '--through-stage',
+            'left_to_teach_start', '--allow-motion']
+        assert visual_reset[1]['cwd'] == launch.Path('/home/flyfuture/g2_hinge_assembly')
+    else:
+        assert commands == []
 
 
-@pytest.mark.parametrize('reason,raw,expected', [
-    ('ptp_fault', 'UNCALIBRATED to LISTENING on ANNOUNCE_RECEIPT_TIMEOUT_EXPIRES', True),
-    ('master_mismatch', 'UNCALIBRATED to LISTENING on ANNOUNCE_RECEIPT_TIMEOUT_EXPIRES', False),
-    ('ptp_fault', 'FAULTY', False),
+@pytest.mark.parametrize('pre_reset_code,visual_reset_code,expected_calls,expected_result', [
+    (1, 0, 1, 1), (0, 2, 2, 2),
 ])
-def test_startup_retry_requires_recorded_announce_timeout(tmp_path, reason, raw, expected):
-    from g2_local.manual_demo import _startup_clock_failure
-    (tmp_path / 'evidence.jsonl').write_text(
-        json.dumps(dict(kind='ptp', raw=raw)) + '\n' +
-        json.dumps(dict(kind='exit', reason=reason)) + '\n')
-    assert _startup_clock_failure(tmp_path) == (reason, expected)
+def test_post_demo_reset_stops_if_either_reset_stage_fails(
+        tmp_path, pre_reset_code, visual_reset_code, expected_calls, expected_result):
+    from g2_local.manual_demo import _run_post_demo_reset
+    (tmp_path / '常用命令.md').write_text('''## 6. 上游起始位置
+```bash
+cd /home/flyfuture/g2_hinge_assembly && \\
+./scripts/run_gdk_sam3_python.sh g2_adapter/run_bilateral_flow_gdk.py \\
+--relief-extra-lift-mm 4 \\
+--vlm-enable false --tts-enable false \\
+--teach-max-acceleration-rad-s2 20.0 \\
+--from-stage left_to_hole_offset --through-stage right_to_lr1 \\
+--allow-motion
+```
+''')
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append((argv, kwargs))
+        code = pre_reset_code if len(calls) == 1 else visual_reset_code
+        return SimpleNamespace(returncode=code)
+
+    result = _run_post_demo_reset(tmp_path, tmp_path / 'config.json', runner)
+
+    assert result == expected_result
+    assert len(calls) == expected_calls
+    if expected_calls == 2:
+        assert calls[1][0] == [
+            './scripts/run_gdk_sam3_python.sh',
+            'g2_adapter/run_bilateral_flow_gdk.py',
+            '--relief-extra-lift-mm', '4',
+            '--vlm-enable', 'false', '--tts-enable', 'false',
+            '--teach-max-acceleration-rad-s2', '20.0',
+            '--from-stage', 'left_to_hole_offset',
+            '--through-stage', 'right_to_lr1', '--allow-motion']
