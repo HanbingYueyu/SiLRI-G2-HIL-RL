@@ -1,5 +1,11 @@
 # 固定冰箱真机训练修复与启动交接（2026-09-28）
 
+> **2026-09-29 更新（本文以下内容为当时的快照）**：现成可用的命令以仓库外层的 `常用命令.md` 为准。当前 seed 已重建为
+> `runtime/offline-pretrain-20260928-camera30-02/checkpoint.pt`，而 `offline_pretrain` 用输出目录名作为 checkpoint 的 `run_id`，
+> 所以 **Learner 与 Actor 的 `--run-id` 必须写成 `offline-pretrain-20260928-camera30-02`**，`--checkpoint-dir` 用
+> `runtime/fixed-fridge-training-20260928-camera30-02`。本文下面出现的 `...-camera30-01` 都已作废（旧 checkpoint 因源码/配置摘要变化被拒绝加载）。
+> 另外：`g2_local/*.py` 或配置文件的任何改动都会让已有 checkpoint 失效，改完必须重新 `offline_pretrain`。
+
 ## 已完成的软件修复
 
 - `MultivariateNormalDiag` 现在把 `scale_diag` 作为标准差传入 `scale_tril`。`fixed_std=0.05` 和 β 网络输出的 std 因而与采样分布、NLL 及约束使用的尺度一致。

@@ -214,6 +214,31 @@ def test_actor_uploads_driver_confirmed_action_with_identity():
     assert rig.coordinator.intervention.polls >= 1
 
 
+def test_console_announces_parameters_start_and_episode_steps(capsys):
+    rig = actor_rig()
+    rig.env.truncate_first = True
+    rig.runtime.run(max_completed_steps=1)
+    out = capsys.readouterr().out
+    assert '已收到 Learner 策略参数：version=v3' in out
+    assert '双键已识别：第 1 个回合开始' in out
+    assert '回合 #1 结束：steps=1 结果=截断' in out
+    assert out.startswith('[')
+
+
+def test_console_reports_a_missing_context_file_instead_of_silence(capsys):
+    from pathlib import Path
+
+    rig = actor_rig()
+    rig.runtime.context_source = SimpleNamespace(path=Path('/missing/episode-context.json'))
+    threading.Timer(.05, rig.runtime.stop_event.set).start()
+    rig.runtime.run()
+    out = capsys.readouterr().out
+    assert '等待下一回合的 EpisodeContext：/missing/episode-context.json' in out
+    assert 'start_training_actor.py --write-context' in out
+    # One actionable hint while idling, not a repeating wall of identical lines.
+    assert out.count('等待下一回合的 EpisodeContext：') == 1
+
+
 def test_camera_fault_interrupts_episode_without_exiting_actor():
     from g2_local.gdk_backend import CameraUnavailable
 

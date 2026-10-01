@@ -103,8 +103,9 @@ def fake_factories(events, *, mode=1, fail_port=False):
             self.closed = True
             events.append('clock_close')
 
-    def make_clock(socket, master):
-        assert (socket, master) == ('/fake/clock.sock', 'fake-master')
+    def make_clock(*args, **kwargs):
+        # No clock endpoint is configured any more; the handle is a lifetime
+        # placeholder that freshness no longer reads.
         events.append('clock')
         state.clock = Clock()
         return state.clock
@@ -185,7 +186,7 @@ def test_failed_port_construction_releases_reader_then_clock():
     assert state.reader.closed and state.clock.closed
 
 
-def accepting_guard(client, limits, **kwargs):
+def accepting_guard(limits, **kwargs):
     def accept(obs, info, after):
         return True
     accept.revalidate = lambda obs, info: True

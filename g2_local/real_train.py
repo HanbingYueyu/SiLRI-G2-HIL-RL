@@ -17,10 +17,47 @@ import sys
 import time
 from types import SimpleNamespace
 
+from .console import RateLimit, number, say
 from .training_config import load_training_config
 
 
 _RUN_ID = re.compile(r'[A-Za-z0-9_.-]{1,128}\Z', re.ASCII)
+_CONSOLE_UPDATE_INTERVAL_S = 1.0
+
+
+class LearnerConsole:
+    """Human-readable stdout mirror of Learner progress.
+
+    Evidence stays in ``events.jsonl``; this only decides what the operator
+    sees, so loss rows are rate limited to one line per interval.
+    """
+
+    def __init__(self, *, interval_s=_CONSOLE_UPDATE_INTERVAL_S):
+        self.limit = RateLimit(interval_s)
+        self.actor_loss = None
+
+    def __call__(self, row):
+        kind = row.get('event')
+        if kind == 'training_resume':
+            say(f"训练已恢复：已完成回合 {row['completed_episodes']}，"
+                f"learner_update {row['learner_update']}，"
+                f"种子 {row['checkpoint_source']}")
+        elif kind == 'learner_update':
+            if row.get('actor_loss') is not None:
+                self.actor_loss = row['actor_loss']
+            if not self.limit.due():
+                return
+            say(f"更新 {row['learner_update']}｜critic {number(row.get('critic_loss'))}"
+                f"｜actor {number(self.actor_loss)}"
+                f"｜已完成回合 {row.get('completed_episodes')}")
+        elif kind == 'episode_completed':
+            steps = row.get('steps')
+            length = '' if steps is None else f"，本回合 {steps} 步"
+            say(f"回合完成：第 {row['completed_episodes']} 个{length}｜"
+                f"learner_update {row['learner_update']}")
+        elif kind == 'checkpoint_saved':
+            say(f"检查点已保存：{row['path']}"
+                f"（回合 {row['completed_episodes']}，update {row['learner_update']}）")
 
 
 def parser():
@@ -35,24 +72,14 @@ def parser():
                      help='Learner only: persistent latest checkpoint; --checkpoint is first-run seed')
     cli.add_argument('--context', type=Path)
     cli.add_argument('--hid-device', type=Path)
-    cli.add_argument('--clock-socket', type=Path,
-                     help='Actor/demo/eval only: current PTP endpoint, logged separately from task identity')
+    cli.add_argument('--auto-reset', action='store_true',
+                     help='Actor/demo/eval only: enable the configured automatic lift/return '
+                          'between episodes without editing the config file')
     cli.add_argument('--demonstrations', type=Path, action='append', default=[],
                      help='Learner only: import a complete local demonstration dataset; repeatable')
     cli.add_argument('--exit-after-labeled-demo', action='store_true',
                      help='Demo only: exit after saving a Y/F-labeled episode')
     return cli
-
-
-def with_clock_endpoint(args, loaded):
-    path = getattr(args, 'clock_socket', None)
-    if path is None:
-        return loaded
-    if args.role == 'learner' or not path.is_absolute() or len(str(path).encode()) > 107:
-        raise ValueError('Absolute Unix clock socket required for Actor/demo/eval only')
-    # Operational endpoint, like --context/--hid-device. SnapshotClient still
-    # checks ownership, master and mapping; this cannot grant motion permission.
-    return replace(loaded, commissioning=replace(loaded.commissioning, clock_socket=path))
 
 
 def bounded_error(error):
@@ -287,10 +314,16 @@ def load_eval_checkpoint(path, *, run_id, config_hash):
             tuple(payload.get('camera_keys', ())) != CAMERA_KEYS or
             payload.get('image_size') != 128 or payload.get('action_size') != 6):
         raise ValueError('Checkpoint identity or camera/action contract mismatch')
-    from .code_identity import algorithm_identity
-    if (type(payload.get('runtime')) is not dict or
-            payload.get('algorithm_identity') != algorithm_identity(payload['runtime']['device'])):
+    from .code_identity import algorithm_identity, identity_mismatch_detail
+    if type(payload.get('runtime')) is not dict:
         raise ValueError('Algorithm code/version identity mismatch; explicit migration required')
+    current_identity = algorithm_identity(payload['runtime']['device'])
+    if payload.get('algorithm_identity') != current_identity:
+        raise ValueError(
+            'Algorithm code/version identity mismatch; explicit migration required. '
+            + identity_mismatch_detail(path, payload.get('algorithm_identity'), current_identity)
+            + '; rebuild the seed with g2_local.offline_pretrain after freezing the code, '
+              'or migrate this checkpoint explicitly')
     version = payload.get('published_version')
     state = payload.get('published_actor_state')
     if (type(version) is not int or version < 0 or
@@ -405,9 +438,10 @@ def _run_learner_owned(args, loaded, evidence):
         learner = RealLearnerRuntime(config=loaded, run_id=args.run_id,
                                      config_hash=loaded.config_hash,
                                      checkpoint_path=target)
+    console = LearnerConsole()
     def progress(row):
         evidence.event(row['event'], **{k: v for k, v in row.items() if k != 'event'})
-        print(json.dumps(row, ensure_ascii=False, allow_nan=False), flush=True)
+        console(row)
     learner.progress = progress
     progress(dict(event='training_resume', completed_episodes=len(learner.completed_episode_ids),
                   next_episode=len(learner.completed_episode_ids)+1,
@@ -434,6 +468,10 @@ def _run_learner_owned(args, loaded, evidence):
         evidence.event('ready', address=f'127.0.0.1:{loaded.runtime.learner_port}',
                        policy_version=learner.version,
                        checkpoint_path=str(learner.checkpoint_path))
+        say(f'Learner 就绪：127.0.0.1:{loaded.runtime.learner_port}，'
+            f'策略版本 v{learner.version}，检查点 {learner.checkpoint_path}')
+        say('现在可以启动 Actor；训练过程中这里持续显示每个更新（critic/actor loss）'
+            '和每个回合的步数，完整记录在 events.jsonl。')
         while not learner.stopped.wait(.2):
             pass
     finally:
@@ -551,7 +589,15 @@ def _run_actor_or_eval(args, loaded, evidence):
             exit_after_labeled_demo=getattr(args, 'exit_after_labeled_demo', False))
         evidence.event('ready', policy_version=runtime.parameter_version)
         if args.role == 'demo':
-            print('等待双键开始：两键都按住后全部松开，无需拨动旋帽。', flush=True)
+            say('等待双键开始：两键都按住后全部松开，无需拨动旋帽。')
+        else:
+            say(f'{args.role} 已就绪：run_id={args.run_id}，'
+                f'Learner=127.0.0.1:{loaded.runtime.learner_port}，'
+                f'HID={args.hid_device}，context={args.context}')
+            say('现场顺序（SpaceMouse 是独占锁，Actor 与上游复位程序不能同时运行）：'
+                'Ctrl+C 退出 Actor → 第 6 节上游复位并退出 → '
+                'scripts/start_training_actor.py --allow-motion 写 context 并启动 Actor → '
+                f'{loaded.runtime.context_max_age_s:.0f} 秒内按住双键再全部松开。')
         try:
             summary = runtime.run()
         except BaseException as error:
@@ -583,18 +629,26 @@ def main(argv=None):
         if args.role != 'learner' and args.checkpoint_dir is not None:
             raise ValueError('--checkpoint-dir is learner only')
         loaded = load_training_config(args.config, cli_allow_motion=bool(args.allow_motion))
-        loaded = with_clock_endpoint(args, loaded)
+        if args.auto_reset and args.role == 'learner':
+            raise ValueError('--auto-reset is illegal for learner')
         if args.role == 'learner' and loaded.mode != 'train':
             raise ValueError('Learner requires train mode')
         if args.role == 'actor' and loaded.mode != 'train':
             raise ValueError('Actor requires train mode')
         if args.role == 'eval' and loaded.mode != 'train':
             raise ValueError('Eval requires the checkpoint training profile')
+        # Operator opt-in for the between-episode lift/return. Only the enable
+        # switch moves: every limit still comes from the approved config, and
+        # the override is recorded, so it never changes config_hash.
+        if args.auto_reset:
+            loaded = replace(loaded, motion=replace(
+                loaded.motion, auto_reset=replace(loaded.motion.auto_reset, enabled=True)))
         manifest = loaded.write_manifest(args.output, run_id=args.run_id, role=args.role)
         evidence = RunEvidenceWriter(args.output, manifest, role=args.role)
-        if args.clock_socket is not None:
-            evidence.event('clock_endpoint', socket=str(args.clock_socket),
-                           expected_master=loaded.commissioning.expected_master)
+        if args.auto_reset:
+            evidence.event('auto_reset_override', enabled=True,
+                           lift_m=loaded.motion.auto_reset.lift_m,
+                           source='operator_cli_flag')
         if args.role in ('actor', 'eval', 'demo') and not loaded.motion_permitted:
             evidence.finish('motion_not_permitted')
             return 2

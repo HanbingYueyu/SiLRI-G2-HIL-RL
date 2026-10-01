@@ -59,6 +59,26 @@ def _learner():
     return learner
 
 
+def test_actor_bc_pretrain_warm_starts_the_actor_only():
+    learner = _learner()
+    learner.ingest([_row(0, human=True), _row(1, human=True)])
+    before_actor = {k: v.clone() for k, v in learner.policy.actor.state_dict().items()}
+    before_critic = {k: v.clone() for k, v in learner.policy.critic_ensemble.state_dict().items()}
+    before_expert = {k: v.clone() for k, v in learner.policy.expert_network.state_dict().items()}
+    assert learner.pretrain_actor_behavior(steps=0) == (0, None)
+    steps, loss = learner.pretrain_actor_behavior(steps=2)
+    assert steps == 2 and loss is not None and torch.isfinite(torch.tensor(loss))
+    assert learner.actor_bc_pretrain_steps == 2
+    assert any(not torch.equal(v, learner.policy.actor.state_dict()[k])
+               for k, v in before_actor.items())
+    assert all(torch.equal(v, learner.policy.critic_ensemble.state_dict()[k])
+               for k, v in before_critic.items())
+    assert all(torch.equal(v, learner.policy.expert_network.state_dict()[k])
+               for k, v in before_expert.items())
+    with pytest.raises(ValueError):
+        learner.pretrain_actor_behavior(steps=-1)
+
+
 def test_duplicate_does_not_mutate_replay_or_update_budget():
     learner = _learner()
     row = _row(human=True)
@@ -66,6 +86,22 @@ def test_duplicate_does_not_mutate_replay_or_update_budget():
     before = learner.snapshot_counts()
     assert learner.ingest([row]).duplicates == 1
     assert learner.snapshot_counts() == before
+
+
+def test_episode_completion_reports_accepted_steps():
+    learner = _learner()
+    progress = []
+    learner.progress = progress.append
+    learner.ingest([_row(0), _row(1)])
+    assert progress == []
+    final = _row(2)
+    final['done'] = True
+    final['complementary_info']['success_label'] = True
+    learner.ingest([final])
+    assert progress[-1]['event'] == 'episode_completed'
+    assert progress[-1]['steps'] == 3
+    assert progress[-1]['episode_id'] == 'ep-1'
+    assert learner._episode_steps == {}
 
 
 def test_episode_checkpoint_and_resume_excludes_demonstrations(tmp_path):
@@ -801,7 +837,8 @@ class _StreamContext:
 
 
 @pytest.mark.parametrize('pending', (False, True))
-def test_stream_cancel_during_wait_or_pending_envelope_stops_without_emit(pending):
+def test_stream_cancel_ends_the_stream_without_stopping_the_learner(pending):
+    """An Actor exit must not kill the Learner: the next Actor reconnects."""
     runtime = replace(_config().runtime, parameter_heartbeat_s=1.)
     learner = RealLearnerRuntime(config=_config(runtime=runtime), run_id='run-1')
     service = GrpcLearnerService(learner)
@@ -825,7 +862,15 @@ def test_stream_cancel_during_wait_or_pending_envelope_stops_without_emit(pendin
     worker.join(2.)
     assert not worker.is_alive()
     assert not emitted
-    assert learner.stopped.is_set()
+    assert not learner.stopped.is_set()
+
+    # A second Actor must still be served the current parameters.
+    service.publish(learner.publish_parameters())
+    again = service.StreamParameters(pb.Empty(), _StreamContext())
+    chunk = next(again)
+    assert chunk.transfer_state == pb.TransferState.TRANSFER_END
+    again.close()
+    assert not learner.stopped.is_set()
 
 
 def test_transition_rpc_failure_wakes_waiting_parameter_stream():

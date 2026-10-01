@@ -81,10 +81,12 @@ def test_pre_reset_main_passes_expanded_limits_only_to_its_own_backend(monkeypat
     monkeypatch.setattr(pre_reset, 'load_training_config',
                         lambda *args, **kwargs: original)
 
-    def create(config, coordinator, *, cli_allow_motion, skip_tf_progress=False):
+    def create(config, coordinator, *, cli_allow_motion, skip_tf_progress=False,
+               skip_state_progress=False):
         seen['backend_config'] = config
         assert cli_allow_motion is True
         assert skip_tf_progress is True
+        assert skip_state_progress is True
         return object()
 
     def run(env, motion, *, start_limits):

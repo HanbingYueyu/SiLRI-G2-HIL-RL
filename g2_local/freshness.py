@@ -10,9 +10,12 @@ import threading
 import time
 from types import MappingProxyType
 
-from .clock_ipc import _snapshot_from_payload
-from .clock_mapping import MAX_DRIFT_PPM, MAX_REPORT_INTEGER, MAX_WALL_JUMP_NS, SOURCES
-from .live_clock import ClockSnapshot
+# Upstream G2 semantics: freshness is "how long has it been since this process
+# received a NEW timestamp from this source".  No robot-clock-to-local-clock
+# mapping is involved, so no PTP client is needed here.
+SOURCES = ('left_wrist', 'right_aux', 'joint', 'tf')
+MAX_WALL_JUMP_NS = 1_000_000
+MAX_REPORT_INTEGER = 2**63 - 1
 
 
 def _finite(value, name, *, positive=False):
@@ -45,7 +48,7 @@ def _pose(value, name):
         raise ValueError(f'{name}: finite XYZ and unit xyzw quaternion required')
 
 
-def _evidence(info, snapshot, now):
+def _evidence(info, now):
     if type(info) is not dict:
         raise ValueError('Observation metadata must be a dict')
     stamps = info['source_timestamp_ns']
@@ -92,17 +95,12 @@ def _evidence(info, snapshot, now):
             info['read_start_wall_ns'] > info['read_end_wall_ns'] or
             info['read_duration_s'] != (end-start)/1e9):
         raise ValueError('Inconsistent read clock evidence')
-    if snapshot is None:
+    if True:
         start_origin = info['read_start_wall_ns']-info['read_start_monotonic_ns']
         end_origin = info['read_end_wall_ns']-info['read_end_monotonic_ns']
         if abs(start_origin-end_origin) > MAX_WALL_JUMP_NS:
             raise ValueError('Read wall-minus-monotonic origin changed within one read')
         return stamps
-    for side in ('start', 'end'):
-        origin = info[f'read_{side}_wall_ns']-info[f'read_{side}_monotonic_ns']
-        if abs(origin-snapshot.wall_minus_mono_ns) > MAX_WALL_JUMP_NS:
-            raise ValueError('Read wall-minus-monotonic origin differs from mapping')
-    return stamps
 
 
 @dataclass(frozen=True)
@@ -162,6 +160,13 @@ class FreshnessLeaseGuard:
                 self.valid_until = self.clock() + self.feedback_lease_s
             return accepted
 
+    def revalidate(self, obs, info):
+        """Recheck an already accepted input without renewing the command lease."""
+        with self.lock:
+            revalidate = getattr(self.observation_guard, 'revalidate', None)
+            return (revalidate(obs, info) if callable(revalidate)
+                    else self.observation_guard(obs, info))
+
     def __call__(self):
         with self.lock:
             return self.valid_until is not None and self.clock() <= self.valid_until
@@ -170,33 +175,28 @@ class FreshnessLeaseGuard:
 class ObservationFreshnessGuard:
     """Serialize checks and commit source progress only on complete acceptance.
 
-    ``client`` is a SnapshotClient (or an offline equivalent with ``read``).
-    Boot/master/session authentication is owned by that client; snapshot shape,
-    lease and successful-observation identity/sequence are rechecked here.
-    Observation shape is owned by MotionBackend. This guard neither changes
-    the observation nor owns/operates any command or stop interface.
+    Freshness is local: the age of a source is how long this process has gone
+    without a *new* timestamp from it, and robot timestamps must still strictly
+    advance.  No clock client is read.  Observation shape is owned by
+    MotionBackend; this guard neither changes the observation nor owns or
+    operates any command or stop interface.
     """
 
-    def __init__(self, client=None, limits: FreshnessLimits = None, *, monotonic_ns=None,
-                 skip_tf_progress=False, local=False):
-        if type(local) is not bool:
-            raise ValueError('local must be boolean')
-        if local:
-            if client is not None:
-                raise ValueError('Local freshness mode does not use a snapshot client')
-        elif not callable(getattr(client, 'read', None)):
-            raise ValueError('A snapshot client is required')
+    def __init__(self, limits: FreshnessLimits = None, *, monotonic_ns=None,
+                 skip_tf_progress=False, skip_state_progress=False):
         if type(limits) is not FreshnessLimits:
             raise ValueError('Explicit FreshnessLimits are required')
-        self._client, self._limits = client, limits
-        self._local = local
+        self._limits = limits
         self._skip_tf_progress = skip_tf_progress
+        # Internal repositioning loops (pre-reset) command far faster than the
+        # robot state topic updates, so a repeated joint/TF timestamp is normal
+        # there; their liveness is still bounded by state_age_s.
+        self._skip_state_progress = skip_state_progress
         self._now = time.monotonic_ns if monotonic_ns is None else monotonic_ns
         if not callable(self._now):
             raise ValueError('A monotonic clock is required')
         self._lock = threading.RLock()
         self._previous_source_ns = {}
-        self._snapshot = None
         self._last_decision = FreshnessDecision('not_checked', 'No observation checked')
 
     @property
@@ -208,37 +208,6 @@ class ObservationFreshnessGuard:
     def last_decision(self):
         with self._lock:
             return self._last_decision
-
-    def _read_mapping(self):
-        try:
-            snapshot = self._client.read()
-        except Exception as error:
-            # Only these explicit transient monitor states are restartable at
-            # startup. Identity/schema/transport failures must not be retried.
-            transient = {'Clock snapshot is unhealthy: warming_up': 'mapping_warming_up',
-                         'Clock snapshot is unhealthy: lease_expired': 'mapping_expired'}
-            if type(error) is ValueError and str(error) in transient:
-                raise _Rejected(transient[str(error)], str(error)) from error
-            raise _Rejected('mapping_unavailable', f'{type(error).__name__}: {error}') from error
-        now = self._now()
-        if type(now) is not int or not 0 < now <= MAX_REPORT_INTEGER:
-            raise _Rejected('mapping_invalid', 'Invalid local monotonic time')
-        if type(snapshot) is not ClockSnapshot:
-            raise _Rejected('mapping_invalid', 'Expected ClockSnapshot')
-        if type(snapshot.valid_until_ns) is int and now > snapshot.valid_until_ns:
-            raise _Rejected('mapping_expired', 'Snapshot lease expired before validation')
-        previous = self._snapshot
-        try:
-            _snapshot_from_payload(
-                asdict(snapshot),
-                expected_master=(previous.expected_master if previous else snapshot.expected_master),
-                previous_sequence=previous.sequence if previous else None,
-                previous_session=previous.session_id if previous else None,
-                received_mono_ns=now,
-            )
-        except (TypeError, ValueError, OverflowError) as error:
-            raise _Rejected('mapping_invalid', str(error)) from error
-        return snapshot, now
 
     def revalidate(self, obs, info):
         """Recheck an already accepted policy input's age without source progress."""
@@ -252,7 +221,7 @@ class ObservationFreshnessGuard:
         """
         with self._lock:
             try:
-                if self._local:
+                if True:
                     now = self._now()
                     _pose(info['motion_pose'], 'motion_pose')
                     start = _timestamp(info['read_start_monotonic_ns'], 'read_start')
@@ -266,36 +235,6 @@ class ObservationFreshnessGuard:
                         if _finite(info[name], name) > getattr(self._limits, name):
                             raise ValueError('stop '+name+' exceeds limit')
                     return True
-                snapshot, now = self._read_mapping()
-                _pose(info['motion_pose'], 'motion_pose')
-                start = _timestamp(info['read_start_monotonic_ns'], 'read_start')
-                wall = _timestamp(info['read_start_wall_ns'], 'read_wall')
-                if not 0 <= now-start <= self._limits.state_age_s*1e9:
-                    raise ValueError('stop feedback read expired')
-                if abs(wall-start-snapshot.wall_minus_mono_ns) > MAX_WALL_JUMP_NS:
-                    raise ValueError('stop feedback clock origin changed')
-                error = (_decimal(snapshot.empirical_error_ns) +
-                         Fraction(max(0, now-snapshot.reference_mono_ns)*MAX_DRIFT_PPM, 1_000_000))
-                if error > _decimal(self._limits.mapping_error_s)*1e9:
-                    raise ValueError('stop mapping error exceeds limit')
-                query = info['tf_queries'][1]
-                if (query['target'], query['source']) != ('arm_l_end_link', 'base_link'):
-                    raise ValueError('stop TF direction mismatch')
-                _pose(query['pose'], 'tf_pose')
-                denominator = 1-_decimal(snapshot.drift_ppm)/1_000_000
-                for name, stamp in (('joint', info['joint_timestamp_ns']), ('tf', query['timestamp_ns'])):
-                    stamp = _timestamp(stamp, name)
-                    center = snapshot.reference_mono_ns + (
-                        stamp-snapshot.wall_minus_mono_ns-snapshot.reference_mono_ns+
-                        _decimal(snapshot.offset_at_reference_ns))/denominator
-                    earliest = center-error/denominator
-                    if earliest > now or now-earliest > _decimal(self._limits.state_age_s)*1e9:
-                        raise ValueError('stop feedback stale or future: '+name)
-                for name in ('tf_position_error_m', 'tf_rotation_error_rad'):
-                    if _finite(info[name], name) > getattr(self._limits, name):
-                        raise ValueError('stop '+name+' exceeds limit')
-                self._snapshot = snapshot
-                return True
             except (_Rejected, KeyError, TypeError, ValueError, OverflowError) as error:
                 raise RuntimeError('Independent stop feedback rejected: '+str(error)) from error
 
@@ -303,18 +242,8 @@ class ObservationFreshnessGuard:
         with self._lock:
             diagnostics = {}
             try:
-                if self._local:
-                    snapshot, now = None, self._now()
-                    error = 0
-                else:
-                    snapshot, now = self._read_mapping()
-                    diagnostics['snapshot_sequence'] = snapshot.sequence
-                    error = (_decimal(snapshot.empirical_error_ns) +
-                             Fraction(max(0, now-snapshot.reference_mono_ns)*MAX_DRIFT_PPM, 1_000_000))
-                    diagnostics['mapping_error_s'] = float(error/1_000_000_000)
-                    if error > _decimal(self._limits.mapping_error_s)*1_000_000_000:
-                        raise _Rejected('mapping_error', 'Extrapolated empirical error exceeds limit')
-                stamps = _evidence(info, snapshot, now)
+                now = self._now()
+                stamps = _evidence(info, now)
                 sent_ns = None
                 if after is not None:
                     _finite(after, 'after')
@@ -323,7 +252,7 @@ class ObservationFreshnessGuard:
                     if sent_ns > now:
                         raise ValueError('after is later than local monotonic time')
                 intervals, ages = {}, {}
-                if self._local:
+                if True:
                     changed = info['source_changed_monotonic_ns']
                     if type(changed) is not dict or set(changed) != set(SOURCES):
                         raise ValueError('Exactly four source receipt times required')
@@ -333,17 +262,6 @@ class ObservationFreshnessGuard:
                             raise ValueError('Source receipt time is not in the past')
                         intervals[source] = (receipt, receipt)
                         ages[source] = (now-receipt, now-receipt)
-                for source in (() if self._local else SOURCES):
-                    # Snapshot offset is wall-minus-raw-PTP: ClockWindow already
-                    # subtracts the 37-second correction. Invert its affine model
-                    # source = origin + t - offset_ref - drift*(t-reference).
-                    delta = (stamps[source]-snapshot.wall_minus_mono_ns-
-                             snapshot.reference_mono_ns)
-                    center = (snapshot.reference_mono_ns +
-                              (delta+_decimal(snapshot.offset_at_reference_ns))/denominator)
-                    radius = error/denominator
-                    intervals[source] = (center-radius, center+radius)
-                    ages[source] = (now-center-radius, now-center+radius)
                 diagnostics['source_intervals_ns'] = MappingProxyType({
                     key: (math.floor(lo), math.ceil(hi)) for key, (lo, hi) in intervals.items()})
                 diagnostics['age_intervals_s'] = MappingProxyType({
@@ -363,6 +281,8 @@ class ObservationFreshnessGuard:
                 diagnostics['camera_skew_s'] = float(skew/1_000_000_000)
                 for source in SOURCES:
                     if source == 'tf' and self._skip_tf_progress:
+                        continue
+                    if source in ('joint', 'tf') and self._skip_state_progress:
                         continue
                     previous = self._previous_source_ns.get(source)
                     if check_progress and previous is not None and stamps[source] <= previous:
@@ -389,6 +309,5 @@ class ObservationFreshnessGuard:
                 return False
             if check_progress:
                 self._previous_source_ns = stamps
-            self._snapshot = snapshot
             self._last_decision = decision
             return True

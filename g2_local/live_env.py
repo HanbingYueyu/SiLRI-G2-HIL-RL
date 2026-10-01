@@ -9,10 +9,16 @@ from copy import deepcopy
 from pathlib import Path
 import logging
 
-from .clock_ipc import SnapshotClient
 from .config import HingeInsertTaskConfig
 from .env import G2LocalEnv
 from .freshness import FreshnessLimits, ObservationFreshnessGuard
+
+
+class _NoClock:
+    """No clock process: freshness is measured from local receipt times."""
+
+    def close(self):
+        return None
 from .gdk_backend import GdkReader
 
 
@@ -117,15 +123,12 @@ def create_g2_env(*, clock_socket, expected_master, limits: FreshnessLimits,
     if type(image_size) is not int or image_size <= 0:
         raise ValueError('image_size must be a positive integer')
 
-    make_client = client_factory or (
-        lambda **kwargs: SnapshotClient(
-            Path(kwargs['clock_socket']), timeout_s=kwargs['timeout_s'],
-            expected_master=kwargs['expected_master']))
+    make_client = client_factory or (lambda **kwargs: _NoClock())
     make_reader = reader_factory or (
         lambda **kwargs: GdkReader(adapter_root=kwargs['adapter_root'],
                                    timeout_s=kwargs['timeout_s']))
     make_guard = guard_factory or (lambda client, limits:
-                                   ObservationFreshnessGuard(client, limits))
+                                   ObservationFreshnessGuard(limits))
 
     client = reader = backend = None
     try:

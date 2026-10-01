@@ -15,11 +15,9 @@ import torch
 from scipy.spatial.transform import Rotation
 
 from g2_local.config import HingeInsertTaskConfig
-from g2_local.clock_mapping import PTP_LEASE_NS
 from g2_local.contract import EpisodeContext
 from g2_local.env import SyntheticBackend
 from g2_local.freshness import FreshnessLimits
-from g2_local.live_clock import ClockSnapshot
 from g2_local.motion_env import MotionFactories, create_motion_env
 from g2_local.real_actor import GrpcActorTransport, RealActorRuntime
 from g2_local.real_episode import RealEpisodeCoordinator
@@ -324,8 +322,7 @@ class FormalRig:
                     self.ports.append(self.command_port)
                     return self.command_port
 
-                def make_clock(socket, master):
-                    assert (socket, master) == (FakeCommissioning.clock_socket, MASTER)
+                def make_clock(*args, **kwargs):
                     return clock
 
                 def make_reader(**kwargs):
@@ -455,7 +452,7 @@ def test_formal_actor_learner_path_updates_and_resumes_without_synthetic_backend
     assert len(resumed.learner.records) == 5
 
 
-@pytest.mark.parametrize('fault', ('clock_expired', 'hid_unplug', 'learner_disconnect',
+@pytest.mark.parametrize('fault', ('hid_unplug', 'learner_disconnect',
                                    'command_timeout', 'successor_stale', 'evidence_write'))
 def test_fault_matrix_is_fail_closed_and_never_reuses_backend(tmp_path, fault):
     rig = formal_runtime_rig(tmp_path / fault, fault=fault)
@@ -463,7 +460,7 @@ def test_fault_matrix_is_fail_closed_and_never_reuses_backend(tmp_path, fault):
         rig.run()
     assert rig.stop_attempted is True
     assert rig.backend_constructions == 1
-    if fault not in ('clock_expired', 'hid_unplug'):
+    if fault != 'hid_unplug':
         assert rig.ports[0].stop_calls > 0
     assert rig.hardware_imports == []
     assert all(reader.closed for reader in rig.readers)
@@ -483,12 +480,7 @@ def test_fault_matrix_is_fail_closed_and_never_reuses_backend(tmp_path, fault):
         error_chain.append(f'{type(error).__name__}: {error}')
         error = error.__cause__ or error.__context__
     error_text = '\n'.join(error_chain).lower()
-    if fault == 'clock_expired':
-        # Local freshness: the same injected staleness is now rejected by the
-        # observation's receipt age, with no clock mapping involved.
-        assert rig.freshness_guard.last_decision.code == 'camera_stale:left_wrist'
-        expected_commands = 0
-    elif fault == 'hid_unplug':
+    if fault == 'hid_unplug':
         assert rig.hid.unplug_triggered is True
         assert 'isolated hid unplug' in error_text
         expected_commands = 0

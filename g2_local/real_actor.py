@@ -18,6 +18,7 @@ from typing import Mapping
 import numpy as np
 import torch
 
+from .console import RateLimit, say
 from .contract import CAMERA_KEYS, EpisodeContext, vector
 from .policy import create_policy
 
@@ -295,7 +296,10 @@ class GrpcActorTransport:
 
     def assert_alive(self):
         if self.error is not None:
-            raise RuntimeError('Learner transport failed') from self.error
+            # Keep the cause in the text: this reaches the operator terminal
+            # through a generic handler that prints only the message.
+            raise RuntimeError(f'Learner transport failed: '
+                               f'{type(self.error).__name__}: {self.error}') from self.error
         if self.stopped.is_set():
             raise ConnectionError('Learner transport stopped')
 
@@ -394,7 +398,11 @@ class RealActorRuntime:
                     for k, target in expected.items())):
                 raise ValueError('Actor parameter shape or dtype mismatch')
             self.policy.actor.load_state_dict(actual, strict=True)
+            first = self.parameter_version < 0
             self.parameter_version = envelope.version
+            if first:
+                say(f'已收到 Learner 策略参数：version=v{envelope.version}；'
+                    'Actor 继续等待场景复位写入 EpisodeContext。')
         elif (set(envelope.actor_state) != set(self.policy.actor.state_dict()) or
               any(not torch.equal(envelope.actor_state[k].cpu(), value.detach().cpu())
                   for k, value in self.policy.actor.state_dict().items())):
@@ -468,6 +476,10 @@ class RealActorRuntime:
                                self.interventions, self.parameter_version,
                                self.stop_reason)
 
+    def _context_window_text(self):
+        window = getattr(self.config.runtime, 'context_max_age_s', None)
+        return f'{window:.0f} 秒' if isinstance(window, (int, float)) else '限定的时效'
+
     def _automatic_reset(self, reference, previous_context):
         from .auto_reset import run_reset
         def poll():
@@ -492,11 +504,22 @@ class RealActorRuntime:
         self._env = env
         try:
             self._emit('reset_started', previous_episode_id=previous_context.episode_id)
+            auto = getattr(getattr(self.config, 'motion', None), 'auto_reset', None)
+            lift = getattr(auto, 'lift_m', None)
+            limit = getattr(auto, 'timeout_s', None)
+            lift = (f'抬升 {lift * 100.:.0f} cm 后'
+                    if isinstance(lift, (int, float)) else '')
+            limit = (f'（{limit:.0f} 秒上限）'
+                     if isinstance(limit, (int, float)) else '')
+            say(f'开始自动归位：{lift}直线回到本回合起始位姿{limit}；'
+                '过程中请不要碰 SpaceMouse、不要按键，否则会取消复位。')
             # run_reset closes resources before any new context becomes eligible.
             run_reset(env, reference, self.config.motion, poll=poll, emit=self._emit)
         finally:
             env.close()
         self._env = None
+        say(f'自动归位完成，下一回合 context 已备好；请在 '
+            f'{self._context_window_text()}内按住双键再全部松开。')
         context = replace(previous_context, episode_id='auto-'+uuid.uuid4().hex,
                           approach_source='automatic_lift_return',
                           visual_reset_monotonic_ns=None, visual_confidence=None,
@@ -535,12 +558,18 @@ class RealActorRuntime:
         episode_start_pose = None
         primary_error = None
         pending = None
+        episode_steps = 0
+        episode_interventions = 0
+        waiting_context = RateLimit(10.)
+        waiting_reminder = RateLimit(60.)
+        waiting_announced = False
+        heartbeat = RateLimit(2.)
         def upload(row):
             self.transport.send_transition_batch((row,))
             self.transitions_sent += 1
             self.interventions += int(row['complementary_info']['is_intervention'])
-        def finish_episode(token, context, truncated, *, labeled=False):
-            nonlocal env, previous_step_at
+        def finish_episode(token, context, truncated, *, labeled=False, success=None):
+            nonlocal env, previous_step_at, episode_steps, episode_interventions
             self.episodes_completed += 1
             previous_step_at = None
             if truncated and self.coordinator.running:
@@ -550,13 +579,21 @@ class RealActorRuntime:
             self._env = None
             self.current_observation = None
             completed_env.close()
+            outcome = ('成功' if success is True else '失败' if success is False
+                       else '截断' if truncated else '未标注')
+            say(f'回合 #{self.episodes_completed} 结束：steps={episode_steps} 结果={outcome} '
+                f'人工接管={episode_interventions}/{episode_steps} 已提交转移={self.transitions_sent}')
+            episode_steps = 0
+            episode_interventions = 0
             reset_config = getattr(getattr(self.config, 'motion', None), 'auto_reset', None)
             if reset_config is not None and reset_config.enabled:
+                say('自动复位已启用：抬升后回到本回合起始位姿，不调用上游视觉复位。')
                 self._automatic_reset(episode_start_pose, context)
             if self.exit_after_labeled_demo and labeled:
                 self.stop('demo_labeled')
         def interrupt_camera_episode(error, token=None):
-            nonlocal env, pending, previous_step_at, episode_start_pose
+            nonlocal env, pending, previous_step_at, episode_start_pose, episode_steps
+            nonlocal episode_interventions
             from .gdk_backend import CameraUnavailable
             is_camera_freshness_error = getattr(error, 'code', None) in (
                 'camera_stale:left_wrist', 'camera_stale:right_aux', 'camera_skew')
@@ -597,8 +634,10 @@ class RealActorRuntime:
                 previous_step_at = None
                 episode_start_pose = None
             self.interrupted_episodes = getattr(self, 'interrupted_episodes', 0) + 1
-            print('相机观测中断：已确认测量保持，当前回合已截断；Actor继续运行，等待现场复位并提交新的 EpisodeContext。',
-                  flush=True)
+            episode_steps = 0
+            episode_interventions = 0
+            say('相机观测中断：已确认测量保持，当前回合已截断；Actor 继续运行，'
+                '等待现场复位并提交新的 EpisodeContext 后再按双键开始。')
             return True
         def terminal_before_next_action(forced=None):
             nonlocal pending
@@ -622,7 +661,7 @@ class RealActorRuntime:
                        attribution='previous_successor_before_next_action')
             upload(row)
             pending = None
-            finish_episode(token, context, False, labeled=True)
+            finish_episode(token, context, False, labeled=True, success=label == 'success')
             return True
         try:
             while not self.stop_event.is_set():
@@ -640,13 +679,32 @@ class RealActorRuntime:
                             if not isinstance(context, EpisodeContext):
                                 raise ValueError('EpisodeContext required')
                             self.coordinator.offer_context(context)
+                            waiting_announced = False
+                            say(f'已读取 EpisodeContext：{context.episode_id}；'
+                                f'请确认现场已复位，并在 {self._context_window_text()}内'
+                                '按住双键再全部松开。')
+                        elif waiting_context.due():
+                            # Announce the actionable hint once, then stay quiet
+                            # apart from a slow reminder: this state can last
+                            # minutes while the operator resets the scene.
+                            path = getattr(self.context_source, 'path', None)
+                            if not waiting_announced:
+                                waiting_announced = True
+                                say(f'等待下一回合的 EpisodeContext：{path}')
+                                say('现场复位后执行 '
+                                    'bash run_g2_python.sh scripts/start_training_actor.py --write-context '
+                                    f'写入新 context，再在 {self._context_window_text()}内按住双键；'
+                                    '或者 Ctrl+C 退出 Actor 后重新启动。')
+                            elif waiting_reminder.due():
+                                say(f'仍在等待新的 EpisodeContext：{path}')
                     if self.coordinator.context is not None:
                         # The chord reader consumes a freshly polled HID frame.
                         self.coordinator.intervention()
                         if self.coordinator.observe_start_frame():
                             context = self.coordinator.context
-                            if self.demonstration:
-                                print('双键已识别，正在连接观测与运动后端...', flush=True)
+                            say(f'双键已识别：第 {self.episodes_completed + 1} 个回合开始 '
+                                f'（episode_id={context.episode_id}）'
+                                + ('，正在连接观测与运动后端…' if self.demonstration else '。'))
                             env = self.env_factory(self.config, self.coordinator)
                             self._env = env
                             try:
@@ -671,7 +729,7 @@ class RealActorRuntime:
                                 raise
                             episode_start_pose = tuple(self.current_observation['state'])
                             if self.demonstration:
-                                print('人工采集已开始：SpaceMouse 控制，Y 成功 / F 失败。', flush=True)
+                                say('人工采集已开始：SpaceMouse 控制，Y 成功 / F 失败。')
                             _policy_observation(self.current_observation, 'cpu',
                                                 self.config.observation.image_size)
                     time.sleep(self.config.runtime.operator_poll_interval_s)
@@ -741,13 +799,21 @@ class RealActorRuntime:
                                read_monotonic_ns=getattr(self.coordinator, 'last_terminal_read_ns', None),
                                attribution='during_command_or_successor_read')
                 completed += 1
+                episode_steps += 1
+                episode_interventions += int(info.get('is_intervention') is True)
+                if heartbeat.due():
+                    say(f'回合 #{self.episodes_completed + 1} 进行中：step={episode_steps} '
+                        f'人工接管={episode_interventions} '
+                        f'推理={inference_latency_s * 1000:.1f}ms')
                 self.current_observation = after
                 if terminated or truncated:
                     upload(row)
                     finish_episode(
                         token, context, truncated,
                         labeled=(row['complementary_info'].get('success_label')
-                                 in (True, False)))
+                                 in (True, False)),
+                        success=(row['complementary_info'].get('success_label')
+                                 if terminated else None))
                 else:
                     pending = (row, token, context)
                 if max_completed_steps is not None and completed >= max_completed_steps:

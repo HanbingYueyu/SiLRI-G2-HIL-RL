@@ -25,19 +25,11 @@ def test_persistent_checkpoint_prefers_saved_state_and_refuses_missing_seed(tmp_
     assert source == target == again
 
 
-def test_clock_endpoint_override_preserves_contract_and_never_grants_motion(tmp_path):
-    from g2_local.training_config import load_training_config
-    loaded = load_training_config(_config(tmp_path), cli_allow_motion=False)
-    args = SimpleNamespace(role='actor', clock_socket=Path('/tmp/new-clock/clock.sock'))
-    updated = real_train.with_clock_endpoint(args, loaded)
-    assert updated.commissioning.clock_socket == args.clock_socket
-    assert updated.config_hash == loaded.config_hash
-    assert updated.canonical_payload == loaded.canonical_payload
-    assert updated.motion_permitted is False
-    assert loaded.commissioning.clock_socket != args.clock_socket
-    args.role = 'learner'
-    with pytest.raises(ValueError, match='clock'):
-        real_train.with_clock_endpoint(args, loaded)
+def test_clock_endpoint_is_no_longer_a_cli_option(tmp_path):
+    """The PTP clock layer is gone; the flag must not come back silently."""
+    from g2_local import real_train as module
+    options = {action.dest for action in module.parser()._actions}
+    assert 'clock_socket' not in options
 
 
 @pytest.mark.parametrize('key,error', [('Y', None), ('F', RuntimeError), ('Y', KeyboardInterrupt)])

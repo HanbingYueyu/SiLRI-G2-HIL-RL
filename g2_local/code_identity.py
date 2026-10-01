@@ -22,6 +22,20 @@ def source_digest(root):
     return digest.hexdigest()
 
 
+def identity_mismatch_detail(path, stored, current):
+    """Operator-facing evidence for a refused checkpoint resume.
+
+    Every ``g2_local/*.py`` edit changes the digest, including display-only
+    ones, so the message must name the file and both digests before an operator
+    decides between rebuilding the seed and migrating explicitly.
+    """
+    def digest(value):
+        return value.get('source_sha256') if isinstance(value, dict) else None
+    return (f'checkpoint={Path(path).resolve()} '
+            f'stored_source_sha256={digest(stored)} '
+            f'current_source_sha256={digest(current)}')
+
+
 def algorithm_identity(device):
     import draccus
     from .policy import create_policy_config

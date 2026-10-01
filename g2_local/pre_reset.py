@@ -123,7 +123,7 @@ def main(argv=None):
                                       intervention=None)
         env = create_motion_env(reset_config, coordinator,
                                 cli_allow_motion=args.allow_motion,
-                                skip_tf_progress=True)
+                                skip_tf_progress=True, skip_state_progress=True)
         print(f'仅本次预复位使用 Y≤{RESET_Y_HIGH_M:.2f} m、'
               f'Z≤{RESET_Z_HIGH_M:.2f} m；采集/训练边界不变。', flush=True)
         run_pre_reset(env, reset_config.motion, start_limits=config.motion.limits)

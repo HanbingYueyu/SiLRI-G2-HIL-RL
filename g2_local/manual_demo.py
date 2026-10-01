@@ -1,4 +1,4 @@
-"""Operator-launched human demo driven by a separately running clock monitor."""
+"""Operator-launched human demonstration; no clock process is involved."""
 import json
 from pathlib import Path
 import re
@@ -78,7 +78,8 @@ def run(*, root=None, demo_main=None, command_runner=None):
     try:
         if demo_main is None:
             from .real_train import main as demo_main
-        print('时钟已就绪，直接等待双键开始；请保持夹持起点，并确保上游运动程序已退出。', flush=True)
+        print('等待双键开始；请保持夹持起点，并确保上游运动程序已退出。'
+              '（SpaceMouse 独占锁：采集与上游复位程序不能同时运行。）', flush=True)
         context_path = session / 'context.json'
         context = dict(episode_id=run_id+'-ep1', target_offset_m=[0., 0., 0.],
                        ee_reset_offset=[0.]*6,

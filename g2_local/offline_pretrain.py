@@ -34,12 +34,17 @@ def main():
     parser.add_argument('--runtime-root', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--updates', type=int, default=10)
+    parser.add_argument('--actor-bc-steps', type=int, default=1000,
+                        help='Behaviour-cloning steps that warm-start the Actor from the '
+                             'demonstrations before any online episode (0 disables)')
     parser.add_argument('--accept-motion-profile', action='store_true',
                         help='Use the exact future Actor profile offline; never grants motion')
     args = parser.parse_args()
     config = load_offline_config(args.config, accept_motion_profile=args.accept_motion_profile)
     if args.updates <= 0:
         raise ValueError('Read-only configuration and positive update count required')
+    if not 0 <= args.actor_bc_steps <= 100_000:
+        raise ValueError('Actor BC steps must be in 0..100000')
     args.output.mkdir(mode=0o700, exist_ok=False)
     class Evidence:
         def event(self, event, **values):
@@ -82,6 +87,15 @@ def main():
     assert learner.pretrain_behavior()
     assert before_expert != digest(learner.policy.expert_network)
     evidence.event('pretrain_complete', counts=learner.snapshot_counts(), loss=learner.beta_last_loss)
+    if args.actor_bc_steps:
+        # Warm-start the Actor from the demonstrations: without this the Actor
+        # starts near its random initialisation and every early episode is pure
+        # human takeover.
+        bc_steps, bc_loss = learner.pretrain_actor_behavior(steps=args.actor_bc_steps)
+        evidence.event('actor_bc_pretrain_complete', steps=bc_steps, loss=bc_loss,
+                       requested_steps=args.actor_bc_steps,
+                       batch_size=config.optimization.human_batch_size)
+    assert before_actor != digest(learner.policy.actor)
     for index in range(args.updates):
         metrics = learner.update_once()
         if metrics is None:
@@ -94,6 +108,8 @@ def main():
     checkpoint = args.output / 'checkpoint.pt'
     evidence.event('checkpoint_saving', counts=expected)
     learner.save_checkpoint(checkpoint)
+    bc_summary = dict(actor_bc_pretrain_steps=learner.actor_bc_pretrain_steps,
+                      actor_bc_last_loss=learner.actor_bc_last_loss)
     del learner
     gc.collect()
     torch.cuda.empty_cache()
@@ -108,7 +124,7 @@ def main():
     evidence.event('restore_and_update_passed', counts=restored.snapshot_counts(), metrics=metrics,
                    saved_checkpoint_updates=args.updates, motion_authorized=False)
     with (args.output / 'result.json').open('x') as stream:
-        json.dump(dict(status='passed', episodes=episodes, steps=steps,
+        json.dump(dict(status='passed', episodes=episodes, steps=steps, **bc_summary,
                        checkpoint=str(checkpoint.resolve()), saved_counts=expected,
                        restored_counts=restored.snapshot_counts(), motion_authorized=False), stream, indent=2)
 

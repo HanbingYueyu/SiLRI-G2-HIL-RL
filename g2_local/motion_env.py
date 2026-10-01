@@ -17,18 +17,14 @@ class MotionFactories:
     @staticmethod
     def production():
         # The SDK import stays behind the complete permission and evidence gates.
-        from .clock_ipc import SnapshotClient
         from .gdk_backend import GdkCommandPort, GdkReader
-
-        def clock_client(socket, master):
-            return SnapshotClient(socket, timeout_s=2., expected_master=master)
 
         def command_port(controller, **kwargs):
             from .safe_stop import prepare_safe_stop
             request = prepare_safe_stop(controller.robot, kwargs['expected_mode'])
             return GdkCommandPort(controller, safe_stop_request=request, **kwargs)
 
-        return MotionFactories(clock_client, GdkReader, command_port)
+        return MotionFactories(_LocalClock, GdkReader, command_port)
 
 
 class OwnedObservationSource:
@@ -71,13 +67,18 @@ class OwnedObservationSource:
 
 
 class _LocalClock:
-    """No clock process: freshness comes from local receipt times.
+    """Closable placeholder: freshness comes from local receipt times.
 
     Upstream G2 flow never converts robot timestamps into local time; it asks
     how long this process has gone without a new frame.  Real time
     synchronisation stays the operator's job (`ptp_hard.sh`), used for logging
     and the GDK latency APIs, and is not needed for this check.
     """
+
+    def __init__(self, *_args, **_kwargs):
+        # Used through the MotionFactories clock_client seam; it accepts and
+        # ignores the legacy (socket, master) arguments.
+        return None
 
     def close(self):
         return None
@@ -111,7 +112,7 @@ def _preflight_mode(controller, expected_mode):
 
 
 def create_motion_env(config, coordinator, *, cli_allow_motion, factories=None,
-                      skip_tf_progress=False) -> G2LocalEnv:
+                      skip_tf_progress=False, skip_state_progress=False) -> G2LocalEnv:
     if (type(cli_allow_motion) is not bool or cli_allow_motion is not True or
             config.requested_motion is not True or config.motion_permitted is not True):
         raise PermissionError('commissioned motion permission is required')
@@ -127,8 +128,7 @@ def create_motion_env(config, coordinator, *, cli_allow_motion, factories=None,
     # Freshness is local (see _LocalClock): nothing reads a clock in this
     # process.  The legacy client factory stays only as the lifetime seam that
     # owns reader/client teardown together.
-    client = factories.clock_client(config.commissioning.clock_socket,
-                                    config.commissioning.expected_master)
+    client = factories.clock_client(None, None)
     source = None
     port = None
     backend = None
@@ -138,15 +138,16 @@ def create_motion_env(config, coordinator, *, cli_allow_motion, factories=None,
                                   allow_motion=True)
         source = OwnedObservationSource(reader, client)
         _preflight_mode(source.controller, config.motion.control_mode)
-        observation_guard = (ObservationFreshnessGuard(None, config.freshness, local=True,
-                             skip_tf_progress=True) if skip_tf_progress else
-                             ObservationFreshnessGuard(None, config.freshness, local=True))
+        observation_guard = ObservationFreshnessGuard(
+            config.freshness, skip_tf_progress=skip_tf_progress,
+            skip_state_progress=skip_state_progress)
         lease = FreshnessLeaseGuard(observation_guard,
                                     feedback_lease_s=(config.motion.command_timeout_s +
                                                       config.motion.send_timeout_s))
         stop_options = {}
         if callable(getattr(reader, 'read_stop_feedback', None)):
-            stop_guard = ObservationFreshnessGuard(None, config.freshness, local=True)
+            stop_guard = ObservationFreshnessGuard(
+                config.freshness, skip_state_progress=skip_state_progress)
             def stop_pose_provider():
                 # Do not race an SDK read or release its resources under a hold.
                 if backend is None or not backend.reader_lock.acquire(

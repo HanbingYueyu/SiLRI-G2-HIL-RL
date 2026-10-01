@@ -240,12 +240,16 @@ class RealLearnerRuntime:
         self.accepted_transitions = 0
         self.update_count = 0
         self.completed_episode_ids = set()
+        # Steps accepted for the currently open episode, dropped at its end.
+        self._episode_steps = {}
         self.progress = None
         self.beta_pretrain_completed = 0
         self.beta_update_count = 0
         self.human_transitions_total = 0
         self.beta_last_human_count = 0
         self.beta_last_loss = None
+        self.actor_bc_pretrain_steps = 0
+        self.actor_bc_last_loss = None
         self.imported_demo_episodes = set()
         self._interaction_budget = 0
         self.publish = publish
@@ -287,6 +291,7 @@ class RealLearnerRuntime:
             new = set()
             previous_episodes = len(self.completed_episode_ids)
             accepted = duplicates = 0
+            finished = []
             for identity, training, record in prepared:
                 if identity in self.seen_transition_ids or identity in new:
                     duplicates += 1
@@ -298,16 +303,28 @@ class RealLearnerRuntime:
                 self.seen_transition_ids.add(identity)
                 new.add(identity)
                 self.records.append(record)
+                episode_id = record['complementary_info']['episode_id']
+                steps = self._episode_steps.get(episode_id, 0) + 1
+                if training['done'] or training['truncated']:
+                    # The episode is closed: report its length once and forget it,
+                    # so the open-episode map stays bounded by live episodes.
+                    self._episode_steps.pop(episode_id, None)
+                    finished.append((episode_id, steps))
+                else:
+                    self._episode_steps[episode_id] = steps
                 if count_episodes and (training['done'] or training['truncated']):
-                    self.completed_episode_ids.add(record['complementary_info']['episode_id'])
+                    self.completed_episode_ids.add(episode_id)
                 accepted += 1
             self.accepted_transitions += accepted
             if grant_interaction_credit:
                 self._interaction_budget += accepted * self.config.optimization.utd_ratio
             completed = len(self.completed_episode_ids)
             if completed != previous_episodes and self.progress is not None:
-                self.progress(dict(event='episode_completed', completed_episodes=completed,
-                                   next_episode=completed+1, learner_update=self.update_count))
+                payload = dict(event='episode_completed', completed_episodes=completed,
+                               next_episode=completed+1, learner_update=self.update_count)
+                if finished:
+                    payload['episode_id'], payload['steps'] = finished[-1]
+                self.progress(payload)
             interval = self.config.optimization.episode_checkpoint_interval
             if self.checkpoint_path is not None and completed//interval > previous_episodes//interval:
                 self.save_checkpoint(self.checkpoint_path)
@@ -370,6 +387,40 @@ class RealLearnerRuntime:
                 self.beta_pretrain_completed += 1
             self.beta_last_human_count = baseline_count
             return True
+
+    def pretrain_actor_behavior(self, *, steps):
+        """Warm-start the Actor by imitating the demonstrated human actions.
+
+        Off-policy Actor learning from a tiny success reward leaves the Actor
+        near its random initialisation for many episodes, which shows up as
+        almost constant human takeover. A behaviour-cloning pass on the imported
+        demonstrations (``actor_bc`` = maximize the log-likelihood of the human
+        action) gives the Actor a sensible starting policy; the Lagrangian
+        constraint then keeps it near the expert while RL improves it.
+        """
+        if type(steps) is not int or not 0 <= steps <= 100_000:
+            raise ValueError('Actor BC steps must be an integer in 0..100000')
+        opt = self.config.optimization
+        completed = 0
+        last_loss = None
+        with self._update_lock:
+            with self._lock:
+                if len(self.human_replay) < opt.human_batch_size:
+                    return 0, None
+            for _ in range(steps):
+                if self.stopped.is_set():
+                    raise LearnerStopped('Learner stopped during Actor BC pretraining')
+                with self._lock:
+                    data = self.human_replay.sample(opt.human_batch_size)
+                if not bool(data['complementary_info']['is_intervention'].any()):
+                    # train_batch would skip the step; count only real steps.
+                    continue
+                metrics = train_batch(self.policy, self.optimizers, data, ('actor_bc',))
+                last_loss = metrics['actor_bc']
+                completed += 1
+        self.actor_bc_pretrain_steps += completed
+        self.actor_bc_last_loss = last_loss
+        return completed, last_loss
 
     def update_once(self):
         with self._update_lock:
@@ -519,8 +570,14 @@ def load_checkpoint(path: Path, *, expected_run_id: str, expected_config_hash: s
         optimization=OptimizationConfig(**payload['optimization']),
         runtime=RuntimeConfig(**payload['runtime']),
         config_hash=expected_config_hash)
-    if payload.get('algorithm_identity') != algorithm_identity(config.runtime.device):
-        raise ValueError('Algorithm code/version identity mismatch; explicit migration required')
+    current_identity = algorithm_identity(config.runtime.device)
+    if payload.get('algorithm_identity') != current_identity:
+        from .code_identity import identity_mismatch_detail
+        raise ValueError(
+            'Algorithm code/version identity mismatch; explicit migration required. '
+            + identity_mismatch_detail(path, payload.get('algorithm_identity'), current_identity)
+            + '; rebuild the seed with g2_local.offline_pretrain after freezing the code, '
+              'or migrate this checkpoint explicitly')
     learner = RealLearnerRuntime(config=config, run_id=expected_run_id,
                                  manifest_digest=payload['manifest_digest'])
     learner.policy.load_state_dict(payload['policy'], strict=True)
@@ -632,6 +689,11 @@ class GrpcLearnerService(rpc.LearnerServiceServicer):
             if self.learner.stopped.is_set():
                 raise LearnerStopped('Learner stopped')
             self._latest = envelope
+            self._condition.notify_all()
+
+    def _wake_stream(self):
+        """Client disconnect: wake the waiting stream, never stop the Learner."""
+        with self._condition:
             self._condition.notify_all()
 
     def _stop(self):
@@ -753,39 +815,42 @@ class GrpcLearnerService(rpc.LearnerServiceServicer):
     def StreamParameters(self, request, context):  # noqa: N802
         heartbeat = self.learner.config.runtime.parameter_heartbeat_s
         last_sequence = -1
-        try:
-            if hasattr(context, 'add_callback'):
-                context.add_callback(self._stop)
-            while context.is_active() and not self.learner.stopped.is_set():
-                with self._condition:
-                    self._condition.wait_for(
-                        lambda: self.learner.stopped.is_set() or
-                        not context.is_active() or
-                        (self._latest is not None and
-                         self._latest.message_sequence > last_sequence),
-                        timeout=heartbeat)
-                    if self.learner.stopped.is_set() or not context.is_active():
-                        return
-                    if self._latest is not None and self._latest.message_sequence > last_sequence:
-                        envelope = self._latest
-                    else:
-                        envelope = None
-                if envelope is None:
-                    envelope = self.learner.heartbeat_parameters()
+        # A client disconnect only ends this stream: wake it now, but keep the
+        # Learner alive so the next Actor can reconnect. The SpaceMouse is an
+        # exclusive lock, so one Actor process per episode is normal, and
+        # stopping the Learner on every Actor exit used to cost a 4 GB save plus
+        # reload per episode. The Learner still stops on Ctrl+C, on an ingest
+        # protocol failure and when the optimizer fails.
+        if hasattr(context, 'add_callback'):
+            context.add_callback(self._wake_stream)
+        while context.is_active() and not self.learner.stopped.is_set():
+            with self._condition:
+                self._condition.wait_for(
+                    lambda: self.learner.stopped.is_set() or
+                    not context.is_active() or
+                    (self._latest is not None and
+                     self._latest.message_sequence > last_sequence),
+                    timeout=heartbeat)
                 if self.learner.stopped.is_set() or not context.is_active():
                     return
-                with self._condition:
-                    last_sequence = envelope.message_sequence
-                payload = dict(run_id=envelope.run_id, config_hash=envelope.config_hash,
-                               version=envelope.version,
-                               message_sequence=envelope.message_sequence,
-                               actor_state=envelope.actor_state)
-                for chunk in send_bytes_in_chunks(state_to_bytes(payload), pb.Parameters):
-                    if self.learner.stopped.is_set() or not context.is_active():
-                        return
-                    yield chunk
-        finally:
-            self._stop()
+                if self._latest is not None and self._latest.message_sequence > last_sequence:
+                    envelope = self._latest
+                else:
+                    envelope = None
+            if envelope is None:
+                envelope = self.learner.heartbeat_parameters()
+            if self.learner.stopped.is_set() or not context.is_active():
+                return
+            with self._condition:
+                last_sequence = envelope.message_sequence
+            payload = dict(run_id=envelope.run_id, config_hash=envelope.config_hash,
+                           version=envelope.version,
+                           message_sequence=envelope.message_sequence,
+                           actor_state=envelope.actor_state)
+            for chunk in send_bytes_in_chunks(state_to_bytes(payload), pb.Parameters):
+                if self.learner.stopped.is_set() or not context.is_active():
+                    return
+                yield chunk
 
     def Ready(self, request, context):  # noqa: N802
         return pb.Empty()
