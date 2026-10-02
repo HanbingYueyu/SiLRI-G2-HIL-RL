@@ -17,19 +17,42 @@ from .training_config import load_training_config
 
 LIFT_M = .05
 SHIFT_Y_M = .10
-RESET_Y_HIGH_M = .28
-RESET_Z_HIGH_M = 1.00
+# Tolerance so a start pose exactly on the workspace edge can still complete the
+# full retraction (floating-point and controller settling).
+RESET_MARGIN_M = .005
 RESET_LINEAR_SPEED_M_S = .04
+
+
+def reset_only_high(motion):
+    """Reset-only ceilings: the configured workspace plus exactly this retraction.
+
+    The +Z 50 mm / +Y 100 mm motion is fixed, slow (40 mm/s) and scoped to the
+    reset; deriving its ceiling from the *approved* workspace means any start
+    pose that is valid for the demonstration/training workspace can finish it.
+    Fixed 0.28/1.00 ceilings used to refuse any start within 65 mm (Y) or 15 mm
+    (Z) of the workspace edge, which blocked domain-randomized start poses:
+
+        y=0.183 + 0.100 = 0.283 > 0.280  ->  ValueError, no visual reset
+
+    Derived values for the current workspace (high = 0.6665, 0.2451, 0.965):
+    Y = 0.2451 + 0.105 = 0.3501 m, Z = 0.965 + 0.055 = 1.020 m. The normal
+    command path still uses the unchanged workspace limits; only this
+    reset-scoped motion sees the wider ceiling.
+    """
+    high = motion.limits.workspace_high
+    return (high[0], high[1] + SHIFT_Y_M + RESET_MARGIN_M,
+            high[2] + LIFT_M + RESET_MARGIN_M)
 
 
 def reset_only_config(config):
     """Use the post-demo reset's Y/Z ceiling and faster translation speed."""
     motion = config.motion
     original_high = motion.limits.workspace_high
-    if original_high[1] > RESET_Y_HIGH_M or original_high[2] > RESET_Z_HIGH_M:
+    reset_high = reset_only_high(motion)
+    if (any(reset < configured for reset, configured in
+            zip(reset_high, original_high))):
         raise ValueError('Reset-only ceilings must not narrow the configured workspace')
-    limits = replace(motion.limits,
-                     workspace_high=(original_high[0], RESET_Y_HIGH_M, RESET_Z_HIGH_M))
+    limits = replace(motion.limits, workspace_high=reset_high)
     limits.validate_motion()
     reset = replace(motion.auto_reset, linear_speed_m_s=RESET_LINEAR_SPEED_M_S)
     return replace(config, motion=replace(motion, limits=limits, auto_reset=reset))
@@ -100,6 +123,28 @@ def run_pre_reset(env, motion, *, start_limits=None, emit=print, monotonic=time.
                 result = backend.execute(action)
                 observed = result.observation
         emit('自动复位：+Z 50 mm、再 +Y 100 mm 已完成。')
+        # The retraction is allowed past the workspace ceiling, so the arm now
+        # commonly rests OUTSIDE the demo/training workspace. Say so explicitly:
+        # starting an episode from there is refused by `plan_target`
+        # ("Measured pose already outside configured workspace"), and the fix is
+        # to let the Section 6 upstream reset bring the arm back to the start
+        # pose first.
+        position = np.asarray(observed['state'][:3], dtype=np.float64)
+        low = np.asarray(motion.limits.workspace_low, dtype=np.float64)
+        high = np.asarray(motion.limits.workspace_high, dtype=np.float64)
+        outside = [axis for axis in range(3) if position[axis] < low[axis]
+                   or position[axis] > high[axis]]
+        if outside:
+            detail = ', '.join(
+                f'{"xyz"[axis]}={position[axis]:.4f} '
+                f'{"<" if position[axis] < low[axis] else ">"} '
+                f'{low[axis] if position[axis] < low[axis] else high[axis]:.4f}'
+                for axis in outside)
+            emit(f'注意：机械臂现在停在**采集工作空间之外**（{detail}）。'
+                 '请先跑《常用命令.md》第 6 节把臂带回起始位姿，再按双键开始下一回合；'
+                 '否则会报 Measured pose already outside configured workspace。')
+        else:
+            emit(f'机械臂当前位姿 {np.round(position, 4).tolist()} 仍在采集工作空间内。')
         return observed
     finally:
         env.close()
@@ -124,8 +169,10 @@ def main(argv=None):
         env = create_motion_env(reset_config, coordinator,
                                 cli_allow_motion=args.allow_motion,
                                 skip_tf_progress=True, skip_state_progress=True)
-        print(f'仅本次预复位使用 Y≤{RESET_Y_HIGH_M:.2f} m、'
-              f'Z≤{RESET_Z_HIGH_M:.2f} m；采集/训练边界不变。', flush=True)
+        reset_high = reset_only_high(config.motion)
+        print(f'仅本次预复位使用 Y≤{reset_high[1]:.3f} m、Z≤{reset_high[2]:.3f} m'
+              f'（= 工作空间上限 + 本次位移 + {RESET_MARGIN_M*1000:.0f} mm 裕度）；'
+              '采集/训练边界不变。', flush=True)
         run_pre_reset(env, reset_config.motion, start_limits=config.motion.limits)
         return 0
     except KeyboardInterrupt:

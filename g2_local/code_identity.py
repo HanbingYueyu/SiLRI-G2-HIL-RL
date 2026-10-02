@@ -1,13 +1,50 @@
-"""Small local reproducibility record including uncommitted source contents."""
+"""Small local reproducibility record including uncommitted source contents.
+
+Two identities, on purpose
+--------------------------
+``contract_digest`` is what a seed/checkpoint actually *depends on*: the
+demonstration contract (task/observation/intervention/motion keys), the modules
+that define and validate that contract, and the policy configuration
+(observation shape, action size, architecture). It is the only identity that is
+enforced when a seed is loaded.
+
+``source_digest`` is a full digest of every algorithm source file. It is recorded
+in every manifest and checkpoint for audit, but it is **not** enforced: none of
+the runtime/executor code is read back out of a checkpoint, so editing the Actor
+loop, the GDK backend, a console string or a docstring must not invalidate a 5 GB
+seed and a running Learner. Enforcing it (the old behaviour) turned every honest
+bug fix into "rebuild the seed", which is a bug in its own right.
+"""
 import hashlib
 import importlib.metadata
 from pathlib import Path
 import platform
 import subprocess
+import sys
+
+
+# Modules whose bytes participate in the *contract*: they define the task/action
+# contract, the workspace/observation schema, and the demonstration import and
+# validation format. A change here can reinterpret stored data or stored replay
+# tensors, so it invalidates a seed on purpose.
+SEED_CONTRACT_SOURCES = (
+    'g2_local/contract.py',
+    'g2_local/config.py',
+    'g2_local/demonstrations.py',
+)
+
+# Keys inside the encoded policy configuration that say *where* and *how fast* to
+# compute, not *what* is computed. They are excluded from the contract digest so
+# the enforced identity is machine-independent: a seed built on a CUDA box must be
+# verifiable and loadable on a CPU-only one, and an operator must be able to
+# reproduce the digest by hand. Both values live in the configuration JSON, whose
+# own hash (``config_hash``) is still enforced.
+POLICY_PLACEMENT_KEYS = ('device', 'storage_device', 'use_amp')
 
 
 def source_digest(root):
-    """Source identity, including dirty env code; not a dataset snapshot."""
+    """Full source identity, including dirty env code; not a dataset snapshot."""
+    root = Path(root)
     digest = hashlib.sha256()
     paths = set(root.glob('*.sh')) | set(root.glob('*.py'))
     for name in ('g2_local', 'lerobot/src/lerobot', 'rl_envs', 'rl_envs_sim'):
@@ -22,23 +59,45 @@ def source_digest(root):
     return digest.hexdigest()
 
 
-def identity_mismatch_detail(path, stored, current):
-    """Operator-facing evidence for a refused checkpoint resume.
+def current_source_digest():
+    """Full source digest of the running checkout (audit/notice only)."""
+    return source_digest(Path(__file__).resolve().parents[1])
 
-    Every ``g2_local/*.py`` edit changes the digest, including display-only
-    ones, so the message must name the file and both digests before an operator
-    decides between rebuilding the seed and migrating explicitly.
+
+def contract_digest(config):
+    """The enforced seed/checkpoint identity: contract + policy configuration."""
+    import draccus
+    from .demonstrations import demonstration_contract
+    from .policy import create_policy_config
+    from .training_config import canonical_json
+    root = Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256()
+    digest.update(b'demonstration-contract\0')
+    digest.update(demonstration_contract(config).encode())
+    for name in SEED_CONTRACT_SOURCES:
+        digest.update(name.encode()+b'\0')
+        digest.update((root/name).read_bytes())
+        digest.update(b'\0')
+    digest.update(b'policy-config\0')
+    policy = {key: value for key, value in
+              draccus.encode(create_policy_config(config.runtime.device)).items()
+              if key not in POLICY_PLACEMENT_KEYS}
+    digest.update(canonical_json(policy))
+    return digest.hexdigest()
+
+
+def algorithm_identity(config):
+    """Full recorded identity for a loaded config (or a partial test config).
+
+    ``contract_sha256`` is present whenever ``config`` is a fully loaded training
+    configuration. Enforcement always compares that field, so a recorded identity
+    without it (a partial stub, or a checkpoint written before this change) is
+    refused rather than silently accepted.
     """
-    def digest(value):
-        return value.get('source_sha256') if isinstance(value, dict) else None
-    return (f'checkpoint={Path(path).resolve()} '
-            f'stored_source_sha256={digest(stored)} '
-            f'current_source_sha256={digest(current)}')
-
-
-def algorithm_identity(device):
     import draccus
     from .policy import create_policy_config
+    if not hasattr(config, 'runtime'):
+        raise ValueError('A training config with runtime settings is required')
     root = Path(__file__).resolve().parents[1]
     def revision(path):
         result = subprocess.run(['git', '-C', str(path), 'rev-parse', 'HEAD'],
@@ -52,9 +111,63 @@ def algorithm_identity(device):
             versions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             versions[name] = 'not-installed-as-distribution'
-    return dict(schema=3, main_sha=revision(root),
-                vendored_sources={'lerobot': 'lerobot/src/lerobot'},
-                submodules={name: revision(root/name)
-                            for name in ('rl_envs', 'rl_envs_sim')},
-                source_sha256=source_digest(root), python=platform.python_version(),
-                packages=versions, policy_config=draccus.encode(create_policy_config(device)))
+    identity = dict(schema=3, main_sha=revision(root),
+                    vendored_sources={'lerobot': 'lerobot/src/lerobot'},
+                    submodules={name: revision(root/name)
+                                for name in ('rl_envs', 'rl_envs_sim')},
+                    source_sha256=source_digest(root), python=platform.python_version(),
+                    packages=versions,
+                    policy_config=draccus.encode(create_policy_config(config.runtime.device)))
+    if hasattr(config, 'canonical_payload'):
+        identity['contract_sha256'] = contract_digest(config)
+    return identity
+
+
+def _field(identity, name):
+    return identity.get(name) if isinstance(identity, dict) else None
+
+
+def seed_identity_check(path, stored, current):
+    """(ok, detail) for a stored vs current algorithm identity.
+
+    Only the contract decides usability. Full source/git/package drift is
+    reported by ``source_drift_notice`` instead of refusing the checkpoint.
+    """
+    stored_contract = _field(stored, 'contract_sha256')
+    current_contract = _field(current, 'contract_sha256')
+    if stored_contract is None or stored_contract != current_contract:
+        return False, (f'checkpoint={Path(path).resolve()} '
+                       f'stored_contract_sha256={stored_contract} '
+                       f'current_contract_sha256={current_contract}')
+    return True, None
+
+
+def source_drift_notice(path, stored, current):
+    """One-line audit notice when only the (unenforced) source digest differs."""
+    stored_source = _field(stored, 'source_sha256')
+    current_source = _field(current, 'source_sha256')
+    if stored_source is None or stored_source == current_source:
+        return None
+    return (f'note: {Path(path).resolve()} was written by different algorithm '
+            f'sources (stored source_sha256={stored_source} '
+            f'current source_sha256={current_source}); the task/action contract and '
+            'policy configuration are unchanged, so this checkpoint stays usable. '
+            'The mismatch is recorded for audit only.')
+
+
+def announce_source_drift(path, stored, current):
+    """Print the audit notice, if any, without changing behaviour."""
+    notice = source_drift_notice(path, stored, current)
+    if notice is not None:
+        print(notice, file=sys.stderr, flush=True)
+    return notice
+
+
+def identity_mismatch_detail(path, stored, current):
+    """Operator-facing evidence for a refused checkpoint.
+
+    Kept for callers that still want the raw digests; the enforced comparison is
+    ``seed_identity_check``.
+    """
+    return seed_identity_check(path, stored, current)[1] or (
+        f'checkpoint={Path(path).resolve()} identities match')

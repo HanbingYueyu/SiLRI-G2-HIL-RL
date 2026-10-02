@@ -113,8 +113,11 @@ def main():
     del learner
     gc.collect()
     torch.cuda.empty_cache()
+    from .code_identity import contract_digest
     restored = load_checkpoint(checkpoint, expected_run_id=args.output.name,
-                               expected_config_hash=config.config_hash).runtime
+                               expected_config_hash=config.config_hash,
+                               expected_contract_sha256=contract_digest(config),
+                               full_config=config).runtime
     restored.config = config
     assert restored.snapshot_counts() == expected
     assert digest(restored.policy.actor) == actor

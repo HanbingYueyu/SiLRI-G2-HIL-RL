@@ -1,5 +1,7 @@
 # G2 时间映射只读诊断
 
+> **2026-10-01 更新**：本文是当时快照。时钟层已删除（`clock_monitor`/`live_clock`/`clock_mapping`/`clock_ipc`/`demo_clock`/`clock_probe` 及 `--clock-socket` 全部移除），采集与训练的新鲜度只看**本地接收时间**；当前命令以仓库外层 `常用命令.md` 为准，本文中出现的 `--clock-socket` 命令已失效。
+
 本工具不调整 CLOCK_REALTIME 或 PHC，不切换机器人模式、不发送运动/夹爪指令。
 原有 probe、Gym 和运动许可保持不变。`diagnostic_consistent` 不是运动验收。
 

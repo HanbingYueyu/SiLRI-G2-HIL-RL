@@ -348,8 +348,10 @@ class RealActorRuntime:
         self.demonstration = demonstration
         if type(exit_after_labeled_demo) is not bool:
             raise ValueError('exit_after_labeled_demo must be boolean')
-        if exit_after_labeled_demo and not demonstration:
-            raise ValueError('Only a demonstration may exit after Y/F')
+        # NOTE: the real Actor role passes policy=None on purpose (the runtime
+        # loads parameters from the Learner over gRPC), so a None policy here is
+        # not an error. The CLI restricts this flag to the demo and actor roles.
+        
         self.exit_after_labeled_demo = exit_after_labeled_demo
         self._policy_warmed = False
         if demonstration and policy is not None:
@@ -564,6 +566,8 @@ class RealActorRuntime:
         waiting_reminder = RateLimit(60.)
         waiting_announced = False
         heartbeat = RateLimit(2.)
+        gate_wait_reminder = RateLimit(60.)
+        gate_wait_announced = False
         def upload(row):
             self.transport.send_transition_batch((row,))
             self.transitions_sent += 1
@@ -590,7 +594,10 @@ class RealActorRuntime:
                 say('自动复位已启用：抬升后回到本回合起始位姿，不调用上游视觉复位。')
                 self._automatic_reset(episode_start_pose, context)
             if self.exit_after_labeled_demo and labeled:
-                self.stop('demo_labeled')
+                # Training loop: exit cleanly right after Y/F so the launcher can
+                # run the upstream reset (it needs the SpaceMouse) and start the
+                # next episode. The Learner is not affected.
+                self.stop('demo_labeled' if self.demonstration else 'labeled_episode')
         def interrupt_camera_episode(error, token=None):
             nonlocal env, pending, previous_step_at, episode_start_pose, episode_steps
             nonlocal episode_interventions
@@ -728,6 +735,7 @@ class RealActorRuntime:
                                     continue
                                 raise
                             episode_start_pose = tuple(self.current_observation['state'])
+                            gate_wait_announced = False
                             if self.demonstration:
                                 say('人工采集已开始：SpaceMouse 控制，Y 成功 / F 失败。')
                             _policy_observation(self.current_observation, 'cpu',
@@ -736,13 +744,46 @@ class RealActorRuntime:
                     continue
                 if env is None:
                     raise RuntimeError('Running episode has no commissioned environment')
+                # Peek only: env.step consumes the report immediately before command
+                # submission. A pre-read here would lose that motion.
+                intervention = self.coordinator.intervention
                 if self.demonstration:
-                    # Peek only: env.step consumes the report immediately before
-                    # command submission. A pre-read here would lose that motion.
-                    intervention = self.coordinator.intervention
                     if not (intervention.has_new_report() or intervention.verified_neutral):
                         time.sleep(self.config.runtime.operator_poll_interval_s)
                         continue
+                else:
+                    # A step may only be submitted and recorded while the human-input
+                    # gate is verifiable: either a fresh report or an observed
+                    # exact-zero hold. Those are exactly the two shapes the
+                    # transition validator accepts, so any other state either loses
+                    # the intervention provenance or aborts the episode. This is
+                    # reachable on hardware: the upstream HID reports `ready` only
+                    # after BOTH axis channels have been seen, and the start chord
+                    # deliberately reads buttons only, so pressing the double key
+                    # without ever having moved the knob used to reach the first
+                    # env.step with gate.fresh == verified_neutral == False and die
+                    # with 'Invalid intervention or freshness gate summary' after a
+                    # policy action had already been submitted. Wait for the device
+                    # instead, and say exactly what the operator has to do.
+                    #
+                    # This role reads the raw HID *inside* the callable (there is no
+                    # background reader as in the demonstration role), so the gate
+                    # can only become verifiable by calling it. A genuine input
+                    # fault still raises here and stops the Actor, as designed.
+                    gate = getattr(intervention, 'gate', None)
+                    if not (getattr(gate, 'fresh', False) or
+                            getattr(intervention, 'verified_neutral', False)):
+                        intervention()
+                        if not (getattr(gate, 'fresh', False) or
+                                getattr(intervention, 'verified_neutral', False)):
+                            if not gate_wait_announced:
+                                gate_wait_announced = True
+                                say('SpaceMouse 还没有上报过轴向数据（只按双键不算）：'
+                                    '请轻拨一下旋帽再松手，收到轴向报告后本回合立即继续。')
+                            elif gate_wait_reminder.due():
+                                say('仍在等待 SpaceMouse 轴向数据：轻拨一下旋帽再松手。')
+                            time.sleep(self.config.runtime.operator_poll_interval_s)
+                            continue
                 try:
                     before = env.refresh_observation()
                 except Exception as error:

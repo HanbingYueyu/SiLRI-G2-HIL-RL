@@ -8,7 +8,8 @@ frame is rejected.
 import numpy as np
 import pytest
 
-from g2_local.freshness import FreshnessLimits, ObservationFreshnessGuard
+from g2_local.freshness import (FreshnessLeaseGuard, FreshnessLimits,
+                               ObservationFreshnessGuard)
 
 ORIGIN = 1_700_000_000_000_000_000
 NOW = 20_000_000_000
@@ -169,3 +170,57 @@ def test_stop_feedback_rejects_a_bad_tf_direction():
                                  target='base_link', source='arm_l_end_link')
     with pytest.raises(RuntimeError, match='stop TF direction mismatch'):
         g.validate_stop_feedback(info)
+
+
+def test_same_domain_successor_must_be_acquired_after_the_command():
+    """A successor older than the same-domain send anchor must be refused."""
+    fresh = guard()
+    info = evidence()
+    # stamps are 10 ms old inside the SDK domain; the command was sent 20 ms ago.
+    assert fresh(observation(), info, after=(NOW - 10_000_000)/1e9,
+                 after_sdk_ns=SOURCE_NOW - 20_000_000) is True
+    assert fresh.last_decision.sdk_anchor['same_domain'] is True
+    assert fresh.last_decision.sdk_anchor['margins_ns']['left_wrist'] == 10_000_000
+
+    stale = guard()
+    assert stale(observation(), info, after=(NOW - 10_000_000)/1e9,
+                 after_sdk_ns=SOURCE_NOW - 5_000_000) is False
+    assert stale.last_decision.code == 'not_after_command_sdk:left_wrist'
+
+
+def test_unrelated_clocks_degrade_to_the_local_receipt_guarantee():
+    """An unrelated SDK clock must not reject every frame, but must be recorded."""
+    info = evidence()
+    shifted = SOURCE_NOW + 20_000_000_000
+    info['sdk_clock_ns'] = info['read_end_sdk_clock_ns'] = shifted
+    g = guard()
+    assert g(observation(), info, after=(NOW - 10_000_000)/1e9, after_sdk_ns=SOURCE_NOW) is True
+    anchor = g.last_decision.sdk_anchor
+    assert anchor['same_domain'] is False
+    assert anchor['sdk_ages_ns']['joint'] == 20_000_000_000 + 10_000_000
+
+
+def test_rejected_read_keeps_the_previous_lease_until_it_expires():
+    """A rejected read must not revoke an existing lease (successor retries)."""
+    now = [10.0]
+    guard = FreshnessLeaseGuard(FakeGuard([True, False]), feedback_lease_s=1.5,
+                                clock=lambda: now[0])
+    assert guard.accept(object(), {}, after=1.0) is True
+    assert guard() is True
+    assert guard.accept(object(), {}, after=1.0) is False
+    # The previous lease still holds: the writer keeps resending the last target
+    # while the policy loop retries its successor read.
+    assert guard() is True
+    now[0] += 1.6
+    assert guard() is False
+
+
+class FakeGuard:
+    """Minimal observation guard: returns the queued verdicts in order."""
+
+    def __init__(self, verdicts):
+        self.verdicts = list(verdicts)
+        self.last_decision = None
+
+    def __call__(self, obs, info, after=None, after_sdk_ns=None):
+        return self.verdicts.pop(0) if self.verdicts else False

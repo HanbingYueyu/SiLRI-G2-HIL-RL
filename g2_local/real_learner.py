@@ -25,7 +25,7 @@ from .policy import create_policy
 from .real_actor import ParameterEnvelope, validate_real_transition
 from .provenance import ProvenanceRecords, compact_record, tensor_digest
 from .runtime import train_batch
-from .code_identity import algorithm_identity
+from .code_identity import algorithm_identity, seed_identity_check
 from .training_config import OptimizationConfig, RuntimeConfig, _open_owned_regular
 
 
@@ -214,7 +214,7 @@ class RealLearnerRuntime:
                 opt.min_online_transitions > opt.online_capacity):
             raise ValueError('Impossible replay batch')
         self.policy = policy or create_policy(config.runtime.device)
-        self.algorithm_identity = algorithm_identity(config.runtime.device)
+        self.algorithm_identity = algorithm_identity(config)
         self.optimizers, _ = self.policy.get_optimizer_and_scheduler()
         for name, lr in (('actor', opt.actor_lr), ('critic', opt.critic_lr),
                          ('expert', opt.expert_lr), ('lagrange', opt.lagrange_lr)):
@@ -418,9 +418,28 @@ class RealLearnerRuntime:
                 metrics = train_batch(self.policy, self.optimizers, data, ('actor_bc',))
                 last_loss = metrics['actor_bc']
                 completed += 1
+        # The Target Actor still holds the pre-BC copy; hard sync it after the
+        # warm start so the first Critic TD targets bootstrap from the policy we
+        # actually trained (soft tau would take hundreds of updates to catch up).
+        self.policy.hard_update_actor_target()
         self.actor_bc_pretrain_steps += completed
         self.actor_bc_last_loss = last_loss
         return completed, last_loss
+
+    def behavior_clone_weight(self):
+        """Scheduled explicit imitation weight for the Actor loss."""
+        opt = self.config.optimization
+        weight = opt.bc_weight
+        if type(weight) not in (int, float) or weight < 0:
+            raise ValueError('Invalid bc_weight')
+        if weight == 0:
+            return 0.0
+        decay = opt.bc_weight_decay_updates
+        if type(decay) is not int or decay < 0:
+            raise ValueError('Invalid bc_weight_decay_updates')
+        if decay == 0:
+            return float(weight)
+        return float(weight) * max(0.0, 1.0 - self.update_count / decay)
 
     def update_once(self):
         with self._update_lock:
@@ -452,6 +471,8 @@ class RealLearnerRuntime:
             # from checkpoint so resuming on an odd update preserves the phase.
             actor_due = (self.update_count + 1) % opt.actor_update_interval == 0
             names = ('critic', 'actor', 'lagrange') if actor_due else ('critic', 'lagrange')
+            bc_weight = self.behavior_clone_weight()
+            data = dict(data, bc_weight=bc_weight)
             metrics = train_batch(self.policy, self.optimizers, data, names)
             metrics.update(beta_pretrain_steps=self.beta_pretrain_completed,
                            beta_update_steps=self.beta_update_count,
@@ -465,7 +486,7 @@ class RealLearnerRuntime:
                 self.progress(dict(event='learner_update', learner_update=self.update_count,
                                    completed_episodes=len(self.completed_episode_ids),
                                    actor_updated=actor_due, actor_loss=metrics.get('actor'),
-                                   critic_loss=metrics['critic']))
+                                   critic_loss=metrics['critic'], bc_weight=bc_weight))
             if self.version % opt.target_update_interval == 0:
                 self.policy.update_target_networks()
             if self.version % opt.publish_interval == 0:
@@ -509,6 +530,8 @@ class RealLearnerRuntime:
                     human_transitions_total=self.human_transitions_total,
                     beta_last_human_count=self.beta_last_human_count,
                     beta_last_loss=self.beta_last_loss,
+                    actor_bc_pretrain_steps=self.actor_bc_pretrain_steps,
+                    actor_bc_last_loss=self.actor_bc_last_loss,
                     imported_demo_episodes=sorted(self.imported_demo_episodes),
                     interaction_budget=self._interaction_budget,
                     torch_rng=torch.get_rng_state(),
@@ -551,8 +574,23 @@ class RealLearnerRuntime:
 
 
 def load_checkpoint(path: Path, *, expected_run_id: str, expected_config_hash: str,
-                    expected_manifest_digest: str | None = None) -> LearnerSnapshot:
-    """Load only an owned regular local checkpoint; torch pickle requires trust."""
+                    expected_manifest_digest: str | None = None,
+                    expected_contract_sha256: str | None = None,
+                    full_config=None) -> LearnerSnapshot:
+    """Load only an owned regular local checkpoint; torch pickle requires trust.
+
+    Production callers must pass ``expected_contract_sha256`` *and* ``full_config``.
+    The enforced identity is the task/action contract plus the policy
+    configuration (``code_identity.contract_digest``); full source drift is
+    reported to stderr as an audit notice instead of refusing the checkpoint, so
+    fixing the Actor/backend code no longer invalidates a seed.
+
+    ``full_config`` matters beyond validation: the restored Learner records its own
+    ``algorithm_identity``, and that value is what the *next* save writes. Building
+    the runtime from the partial payload stub instead produced checkpoints with no
+    contract digest at all, which the following resume then refused - i.e. a
+    Learner could not resume a checkpoint it had just written itself.
+    """
     fd, metadata = _open_owned_regular(Path(path))
     if metadata.st_mode & 0o022 or metadata.st_nlink != 1:
         os.close(fd)
@@ -566,18 +604,25 @@ def load_checkpoint(path: Path, *, expected_run_id: str, expected_config_hash: s
             tuple(payload.get('camera_keys', ())) != CAMERA_KEYS or
             payload.get('image_size') != 128 or payload.get('action_size') != 6):
         raise ValueError('Checkpoint identity or camera/action contract mismatch')
+    if full_config is not None and full_config.config_hash != expected_config_hash:
+        raise ValueError('Checkpoint identity or camera/action contract mismatch')
     config = SimpleNamespace(
         optimization=OptimizationConfig(**payload['optimization']),
         runtime=RuntimeConfig(**payload['runtime']),
-        config_hash=expected_config_hash)
-    current_identity = algorithm_identity(config.runtime.device)
-    if payload.get('algorithm_identity') != current_identity:
-        from .code_identity import identity_mismatch_detail
-        raise ValueError(
-            'Algorithm code/version identity mismatch; explicit migration required. '
-            + identity_mismatch_detail(path, payload.get('algorithm_identity'), current_identity)
-            + '; rebuild the seed with g2_local.offline_pretrain after freezing the code, '
-              'or migrate this checkpoint explicitly')
+        config_hash=expected_config_hash) if full_config is None else full_config
+    if expected_contract_sha256 is not None:
+        stored_identity = payload.get('algorithm_identity')
+        ok, detail = seed_identity_check(path, stored_identity,
+                                         {'contract_sha256': expected_contract_sha256})
+        if not ok:
+            raise ValueError(
+                'Algorithm contract identity mismatch; the stored task/action contract or '
+                'policy configuration differs from this configuration. ' + detail
+                + '; rebuild the seed with g2_local.offline_pretrain, or migrate this '
+                  'checkpoint explicitly')
+        from .code_identity import announce_source_drift, current_source_digest
+        announce_source_drift(path, stored_identity,
+                              {'source_sha256': current_source_digest()})
     learner = RealLearnerRuntime(config=config, run_id=expected_run_id,
                                  manifest_digest=payload['manifest_digest'])
     learner.policy.load_state_dict(payload['policy'], strict=True)
@@ -652,6 +697,17 @@ def load_checkpoint(path: Path, *, expected_run_id: str, expected_config_hash: s
             (type(learner.beta_last_loss) not in (int, float) or
              not np.isfinite(learner.beta_last_loss))):
         raise ValueError('Invalid beta loss checkpoint')
+    # Actor BC provenance is optional: checkpoints written before the warm start
+    # existed simply have no such keys.
+    bc_steps = payload.get('actor_bc_pretrain_steps', 0)
+    bc_loss = payload.get('actor_bc_last_loss')
+    if type(bc_steps) is not int or not 0 <= bc_steps <= 100_000:
+        raise ValueError('Invalid Actor BC step checkpoint')
+    if (bc_loss is not None and (type(bc_loss) not in (int, float) or
+                                 not np.isfinite(bc_loss))):
+        raise ValueError('Invalid Actor BC loss checkpoint')
+    learner.actor_bc_pretrain_steps = bc_steps
+    learner.actor_bc_last_loss = float(bc_loss) if bc_loss is not None else None
     learner._interaction_budget = payload['interaction_budget']
     if (learner.accepted_transitions != len(learner.records) or
             learner.version != learner.update_count):

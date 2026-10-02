@@ -1,0 +1,179 @@
+{
+  "schema": 1,
+  "mode": "train",
+  "requested_motion": true,
+  "task": {
+    "control_hz": 30,
+    "max_episode_steps": 350,
+    "fix_gripper": true,
+    "action_scale": [
+      0.0015,
+      0.0015,
+      0.0015,
+      0.026,
+      0.026,
+      0.026
+    ],
+    "success_reward": 30,
+    "failure_reward": -1,
+    "step_reward": -0.01,
+    "reward_source": "human",
+    "target_xy_range_m": 0.05,
+    "ee_xyz_range_m": 0.003,
+    "ee_rpy_range_rad": 0.008726646259971648
+  },
+  "motion": {
+    "policy_position_drift_m": 0.005,
+    "policy_rotation_drift_rad": 0.02,
+    "auto_reset": {
+      "enabled": false,
+      "lift_m": 0.05,
+      "linear_speed_m_s": 0.01,
+      "angular_speed_rad_s": 0.2,
+      "position_tolerance_m": 0.001,
+      "rotation_tolerance_rad": 0.01,
+      "timeout_s": 30
+    },
+    "local_envelope": {
+      "translation_low_m": [
+        -0.15,
+        -0.15,
+        -0.15
+      ],
+      "translation_high_m": [
+        0.15,
+        0.15,
+        0.15
+      ],
+      "rotation_max_rad": 0.4363323129985824
+    },
+    "workspace_low": [
+      0.4765,
+      0.0901,
+      0.8289
+    ],
+    "workspace_high": [
+      0.6665,
+      0.2451,
+      0.965
+    ],
+    "control_mode": 1,
+    "command_timeout_s": 1.5,
+    "send_timeout_s": 0.15,
+    "stop_timeout_s": 1,
+    "reader_timeout_s": 2,
+    "command_lifetime_s": 0.1,
+    "send_rate_hz": 50,
+    "adapter_root": "/home/flyfuture/g2_hinge_assembly"
+  },
+  "freshness": {
+    "camera_age_s": 0.25,
+    "state_age_s": 0.05,
+    "camera_skew_s": 0.2,
+    "tf_position_error_m": 0.005,
+    "tf_rotation_error_rad": 0.02,
+    "mapping_error_s": 0.005
+  },
+  "observation": {
+    "camera_keys": [
+      "left_wrist",
+      "right_aux"
+    ],
+    "image_size": 128,
+    "camera_rois": {
+      "left_wrist": [
+        340,
+        200,
+        940,
+        800
+      ],
+      "right_aux": [
+        310,
+        10,
+        910,
+        610
+      ]
+    },
+    "raw_rgb_logging": false
+  },
+  "intervention": {
+    "axis_map": [
+      -2,
+      -1,
+      -3,
+      -5,
+      -4,
+      -6
+    ],
+    "left_button": 0,
+    "right_button": 1,
+    "engage_deadzone": 0.12,
+    "release_deadzone": 0.08,
+    "release_hold_s": 0.25,
+    "report_max_age_s": 0.25
+  },
+  "optimization": {
+    "online_capacity": 1024,
+    "human_capacity": 5632,
+    "min_online_transitions": 256,
+    "online_batch_size": 32,
+    "human_batch_size": 32,
+    "episode_checkpoint_interval": 20,
+    "utd_ratio": 1,
+    "actor_update_interval": 2,
+    "actor_lr": 0.0003,
+    "critic_lr": 0.0003,
+    "expert_lr": 0.0003,
+    "lagrange_lr": 3e-05,
+    "bc_weight": 1.5,
+    "bc_weight_decay_updates": 1000,
+    "beta_pretrain_steps": 500,
+    "beta_min_demo_episodes": 20,
+    "beta_min_human_transitions": 256,
+    "beta_update_interval": 50,
+    "beta_update_steps": 50,
+    "target_update_interval": 1,
+    "publish_interval": 1,
+    "checkpoint_interval": 1000
+  },
+  "runtime": {
+    "seed": 1234,
+    "device": "cuda",
+    "learner_host": "127.0.0.1",
+    "learner_port": 50175,
+    "queue_capacity": 64,
+    "queue_put_timeout_s": 1,
+    "transport_timeout_s": 5,
+    "context_max_age_s": 30,
+    "parameter_heartbeat_s": 1,
+    "learner_silence_timeout_s": 5,
+    "operator_poll_interval_s": 0.01
+  },
+  "commissioning": {
+    "profile": "approved",
+    "clock_socket": "/tmp/g2-demo-clock-20260926-03/clock.sock",
+    "expected_master": "044052.fffe.000010",
+    "evidence": [
+      {
+        "kind": "freshness_approval",
+        "path": "/home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL/runtime/real_actor_audit_20260928/freshness-threshold-approval-camera-relaxed.json",
+        "sha256": "c5e3c4493d434b565c0b5424d1791869aa9b00a3b1b43e58a4530ab8f9b366a4"
+      },
+      {
+        "kind": "xyz_rpy_direction_scale",
+        "path": "/home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL/runtime/demo-commissioning-20260926.json",
+        "sha256": "7f303df678b3286629607db26e55cd2140baaa77268cc52c17e8852293ac787e"
+      },
+      {
+        "kind": "software_stop_lease_expiry",
+        "path": "/home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL/runtime/demo-commissioning-20260926.json",
+        "sha256": "7f303df678b3286629607db26e55cd2140baaa77268cc52c17e8852293ac787e"
+      },
+      {
+        "kind": "hardware_estop",
+        "path": "/home/flyfuture/桌面/hil-rRL/SiLRI-HIL-RL/runtime/demo-commissioning-20260926.json",
+        "sha256": "7f303df678b3286629607db26e55cd2140baaa77268cc52c17e8852293ac787e"
+      }
+    ]
+  }
+}

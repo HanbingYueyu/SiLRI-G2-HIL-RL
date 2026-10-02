@@ -40,7 +40,11 @@ class CommandStream:
     def check(self):
         with self.condition:
             if self.fault is not None:
-                raise RuntimeError(f'Command stream fault: {self.fault}') from self.fault
+                error = RuntimeError(f'Command stream fault: {self.fault}')
+                code = getattr(self.fault, 'code', None)
+                if isinstance(code, str) and code:
+                    error.code = code
+                raise error from self.fault
             if self.halt.is_set():
                 raise RuntimeError('Command stream stopped; no automatic restart')
 

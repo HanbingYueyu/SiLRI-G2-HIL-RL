@@ -17,6 +17,7 @@ import sys
 import time
 from types import SimpleNamespace
 
+from .code_identity import contract_digest
 from .console import RateLimit, number, say
 from .training_config import load_training_config
 
@@ -78,7 +79,8 @@ def parser():
     cli.add_argument('--demonstrations', type=Path, action='append', default=[],
                      help='Learner only: import a complete local demonstration dataset; repeatable')
     cli.add_argument('--exit-after-labeled-demo', action='store_true',
-                     help='Demo only: exit after saving a Y/F-labeled episode')
+                     help='Demo/Actor: exit cleanly after a Y/F-labeled episode; the '
+                          'launcher then runs the upstream reset for the next episode')
     return cli
 
 
@@ -297,7 +299,7 @@ def import_gdk_runtime():
     return CompactHID
 
 
-def load_eval_checkpoint(path, *, run_id, config_hash):
+def load_eval_checkpoint(path, *, run_id, config_hash, contract_sha256=None):
     """Read the trusted frozen Actor snapshot without constructing optimizers."""
     import torch
     from .contract import CAMERA_KEYS
@@ -314,16 +316,18 @@ def load_eval_checkpoint(path, *, run_id, config_hash):
             tuple(payload.get('camera_keys', ())) != CAMERA_KEYS or
             payload.get('image_size') != 128 or payload.get('action_size') != 6):
         raise ValueError('Checkpoint identity or camera/action contract mismatch')
-    from .code_identity import algorithm_identity, identity_mismatch_detail
+    from .code_identity import seed_identity_check
     if type(payload.get('runtime')) is not dict:
-        raise ValueError('Algorithm code/version identity mismatch; explicit migration required')
-    current_identity = algorithm_identity(payload['runtime']['device'])
-    if payload.get('algorithm_identity') != current_identity:
-        raise ValueError(
-            'Algorithm code/version identity mismatch; explicit migration required. '
-            + identity_mismatch_detail(path, payload.get('algorithm_identity'), current_identity)
-            + '; rebuild the seed with g2_local.offline_pretrain after freezing the code, '
-              'or migrate this checkpoint explicitly')
+        raise ValueError('Algorithm contract identity mismatch; explicit migration required')
+    if contract_sha256 is not None:
+        ok, detail = seed_identity_check(path, payload.get('algorithm_identity'),
+                                         {'contract_sha256': contract_sha256})
+        if not ok:
+            raise ValueError(
+                'Algorithm contract identity mismatch; the stored task/action contract or '
+                'policy configuration differs from this configuration. ' + detail
+                + '; rebuild the seed with g2_local.offline_pretrain, or migrate this '
+                  'checkpoint explicitly')
     version = payload.get('published_version')
     state = payload.get('published_actor_state')
     if (type(version) is not int or version < 0 or
@@ -366,8 +370,8 @@ class _TerminalInput:
 def _validate_cli(args, loaded):
     if getattr(args, 'demonstrations', ()) and args.role != 'learner':
         raise ValueError('--demonstrations is only valid for learner')
-    if getattr(args, 'exit_after_labeled_demo', False) and args.role != 'demo':
-        raise ValueError('--exit-after-labeled-demo is demo only')
+    if getattr(args, 'exit_after_labeled_demo', False) and args.role not in ('demo', 'actor'):
+        raise ValueError('--exit-after-labeled-demo is demo/actor only')
     if args.role == 'learner' and (args.allow_motion or loaded.mode != 'train' or
                                    args.context or args.hid_device):
         raise ValueError('Learner accepts train mode only and cannot request motion or HID')
@@ -428,8 +432,20 @@ def _run_learner_owned(args, loaded, evidence):
     from .real_learner import GrpcLearnerService, RealLearnerRuntime, load_checkpoint
     source, target = learner_checkpoint_paths(args, evidence.output)
     if source:
-        snapshot = load_checkpoint(source, expected_run_id=args.run_id,
-                                   expected_config_hash=loaded.config_hash)
+        try:
+            snapshot = load_checkpoint(source, expected_contract_sha256=contract_digest(loaded),
+                                       full_config=loaded,
+                                       expected_run_id=args.run_id,
+                                       expected_config_hash=loaded.config_hash)
+        except ValueError as error:
+            # A refusal here is almost always a stale/partial checkpoint left in
+            # --checkpoint-dir by an interrupted or older run. Say what to do:
+            # moving it aside makes the Learner start from --checkpoint instead.
+            say(f'无法从 {source} 恢复：{error}')
+            say(f'现场处理：把 {source} 移开（例如 mv {source} {source}.stale），'
+                f'Learner 会改从 --checkpoint 指定的 seed 冷启动。'
+                '只有在契约/配置确实变了、且你需要保留那份训练状态时，才考虑显式迁移。')
+            raise
         learner = snapshot.runtime
         learner.config = loaded  # Restore task/ROI contract for optional demo import.
         learner.checkpoint_path = target
@@ -542,6 +558,7 @@ def _run_actor_or_eval(args, loaded, evidence):
     frozen = None
     if args.role == 'eval':
         frozen = load_eval_checkpoint(args.checkpoint, run_id=args.run_id,
+                                      contract_sha256=contract_digest(loaded),
                                       config_hash=loaded.config_hash)
     adapter_root = str(loaded.motion.adapter_root)
     if adapter_root not in sys.path:

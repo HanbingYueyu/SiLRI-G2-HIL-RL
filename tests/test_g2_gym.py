@@ -93,7 +93,7 @@ def test_guard_reason_reaches_gym_and_reset_does_not_reconstruct_backend():
             self.healthy = True
             self.last_decision = FreshnessDecision('not_checked', 'fixture')
 
-        def __call__(self, obs, info, after):
+        def __call__(self, obs, info, after, after_sdk_ns=None):
             self.calls += 1
             reject = not self.healthy and after is not None
             self.last_decision = FreshnessDecision(

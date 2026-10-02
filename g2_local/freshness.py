@@ -16,6 +16,12 @@ from types import MappingProxyType
 SOURCES = ('left_wrist', 'right_aux', 'joint', 'tf')
 MAX_WALL_JUMP_NS = 1_000_000
 MAX_REPORT_INTEGER = 2**63 - 1
+# One-domain sanity bound: when the SDK command clock and the sensor
+# timestamps share a domain, a source's age inside that domain is at most
+# a few sensor periods. A larger gap means the two clocks are unrelated
+# (e.g. a host clock offset), so the same-domain successor proof is not
+# available and only the local-receipt guarantees apply.
+SDK_SAME_DOMAIN_MAX_NS = 500_000_000
 
 
 def _finite(value, name, *, positive=False):
@@ -105,6 +111,18 @@ def _evidence(info, now):
 
 @dataclass(frozen=True)
 class FreshnessLimits:
+    """Explicit limits; every field is part of the approved commissioning record.
+
+    Enforced today: ``camera_age_s``, ``state_age_s``, ``tf_position_error_m``,
+    ``tf_rotation_error_rad``.
+
+    Recorded but NOT enforced (local-receipt freshness has no clock mapping):
+    ``camera_skew_s`` and ``mapping_error_s``. The guard computes the camera
+    skew for diagnostics only (``FreshnessDecision.camera_skew_s``), and
+    ``mapping_error_s`` has no implementation left. Changing those two values
+    therefore changes ``config_hash`` without changing what is rejected — they
+    stay in the dataclass because the commissioning approval file lists them.
+    """
     camera_age_s: float
     state_age_s: float
     camera_skew_s: float
@@ -126,6 +144,9 @@ class FreshnessDecision:
     source_intervals_ns: object = field(default_factory=lambda: MappingProxyType({}))
     age_intervals_s: object = field(default_factory=lambda: MappingProxyType({}))
     camera_skew_s: float | None = None
+    # Same-domain command-send anchor evidence: anchor/sdk clock, whether the
+    # two clocks proved comparable, and the per-source acquisition margin.
+    sdk_anchor: object | None = None
 
 
 class _Rejected(Exception):
@@ -152,10 +173,21 @@ class FreshnessLeaseGuard:
     def last_decision(self):
         return self.observation_guard.last_decision
 
-    def accept(self, obs, info, after=None):
+    def accept(self, obs, info, after=None, after_sdk_ns=None):
+        """Accept a fresh observation, or leave the existing lease untouched.
+
+        A rejected read must NOT revoke an already granted lease. The command
+        writer resends the *last* target (a measured hold) while the policy loop
+        retries the successor read inside its bounded window; revoking the lease
+        here made the 25 Hz writer latch a fatal ``Command stream fault:
+        Feedback freshness not explicitly confirmed`` after ~40 ms, which killed
+        the whole run before the retry could finish. Safety is unchanged: the
+        lease still expires ``feedback_lease_s`` after the last *accepted*
+        observation, and a new target is only submitted from an accepted read.
+        """
         with self.lock:
-            self.valid_until = None
-            accepted = self.observation_guard(obs, info, after)
+            accepted = self.observation_guard(obs, info, after,
+                                              after_sdk_ns=after_sdk_ns)
             if accepted is True:
                 self.valid_until = self.clock() + self.feedback_lease_s
             return accepted
@@ -238,7 +270,7 @@ class ObservationFreshnessGuard:
             except (_Rejected, KeyError, TypeError, ValueError, OverflowError) as error:
                 raise RuntimeError('Independent stop feedback rejected: '+str(error)) from error
 
-    def __call__(self, obs, info, after=None, *, check_progress=True) -> bool:
+    def __call__(self, obs, info, after=None, after_sdk_ns=None, *, check_progress=True) -> bool:
         with self._lock:
             diagnostics = {}
             try:
@@ -251,6 +283,10 @@ class ObservationFreshnessGuard:
                     sent_ns = math.ceil(Fraction(after)*1_000_000_000)
                     if sent_ns > now:
                         raise ValueError('after is later than local monotonic time')
+                anchor_ns = None
+                if after_sdk_ns is not None:
+                    # Robot-domain anchor of the command send (gdk.Clock at ack).
+                    anchor_ns = _timestamp(after_sdk_ns, 'command send SDK clock')
                 intervals, ages = {}, {}
                 if True:
                     changed = info['source_changed_monotonic_ns']
@@ -295,6 +331,39 @@ class ObservationFreshnessGuard:
                         if earliest <= sent_ns:
                             raise _Rejected('not_after_command:'+source,
                                             f'{source} interval is not strictly after command send')
+                if anchor_ns is not None:
+                    # Same-domain successor proof: the successor source timestamps
+                    # must be *acquired* after the command send. Only possible
+                    # when the SDK clock used for the anchor and the sensor
+                    # timestamps share one domain; that is verified per
+                    # observation instead of assumed, so a hardware/toolchain
+                    # mismatch degrades to the local-receipt guarantee with an
+                    # explicit diagnostic rather than rejecting every frame.
+                    sdk_now = info['sdk_clock_ns']
+                    sdk_ages = {source: sdk_now - stamps[source] for source in SOURCES}
+                    same_domain = all(0 <= age <= SDK_SAME_DOMAIN_MAX_NS
+                                      for age in sdk_ages.values())
+                    diagnostics['sdk_anchor'] = MappingProxyType({
+                        'anchor_ns': anchor_ns, 'sdk_clock_ns': sdk_now,
+                        'same_domain': same_domain,
+                        'margins_ns': MappingProxyType(
+                            {source: stamps[source] - anchor_ns for source in SOURCES}),
+                        'sdk_ages_ns': MappingProxyType(dict(sdk_ages))})
+                    if same_domain:
+                        # Enforced for the successor *images* only: those are what
+                        # pair with the executed action, and a persistently stale
+                        # camera frame is retried inside the successor window.
+                        # joint/tf keep their own 50 ms age limit and strict
+                        # progress check; their same-domain margin is recorded in
+                        # `sdk_anchor.margins_ns` so it can be enforced later
+                        # without risking a spurious fatal fault on a slow state
+                        # topic.
+                        for source in SOURCES[:2]:
+                            if stamps[source] <= anchor_ns:
+                                raise _Rejected(
+                                    'not_after_command_sdk:'+source,
+                                    f'{source} acquisition timestamp is not after the '
+                                    'same-domain command send time')
                 for name, code in (('tf_position_error_m', 'tf_position_error'),
                                    ('tf_rotation_error_rad', 'tf_rotation_error')):
                     if info[name] > getattr(self._limits, name):

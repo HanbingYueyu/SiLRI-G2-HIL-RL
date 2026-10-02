@@ -1,5 +1,13 @@
 # G2 real SiLRI training: operator runbook
 
+> **2026-10-01 安全事件（必须读）**：测试套件曾经**真的驱动了机器人**。`tests/test_g2_training_loop.py` 的一个循环测试漏了替换 `scripts/start_training_actor.py` 的 `run_pre_reset` 接缝，于是测试进程中启动的子进程直接跑了 `g2_local.pre_reset --allow-motion`，在真机上执行了 +Z 5 cm、+Y 10 cm 的复位位移。根因是"测试进程里的 monkeypatch 管不住子进程"。
+>
+> 现在 `tests/conftest.py` 装了两道会话级安全网：任何 argv 命中真机入口（`g2_local.pre_reset`/`real_train`/`manual_demo`/`commissioning_jog`/第 6 节/两个 GDK 探针）的 `subprocess` 调用直接抛 `Refusing to spawn`；真实 `agibot_gdk` 通过 meta-path finder 拒绝导入（不污染 `sys.modules`）。`test_an_unpatched_retraction_seam_cannot_reach_the_robot` 把当初那个漏替身的场景原样重放，确认现在会报错而不会动臂。
+>
+> 教训：**任何会走到 `create_motion_env` / `pre_reset` / 上游复位命令的代码路径都不能在测试里"顺手跑一下"**；这条环境（本机）GDK 可达、`--allow-motion` 生效，测试不是安全沙箱。
+
+> **2026-10-01 更新**：本文是当时快照。时钟层已删除（`clock_monitor`/`live_clock`/`clock_mapping`/`clock_ipc`/`demo_clock`/`clock_probe` 及 `--clock-socket` 全部移除），采集与训练的新鲜度只看**本地接收时间**；当前命令以仓库外层 `常用命令.md` 为准，本文中出现的 `--clock-socket` 命令已失效。
+
 This procedure is for a separately commissioned setup. Software completion does **not** approve robot motion. The hardware emergency stop must remain independent of the Actor, Learner, clock monitor, and host process.
 
 1. Verify the physical E-stop works, identify the person who owns it, and establish an exclusion zone before powering or enabling the robot. Keep all personnel outside the swept workspace.

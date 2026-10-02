@@ -56,6 +56,13 @@ class OwnedObservationSource:
     def read_control_pose(self):
         return getattr(self.reader, 'read_control_pose', None)
 
+    def read_sdk_clock_ns(self):
+        """Delegate the command-send clock anchor; absent readers raise."""
+        source = getattr(self.reader, 'read_sdk_clock_ns', None)
+        if not callable(source):
+            raise AttributeError('Reader exposes no SDK clock')
+        return source()
+
     def close(self):
         if self._closed:
             return

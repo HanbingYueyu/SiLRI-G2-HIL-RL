@@ -1,5 +1,7 @@
 # 固定冰箱首轮训练交接
 
+> **2026-10-01 更新**：本文是当时快照。时钟层已删除（`clock_monitor`/`live_clock`/`clock_mapping`/`clock_ipc`/`demo_clock`/`clock_probe` 及 `--clock-socket` 全部移除），采集与训练的新鲜度只看**本地接收时间**；当前命令以仓库外层 `常用命令.md` 为准，本文中出现的 `--clock-socket` 命令已失效。
+
 ## 当前边界
 
 当前完整回合仍为 0。最新 `train-live-pn2pgrpe` 回传 36 条有效转移，其中人工接管 10 条；Learner 正常保存到 54 次更新（累计 accepted=4086、human=4052）。PTP 最后报告为单调时间 35267.993 s；4.5 秒租约到期后拒绝 successor，35274.722 s 的 ptp4l 报告 `ANNOUNCE_RECEIPT_TIMEOUT_EXPIRES`，监控因 ptp_fault 退出。需要抓包定位 PTP 断流原因，不再把本次问题归因于已修复的 4.001 秒拟合间隔容差。当前工具会话缺少 sudo 凭证，尚未抓包。checkpoint 路径仍为 `runtime/fixed-fridge-training-07/checkpoint.pt`；原迁移前文件保留。Actor 的 `stop_confirmed=false` 需现场确认机器人静止后再启动动作。

@@ -45,7 +45,7 @@ class Guard:
         self.calls = []
         self.last_decision = FreshnessDecision('not_checked', 'fixture')
 
-    def __call__(self, obs, info, after=None):
+    def __call__(self, obs, info, after=None, after_sdk_ns=None):
         self.calls.append(after)
         self.last_decision = FreshnessDecision('ok', 'fixture')
         return True
@@ -83,7 +83,7 @@ def test_create_g2_env_rejects_guard_failure_before_reset_completes():
     client = Client()
 
     class RejectingGuard(Guard):
-        def __call__(self, obs, info, after=None):
+        def __call__(self, obs, info, after=None, after_sdk_ns=None):
             self.calls.append(after)
             self.last_decision = FreshnessDecision('mapping_expired', 'expired')
             return False

@@ -169,7 +169,16 @@ class GdkCommandPort:
     def _check(self):
         self._check_health()
         if self.guard() is not True:
-            raise RuntimeError('Feedback freshness not explicitly confirmed')
+            # Carry the freshness decision code so the caller can tell a
+            # recoverable camera fault from a liveness fault, and so the log
+            # names the actual reason instead of a generic message.
+            decision = getattr(getattr(self.guard, '__self__', None), 'last_decision', None)
+            code = getattr(decision, 'code', None)
+            error = RuntimeError('Feedback freshness not explicitly confirmed'
+                                 + (f': {code}' if isinstance(code, str) and code else ''))
+            if isinstance(code, str) and code:
+                error.code = code
+            raise error
 
     def _write(self, target, *, target_send=False):
         vector(target.position_m, 3)
@@ -447,6 +456,18 @@ class GdkReader:
         self.last_stamps = stamps
         self.last_info = info
         return obs
+
+    def read_sdk_clock_ns(self):
+        """Robot/SDK clock reading, the same domain as the sensor timestamps.
+
+        Used to anchor a command send so a successor observation can be checked
+        with ``successor_timestamp_ns > send_sdk_clock_ns`` inside ONE clock
+        domain (no robot-to-local mapping, no PTP). The freshness guard decides
+        whether the reading is actually comparable with the observation stamps.
+        """
+        if self.closed:
+            raise RuntimeError('Reader is closed')
+        return source_timestamp_ns(self.gdk.Clock.now_ns())
 
     def close(self):
         if not self.closed:

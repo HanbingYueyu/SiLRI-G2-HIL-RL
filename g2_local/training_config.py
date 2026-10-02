@@ -265,6 +265,14 @@ class OptimizationConfig:
     beta_min_human_transitions: int = 256
     actor_update_interval: int = 1  # Legacy profiles retain their original schedule.
     episode_checkpoint_interval: int = 10
+    # Explicit imitation weight for the Actor loss. The Lagrange term alone
+    # self-tunes to just enough constraint (measured: lambda 0.024 -> 2.3% of the
+    # loss once the BC warm start put the Actor close to the expert), so a
+    # separate weight is what makes the *start* of online training lean on the
+    # demonstrations. It decays linearly to zero over
+    # `bc_weight_decay_updates` updates; 0 disables it (legacy behaviour).
+    bc_weight: float = 0.0
+    bc_weight_decay_updates: int = 0
 
 
 @dataclass(frozen=True)
@@ -384,7 +392,7 @@ class LoadedTrainingConfig:
             raise ValueError('A new manifest output directory is required')
         from .code_identity import algorithm_identity
         data = {'schema': self.schema, 'run_id': run_id, 'role': role,
-                'algorithm_identity': algorithm_identity(self.runtime.device),
+                'algorithm_identity': algorithm_identity(self),
                 'config_sha256': self.config_hash,
                 'config': _thaw(self.canonical_payload)}
         encoded = canonical_json(data) + b'\n'
@@ -561,13 +569,26 @@ def parse_schema_one(payload) -> LoadedTrainingConfig:
     for key, default in (('beta_pretrain_steps', 500), ('beta_update_interval', 50),
                          ('beta_update_steps', 50), ('beta_min_demo_episodes', 20),
                          ('beta_min_human_transitions', 256), ('actor_update_interval', 1),
-                         ('episode_checkpoint_interval', 10)):
+                         ('episode_checkpoint_interval', 10),
+                         ('bc_weight', 0.0), ('bc_weight_decay_updates', 0)):
         optimization_values.setdefault(key, default)
+
+    def optimization_value(key):
+        if key.endswith('_lr'):
+            return _number(raw[key], key, positive=True)
+        if key == 'bc_weight':
+            # 0 disables the explicit imitation term; otherwise positive.
+            value = _number(raw[key], key)
+            return value
+        if key == 'bc_weight_decay_updates':
+            return _integer(raw[key], key, minimum=0)
+        return _integer(raw[key], key, minimum=1)
+
     raw = _keys(optimization_values, _fields(OptimizationConfig), 'optimization')
-    optimization = OptimizationConfig(**{
-        key: (_number(raw[key], key, positive=True) if key.endswith('_lr') else
-              _integer(raw[key], key, minimum=1))
-        for key in _fields(OptimizationConfig)})
+    optimization = OptimizationConfig(**{key: optimization_value(key)
+                                         for key in _fields(OptimizationConfig)})
+    if optimization.bc_weight < 0:
+        raise ValueError('bc_weight must be nonnegative')
     if (optimization.online_batch_size > optimization.online_capacity or
             optimization.human_batch_size > optimization.human_capacity or
             optimization.min_online_transitions > optimization.online_capacity or

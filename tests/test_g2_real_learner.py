@@ -1,6 +1,7 @@
 """Focused real Learner contract tests."""
 
 from dataclasses import replace
+from pathlib import Path
 import pytest
 import torch
 import numpy as np
@@ -79,6 +80,24 @@ def test_actor_bc_pretrain_warm_starts_the_actor_only():
         learner.pretrain_actor_behavior(steps=-1)
 
 
+def test_behavior_clone_weight_schedule_decays_to_zero():
+    opt = replace(_config().optimization, bc_weight=1.5, bc_weight_decay_updates=100)
+    learner = RealLearnerRuntime(config=_config(optimization=opt), run_id='run-1')
+    assert learner.behavior_clone_weight() == 1.5
+    learner.update_count = 50
+    assert learner.behavior_clone_weight() == pytest.approx(0.75)
+    learner.update_count = 100
+    assert learner.behavior_clone_weight() == 0.0
+    disabled = replace(_config().optimization, bc_weight=0.0)
+    assert RealLearnerRuntime(config=_config(optimization=disabled),
+                              run_id='run-1').behavior_clone_weight() == 0.0
+    constant = replace(_config().optimization, bc_weight=2.0,
+                       bc_weight_decay_updates=0)
+    off = RealLearnerRuntime(config=_config(optimization=constant), run_id='run-1')
+    off.update_count = 10_000
+    assert off.behavior_clone_weight() == 2.0
+
+
 def test_duplicate_does_not_mutate_replay_or_update_budget():
     learner = _learner()
     row = _row(human=True)
@@ -86,6 +105,34 @@ def test_duplicate_does_not_mutate_replay_or_update_budget():
     before = learner.snapshot_counts()
     assert learner.ingest([row]).duplicates == 1
     assert learner.snapshot_counts() == before
+
+
+def test_actor_bc_warm_start_hard_syncs_the_target_actor():
+    """BC must not leave the Critic bootstrapping from the pre-BC Target Actor."""
+    learner = _learner()
+    learner.ingest([_row(0, human=True), _row(1, human=True)])
+    initial = {k: v.clone() for k, v in learner.policy.actor.state_dict().items()}
+    learner.pretrain_actor_behavior(steps=2)
+    assert any(not torch.equal(v, learner.policy.actor.state_dict()[k])
+               for k, v in initial.items()), 'BC did not move the online Actor'
+    assert all(torch.equal(v, learner.policy.actor_target.state_dict()[k])
+               for k, v in learner.policy.actor.state_dict().items()), \
+        'Target Actor was not hard-synced after the BC warm start'
+
+
+def test_checkpoint_carries_actor_bc_provenance(tmp_path):
+    learner = _learner()
+    learner.ingest([_row(0, human=True), _row(1, human=True)])
+    steps, loss = learner.pretrain_actor_behavior(steps=1)
+    path = learner.save_checkpoint(tmp_path / 'bc.pt')
+    payload = torch.load(path, weights_only=False)
+    assert payload['actor_bc_pretrain_steps'] == 1
+    assert payload['actor_bc_last_loss'] == loss
+    restored = load_checkpoint(path, expected_run_id='run-1',
+                               expected_config_hash='hash-1').runtime
+    assert restored.actor_bc_pretrain_steps == 1
+    assert restored.actor_bc_last_loss == loss
+    assert steps == 1
 
 
 def test_episode_completion_reports_accepted_steps():
@@ -571,6 +618,75 @@ def test_background_optimizer_failure_closes_parameter_liveness(monkeypatch):
         release.set()
         sender.join(5.)
         service.close()
+
+
+def test_contract_identity_is_enforced_while_source_drift_is_only_noticed(tmp_path, capsys):
+    """Regression for "every code edit forces a seed rebuild".
+
+    Stored weights and replay depend on the task/action contract and the policy
+    configuration, not on the runtime/executor source. Editing the Actor loop,
+    the GDK backend or a console string must not invalidate a checkpoint; a
+    changed contract must.
+    """
+    learner = _learner()
+    learner.ingest([_row()])
+    checkpoint = learner.save_checkpoint(tmp_path / 'checkpoint.pt')
+    stored = torch.load(checkpoint, weights_only=False)['algorithm_identity']
+
+    # A checkpoint whose contract digest is unknown or different is refused.
+    with pytest.raises(ValueError, match='contract identity mismatch'):
+        load_checkpoint(checkpoint, expected_run_id='run-1', expected_config_hash='hash-1',
+                        expected_contract_sha256='0' * 64)
+
+    # Same contract, different full-source digest: usable, reported for audit.
+    payload = torch.load(checkpoint, weights_only=False)
+    payload['algorithm_identity'] = dict(stored, contract_sha256='c' * 64,
+                                         source_sha256='f' * 64)
+    drifted = tmp_path / 'drifted.pt'
+    torch.save(payload, drifted)
+    drifted.chmod(0o600)
+    restored = load_checkpoint(drifted, expected_run_id='run-1', expected_config_hash='hash-1',
+                               expected_contract_sha256='c' * 64)
+    assert restored.runtime.run_id == 'run-1'
+    out = capsys.readouterr().err
+    assert 'different algorithm sources' in out and 'stays usable' in out
+
+
+def test_contract_digest_is_stable_and_covers_the_contract_modules():
+    from g2_local.code_identity import SEED_CONTRACT_SOURCES, contract_digest
+    from g2_local.training_config import load_training_config
+    root = Path(__file__).resolve().parents[1]
+    config = load_training_config(root / 'configs/g2_real_training_readonly.json',
+                                  cli_allow_motion=False)
+    first = contract_digest(config)
+    assert first == contract_digest(config)
+    assert len(first) == 64
+    assert 'g2_local/contract.py' in SEED_CONTRACT_SOURCES
+    assert 'g2_local/demonstrations.py' in SEED_CONTRACT_SOURCES
+
+
+def test_a_learner_checkpoint_carries_the_contract_and_resumes(tmp_path):
+    """Regression: the resume path built the runtime from the payload stub, so the
+    next save wrote a checkpoint with NO contract digest, and the resume after that
+    refused the Learner's own file. A full config must flow through load_checkpoint.
+    """
+    from g2_local.code_identity import contract_digest
+    from g2_local.training_config import load_training_config
+    root = Path(__file__).resolve().parents[1]
+    base = load_training_config(root / 'configs/g2_real_training_readonly.json',
+                                cli_allow_motion=False)
+    config = replace(base, runtime=replace(base.runtime, device='cpu'))
+    contract = contract_digest(config)
+    learner = RealLearnerRuntime(config=config, run_id='run-1')
+    path = learner.save_checkpoint(tmp_path / 'cp.pt')
+    assert torch.load(path, weights_only=False)['algorithm_identity']['contract_sha256'] == contract
+
+    restored = load_checkpoint(path, expected_run_id='run-1',
+                               expected_config_hash=config.config_hash,
+                               expected_contract_sha256=contract, full_config=config)
+    assert restored.runtime.algorithm_identity['contract_sha256'] == contract
+    again = restored.runtime.save_checkpoint(tmp_path / 'cp2.pt')
+    assert torch.load(again, weights_only=False)['algorithm_identity']['contract_sha256'] == contract
 
 
 def test_resume_rejects_symlink_and_corrupt_provenance(tmp_path):

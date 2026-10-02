@@ -10,7 +10,7 @@ def test_squared_distance_and_point_one_slack():
     class Expert:
         def get_dist(self, *args):
             return None, zero, zero
-        def __call__(self, *args):
+        def __call__(self, *args, **kwargs):
             return None, None, zero
     fake = NS(expert_network=Expert(), actor=lambda *args: (None, None, model),
               lagrange_net=lambda *args, **kwargs: torch.ones(1,1),

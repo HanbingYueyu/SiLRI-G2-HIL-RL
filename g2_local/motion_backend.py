@@ -76,9 +76,9 @@ class MotionBackend:
         self.execute_lock = threading.Lock()
         self.reader_lock = threading.RLock()
 
-    def _read(self, *, after=None):
+    def _read(self, *, after=None, after_sdk_ns=None):
         with self.reader_lock:
-            return self._read_locked(after=after)
+            return self._read_locked(after=after, after_sdk_ns=after_sdk_ns)
 
     def _check_local(self, pose, stage, *, reference=None):
         reference = self.episode_reference if reference is None else reference
@@ -99,7 +99,7 @@ class MotionBackend:
         try:
             return plan_target(pose, action, self.config)
         except ValueError as error:
-            if str(error) == 'Measured pose already outside configured workspace':
+            if str(error).startswith('Measured pose already outside configured workspace'):
                 error.boundary_event = dict(
                     boundary_kind='absolute_workspace', stage=stage, reason=str(error),
                     pose=list(pose), episode_reference=(list(self.episode_reference)
@@ -108,7 +108,7 @@ class MotionBackend:
                     workspace_high=list(self.config.workspace_high))
             raise
 
-    def _read_locked(self, *, after=None):
+    def _read_locked(self, *, after=None, after_sdk_ns=None):
         if self.stopped or self.closed:
             raise RuntimeError('Motion backend stopped; reconstruct explicitly before rearming')
         self.stream.check()
@@ -132,7 +132,7 @@ class MotionBackend:
             if (array.dtype != np.uint8 or array.ndim != 3 or array.shape[2] != 3
                     or min(array.shape[:2]) <= 0):
                 raise ValueError('Invalid RGB observation')
-        if self.observation_guard(obs, info, after) is not True:
+        if self.observation_guard(obs, info, after, after_sdk_ns=after_sdk_ns) is not True:
             message = 'Source observation freshness not confirmed'
             try:
                 owner = getattr(self.observation_guard, '__self__', self.observation_guard)
@@ -164,21 +164,28 @@ class MotionBackend:
         self._last_accepted = (deepcopy(obs), info)
         return deepcopy(obs)
 
-    def _read_successor(self, sent_at):
-        """Wait briefly for camera timestamps to cross the just-sent action."""
-        deadline = time.monotonic() + min(.20, self.stream.command_timeout*.8)
+    def _read_successor(self, sent_at, sdk_after_ns=None):
+        """Wait briefly for observation timestamps to cross the sent action.
+
+        Rejection codes of the ``not_after_command`` family mean "this sample was
+        not acquired/received after the command", which a fresh read can fix;
+        anything else is a real fault.
+        """
+        window = min(.20, self.stream.command_timeout*.8)
+        deadline = time.monotonic() + window
         while True:
             try:
-                return self._read(after=sent_at)
+                return self._read(after=sent_at, after_sdk_ns=sdk_after_ns)
             except ObservationRejected as error:
                 if error.code not in ('not_after_command:left_wrist',
-                                      'not_after_command:right_aux'):
+                                      'not_after_command:right_aux',
+                                      'not_after_command_sdk:left_wrist',
+                                      'not_after_command_sdk:right_aux'):
                     raise
                 if time.monotonic() >= deadline:
                     from .gdk_backend import CameraUnavailable
                     raise CameraUnavailable(
-                        f'No post-command camera frame within '
-                        f'{min(.20, self.stream.command_timeout*.8):.3f}s; '
+                        f'No post-command camera frame within {window:.3f}s; '
                         f'freshness_code={error.code}') from error
                 self.stream.check()
                 time.sleep(min(.01, max(0., deadline-time.monotonic())))
@@ -319,9 +326,22 @@ class MotionBackend:
             execution.update(send_status='submitted_unconfirmed', command_sequence=sequence)
             sent_at = self.stream.wait_sent(sequence, timeout=self.stream.command_timeout)
             execution.update(send_status='acknowledged', command_sent_monotonic_ns=round(sent_at*1e9))
+            # Robot-domain anchor of this send, read as soon as the command is
+            # acknowledged: the successor must be *acquired* after it, which the
+            # local receipt time alone cannot prove.
+            sdk_after_ns = None
+            reader_clock = getattr(self.reader, 'read_sdk_clock_ns', None)
+            if callable(reader_clock):
+                try:
+                    sdk_after_ns = reader_clock()
+                except BaseException as error:
+                    # Missing SDK clock only removes the extra proof; the local
+                    # receipt, strict progress and age checks still apply.
+                    execution['sdk_anchor_error'] = type(error).__name__
+            execution['command_sent_sdk_ns'] = sdk_after_ns
             self.stream.halt.wait(max(0., sent_at+self.step_period-time.monotonic()))
             self.stream.check()
-            after = self._read_successor(sent_at)
+            after = self._read_successor(sent_at, sdk_after_ns)
             self.last_execution_timing = dict(
                 **execution,
                 policy_position_drift_m=position_drift,

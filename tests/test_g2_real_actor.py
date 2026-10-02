@@ -199,6 +199,38 @@ def actor_rig(*, versions=((3, 8),), blocked=False, capacity=1,
                            envs=envs, coordinator=coordinator, transport=transport)
 
 
+def test_actor_never_steps_behind_an_unverified_input_gate(monkeypatch, capsys):
+    """Regression for the on-hardware failure 'Invalid intervention or freshness
+    gate summary'.
+
+    Upstream reports ``ready`` only after BOTH axis channels have been seen, and
+    the start chord deliberately reads buttons only, so a double-key press without
+    ever moving the knob used to reach the first env.step with
+    ``gate.fresh == verified_neutral == False``. The step was submitted anyway and
+    the transition was then rejected, aborting the episode. The automatic role
+    must wait for a verifiable gate instead, and say what the operator has to do.
+    """
+    rig = actor_rig()
+    intervention = rig.coordinator.intervention
+    gate_at_step = []
+    rig.env.during_step = lambda: gate_at_step.append(bool(intervention.gate.fresh))
+    counter = {'polls': 0}
+
+    def counting(self):
+        counter['polls'] += 1
+        # Only becomes usable after a few polls, i.e. as if the operator nudged
+        # the knob after the episode had already started.
+        self.gate.fresh = counter['polls'] > 4
+        return False, None
+    monkeypatch.setattr(FakeIntervention, '__call__', counting)
+    rig.runtime.run(max_completed_steps=1)
+    out = capsys.readouterr().out
+    assert 'SpaceMouse 还没有上报过轴向数据' in out
+    assert rig.env.step_calls == 1
+    assert gate_at_step == [True]          # the only step ran behind a fresh gate
+    assert counter['polls'] >= 5           # and it genuinely waited first
+
+
 def test_actor_uploads_driver_confirmed_action_with_identity():
     rig = actor_rig()
     rig.runtime.run(max_completed_steps=1)
@@ -712,3 +744,36 @@ def test_step_error_preserves_original_after_coordinator_aborts_itself():
     with pytest.raises(ValueError, match='driver read failed'):
         rig.runtime.run(max_completed_steps=1)
     assert rig.env.backend.stop_calls >= 1
+
+
+def test_labeled_training_episode_can_close_the_actor_for_the_next_reset():
+    """Loop mode: the Actor exits after Y/F so the launcher can run Section 6."""
+    rig = actor_rig(exit_after_labeled_demo=True)
+    rig.runtime.config.task = SimpleNamespace(success_reward=30., failure_reward=-1.)
+    rig.coordinator.keys = SimpleNamespace(
+        poll=lambda: 'success' if rig.env.step_calls == 1 else None)
+
+    summary = rig.runtime.run()
+
+    assert summary.transitions_sent == 1
+    assert summary.stop_reason == 'labeled_episode'
+    assert rig.runtime.stop_confirmed is True
+    assert rig.env.closed and rig.transport.closed
+    assert rig.transport.sent[0]['done'] is True
+    assert rig.transport.sent[0]['reward'] == 30.
+
+
+def test_actor_role_without_an_explicit_policy_accepts_exit_after_yf():
+    """The real Actor passes policy=None and gets parameters from the Learner."""
+    rig = actor_rig()
+    runtime = rig.runtime.__class__(
+        config=SimpleNamespace(runtime=SimpleNamespace(
+            queue_capacity=1, queue_put_timeout_s=.01, learner_silence_timeout_s=10.,
+            operator_poll_interval_s=.001, device='cpu', parameter_heartbeat_s=1.),
+            observation=SimpleNamespace(image_size=128), task=SimpleNamespace()),
+        run_id='run-1', config_hash='hash-1', coordinator=rig.coordinator,
+        context_source=rig.runtime.context_source, transport=rig.transport,
+        env_factory=rig.runtime.env_factory, policy=None, demonstration=False,
+        exit_after_labeled_demo=True)
+    assert runtime.policy is not None
+    assert runtime.exit_after_labeled_demo is True

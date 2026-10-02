@@ -159,13 +159,12 @@ def test_boolean_failure_gets_failure_stop_reason(tmp_path):
 
 def test_eval_checkpoint_checks_identity_without_constructing_optimizer(tmp_path):
     import torch
-    from g2_local.code_identity import algorithm_identity
     checkpoint = tmp_path / 'checkpoint.pt'
     torch.save({'schema': 1, 'run_id': 'run-1', 'config_hash': 'hash-1',
                 'manifest_digest': 'hash-1', 'camera_keys': ('left_wrist', 'right_aux'),
                 'image_size': 128, 'action_size': 6, 'version': 4,
                 'published_version': 3, 'runtime': {'device': 'cpu'},
-                'algorithm_identity': algorithm_identity('cpu'),
+                'algorithm_identity': {'schema': 3, 'source_sha256': 'a' * 64},
                 'published_actor_state': {'weight': torch.tensor([3.])}}, checkpoint)
     checkpoint.chmod(0o600)
     frozen = real_train.load_eval_checkpoint(checkpoint, run_id='run-1',
@@ -352,3 +351,80 @@ def test_learner_passes_owned_output_checkpoint_path_to_runtime(tmp_path, monkey
     args = SimpleNamespace(checkpoint=None, run_id='run-1')
     assert real_train._run_learner(args, loaded, evidence) == 0
     assert created[0]['checkpoint_path'] == output / 'checkpoint.pt'
+
+
+class _BoundaryReached(Exception):
+    """Raised by the fake hardware boundary: construction already succeeded."""
+
+
+def test_actor_entry_point_reaches_the_hardware_boundary_with_loop_flags(tmp_path, monkeypatch):
+    """The real CLI wiring for the training loop (actor + exit-after-Y/F).
+
+    This is the level that a unit test of ``RealActorRuntime`` cannot cover: the
+    flag has to survive argument parsing, preflight and the constructor call in
+    ``_run_actor_or_eval``. Skips when the live config and its commissioning
+    evidence are not present on this machine.
+    """
+    live = Path(__file__).resolve().parents[1] / 'runtime/train-fixed-fridge-20260928-camera-relaxed.json'
+    if not live.is_file():
+        pytest.skip('live training config is not present')
+
+    seen = {}
+
+    class FakeHid:
+        def __init__(self, path):
+            seen['hid'] = path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class FakePolicy:
+        def eval(self):
+            return self
+
+    class FakeTransport:
+        def __init__(self, address, **kwargs):
+            seen['address'] = address
+
+        def assert_alive(self):
+            raise _BoundaryReached('hardware boundary')
+
+        def telemetry(self, kind, **fields):
+            return None
+
+        def close(self):
+            return None
+
+    from g2_local import real_actor
+
+    class RecordingRuntime(real_actor.RealActorRuntime):
+        def __init__(self, **kwargs):
+            seen['exit_after_labeled_demo'] = kwargs.get('exit_after_labeled_demo')
+            seen['demonstration'] = kwargs.get('demonstration')
+            seen['policy_arg'] = kwargs.get('policy')
+            super().__init__(**kwargs)
+
+    # The live config asks for CUDA; this test never runs real torch work.
+    import torch
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(real_train, 'import_gdk_runtime', lambda: FakeHid)
+    monkeypatch.setattr(real_train, '_TerminalInput', lambda: __import__('contextlib').nullcontext())
+    monkeypatch.setattr(real_actor, 'GrpcActorTransport', FakeTransport)
+    monkeypatch.setattr(real_actor, 'RealActorRuntime', RecordingRuntime)
+    monkeypatch.setattr(real_actor, 'create_policy', lambda device: FakePolicy())
+    monkeypatch.setattr('g2_local.motion_env.create_motion_env', lambda *a, **k: None)
+
+    output = tmp_path / 'actor'
+    code = real_train.main(['actor', '--run-id', 'run-1', '--config', str(live),
+                            '--output', str(output), '--hid-device', '/dev/null',
+                            '--context', str(tmp_path / 'context.json'),
+                            '--allow-motion', '--exit-after-labeled-demo'])
+    assert code == 1, 'the fake boundary error should make the run fail closed'
+    assert seen['exit_after_labeled_demo'] is True
+    assert seen['demonstration'] is False
+    assert seen['policy_arg'] is None, 'the Actor role loads parameters from the Learner'
+    result = json.loads((output / 'run_result.json').read_text())
+    assert result['status'] == 'failed'

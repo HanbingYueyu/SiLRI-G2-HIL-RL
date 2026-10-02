@@ -35,3 +35,64 @@
 - 新种子 `runtime/offline-pretrain-20260927-04/`：30 条/4042 步，β500、Critic10、Actor5；恢复后第11次更新通过，预算保持0。
 - 实际 Replay（在线1024、人工4042）单次保存测量：2.372 s，文件4,039,856,023字节；期间43次心跳，最大调用耗时0.0472 ms，进程峰值RSS约8.43 GiB（含加载/模型，不是保存增量）。不是p95/最坏延迟，也未测满队列持续上传；测量副本已移入回收站，正式种子保留。
 - 只删除可再生缓存（移入回收站）。示范、checkpoint、故障证据、SDK/虚拟环境、论文/审查资料保留。旧 worktree 存在脏状态，未强制删除。
+
+## 同域证明的真机核对（2026-10-01，只读探针）
+
+`ObservationFreshnessGuard` 里那条"动作后必须出现时间戳更晚的帧"的严格证明，前提是 SDK 时钟
+（`gdk.Clock.now_ns()`）与相机/关节/TF 时间戳属于**同一个时间基准**。这一点此前只是按设计推断，
+没有真机数据。现在测了：
+
+```
+bash run_g2_python.sh scripts/gdk_clock_probe.py --reads 5
+```
+
+结果：`sdk_clock_ns − stamp` 五次采样分别为 182833.5 / 182827.1 / 182818.7 / 182814.2 / 182808.5 ms，
+**全部远超实现里 500 ms 的 `SDK_SAME_DOMAIN_MAX_NS`**，判定 NOT same domain —— 两者相差一个约 183 秒的
+常量偏移。PTP（`ptp_hard.sh`）只作用于日志/文件时间对齐与 GDK 的传感器延迟接口，改不掉这个偏移。
+
+因此本机实际生效的是**退化后的本地接收保证**，而不是同域严格证明：
+
+- `freshness.py:352` 的 `if same_domain:` 分支不进入，`not_after_command_sdk:*` 不会被触发；
+- 实际用的是本地单调时间：`camera_age_s=0.25` / `state_age_s=0.05` 的接收年龄上限、相机时间戳
+  严格前进（相同时间戳按缓存帧容忍）、以及 `not_after_command:*`（本地接收区间必须严格晚于发送时刻）；
+- 每个样本在证据里记 `sdk_anchor.same_domain=false` 与 `sdk_anchor.margins_ns`，供后续审计或将来
+  改成真正同域时再启用。
+
+结论：P1-2 的严格同域证明在当前硬件上**不生效且不会造成误拒**（设计上就是"核实不了就退化并留证"）；
+不需要为此调整 PTP 或放宽任何阈值。同时把 `scripts/gdk_clock_probe.py` 从失效的 `GdkBackend` API
+修到现行的 `GdkReader`，`scripts/gdk_reinit_probe.py` 同样修正。
+
+## 身份判定重构：契约摘要强制，源码摘要仅审计（2026-10-01）
+
+原实现把 `source_digest`（`g2_local/**/*.py`、顶层 `*.py`/`*.sh`、`lerobot/src/lerobot/**/*.py`、
+`rl_envs*`、`native/*.cpp`、`_gdk_safe_stop*.so` 的全部字节，外加 git HEAD 与依赖版本）作为唯一
+身份，并在加载 seed/checkpoint 时**全等比较**。后果是：改一行日志、加一个注释、甚至只是换一次
+git commit，都会让 4.9 GB 的 seed 和正在训练中的 checkpoint 一起失效 —— 一个诚实的 bug 修复要
+付 15 分钟 GPU 重建的代价。这本身是设计缺陷。
+
+现在拆成两层（`g2_local/code_identity.py`）：
+
+- **`contract_sha256`（强制）**：示教契约（`task` 的 `action_scale`/`control_hz`/`ee_*_range*`/
+  `fix_gripper`/`reward_source`/`target_xy_range_m`、整个 `observation`、整个 `intervention`、
+  `motion` 的 `control_mode`/`local_envelope`/`workspace_low`/`workspace_high` 键）+ 定义与校验
+  该契约的三个模块（`contract.py`、`config.py`、`demonstrations.py`）的字节 + 策略配置
+  （`draccus.encode(create_policy_config(...))`）。只有它变了才拒绝加载。
+- **`source_sha256`（审计）**：全部算法源码 + git HEAD + 依赖版本。不同时只在 stderr 打印
+  `note: … written by different algorithm sources … the task/action contract and policy
+  configuration are unchanged, so this checkpoint stays usable`，并写进 checkpoint 供审计。
+
+`config_hash`（整份配置 JSON）仍然强制：存储的转移里带着当时的奖励值与回合标签，混用会静默出错；
+`schema`、`run_id`、相机/动作契约与 replay 张量契约的检查一律保留。生产调用方
+（`g2_local.real_train` 的 learner/eval、`g2_local.offline_pretrain`）显式传入
+`expected_contract_sha256`；没有契约字段的旧 checkpoint 被拒绝而不是默默接受。
+
+回归测试：`tests/test_g2_real_learner.py::test_contract_identity_is_enforced_while_source_drift_is_only_noticed`
+（同契约不同源码 → 照常加载并打印审计提示；契约不同 → 拒绝）与
+`tests/test_g2_real_actor.py::test_actor_never_steps_behind_an_unverified_input_gate`。
+
+同一轮还修掉了 Actor 侧的一个真实缺陷：`AutomaticIntervention.__call__` 的"启动未就绪"早退分支
+在回合已 `RUNNING` 时返回 `(False, None)`，而 `gate.fresh`/`verified_neutral` 都还是 `False`
+（上游 `CompactReports.snapshot().ready` 要求两个轴向报告都出现过，而 `StartChord` 只看按钮），
+于是第一个 step 会带着未经验证的人工输入闸门提交策略动作，随后被
+`Invalid intervention or freshness gate summary` 拒绝、回合中断。现在策略分支在闸门可验证之前
+只轮询 HID 并提示操作者拨一下旋帽，不提交动作也不记过渡。

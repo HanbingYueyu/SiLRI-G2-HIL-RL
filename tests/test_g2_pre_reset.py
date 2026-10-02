@@ -50,7 +50,7 @@ def test_reset_only_workspace_allows_approved_path_without_changing_demo_limits(
         limits=reset.motion.limits, local_envelope=None))
     assert lift[2] == pytest.approx(.99144654)
     assert shift[1] == pytest.approx(.27285539)
-    assert reset.motion.limits.workspace_high == (.6665, .28, 1.00)
+    assert reset.motion.limits.workspace_high == pytest.approx((.6665, .3501, 1.02))
     assert original.motion.limits.workspace_high == (.6665, .2451, .965)
     assert reset.motion.auto_reset.linear_speed_m_s == .04
     assert original.motion.auto_reset.linear_speed_m_s == .01
@@ -96,7 +96,7 @@ def test_pre_reset_main_passes_expanded_limits_only_to_its_own_backend(monkeypat
     monkeypatch.setattr(pre_reset, 'create_motion_env', create)
     monkeypatch.setattr(pre_reset, 'run_pre_reset', run)
     assert pre_reset.main(['--config', 'unused.json', '--allow-motion']) == 0
-    assert seen['backend_config'].motion.limits.workspace_high == (.6665, .28, 1.0)
+    assert seen['backend_config'].motion.limits.workspace_high == pytest.approx((.6665, .3501, 1.02))
     assert seen['reset_motion'] is seen['backend_config'].motion
     assert seen['start_limits'] is original.motion.limits
     assert original.motion.limits.workspace_high == (.6665, .2451, .965)

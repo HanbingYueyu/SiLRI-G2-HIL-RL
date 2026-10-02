@@ -46,7 +46,7 @@ def test_mapping_startup_wait_is_transient_only(code, retry):
     class Guard:
         calls = 0
         last_decision = FreshnessDecision(code, 'fixture')
-        def __call__(self, *args):
+        def __call__(self, *args, **kwargs):
             self.calls += 1
             return self.calls == 2
     guard = Guard()
@@ -72,7 +72,7 @@ def test_startup_discards_old_camera_without_sending_then_never_retries_live():
     class Guard:
         calls = 0
         last_decision = FreshnessDecision('camera_stale:left_wrist', 'old startup frame')
-        def __call__(self, *args):
+        def __call__(self, *args, **kwargs):
             self.calls += 1
             return self.calls == 2
     guard = Guard()
@@ -93,7 +93,7 @@ def test_bound_method_preserves_freshness_rejection_code():
     port = Port(reader)
     class Lease:
         last_decision = FreshnessDecision('camera_stale:left_wrist', 'old camera')
-        def accept(self, *args):
+        def accept(self, *args, **kwargs):
             return False
     driver = backend(reader, port, observation_guard=Lease().accept, allow_motion=True)
     try:
@@ -149,7 +149,7 @@ def backend(reader, port, *, observation_guard=None, outcome=None, **kwargs):
     from g2_local.motion_backend import MotionBackend
     config = LocalTaskConfig(action_scale=(.01,)*6, workspace_low=(-1,)*3,workspace_high=(1,)*3)
     if observation_guard is None:
-        observation_guard = lambda obs, info, after: info['captured'] >= (after or 0)
+        observation_guard = lambda obs, info, after, after_sdk_ns=None: info['captured'] >= (after or 0)
     if outcome is None:
         outcome = lambda obs: (0., False)
     return MotionBackend(reader, port, config=config,
@@ -165,7 +165,7 @@ class RejectingGuard:
         self.healthy = False
         self.last_decision = FreshnessDecision('not_checked', 'fixture')
 
-    def __call__(self, obs, info, after):
+    def __call__(self, obs, info, after, after_sdk_ns=None):
         reject = not self.healthy and (after is not None if self.after_send else True)
         self.last_decision = FreshnessDecision(
             self.code if reject else 'ok', 'fixture decision')
@@ -222,7 +222,7 @@ def test_successor_waits_briefly_for_camera_frames_after_command_send():
             self.after_calls = 0
             self.last_decision = FreshnessDecision('ok', 'fixture')
 
-        def __call__(self, _obs, _info, after):
+        def __call__(self, _obs, _info, after, after_sdk_ns=None):
             if after is None:
                 return True
             self.after_calls += 1
@@ -253,7 +253,7 @@ def test_missing_post_command_camera_frame_uses_recoverable_camera_fault():
     class Guard:
         last_decision = FreshnessDecision('not_after_command:left_wrist', 'frame predates command')
 
-        def __call__(self, _obs, _info, after):
+        def __call__(self, _obs, _info, after, after_sdk_ns=None):
             return after is None
 
     driver = backend(reader, port, observation_guard=Guard(), allow_motion=True)
@@ -414,7 +414,7 @@ def test_guard_accepts_only_the_exact_true_singleton(result):
     class Guard:
         last_decision = FreshnessDecision('mapping_invalid', 'fixture')
 
-        def __call__(self, obs, info, after):
+        def __call__(self, obs, info, after, after_sdk_ns=None):
             return result
 
     driver = backend(reader, port, observation_guard=Guard(), allow_motion=True)
@@ -434,7 +434,7 @@ def test_diagnostic_lookup_failure_still_fails_closed_without_masking_rejection(
     class Guard:
         diagnostic_reads = 0
 
-        def __call__(self, obs, info, after):
+        def __call__(self, obs, info, after, after_sdk_ns=None):
             return False
 
         @property
@@ -461,7 +461,7 @@ def test_unsafe_diagnostic_code_is_not_interpolated_into_the_error():
     class Guard:
         last_decision = FreshnessDecision('unsafe\noperator message', 'fixture')
 
-        def __call__(self, obs, info, after):
+        def __call__(self, obs, info, after, after_sdk_ns=None):
             return False
 
     driver = backend(reader, port, observation_guard=Guard(), allow_motion=True)
@@ -479,7 +479,7 @@ def test_guard_exception_fails_closed_before_send():
     reader = Reader()
     port = Port(reader)
 
-    def broken_guard(obs, info, after):
+    def broken_guard(obs, info, after, after_sdk_ns=None):
         raise TimeoutError('snapshot timed out')
 
     driver = backend(reader, port, observation_guard=broken_guard, allow_motion=True)

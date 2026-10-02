@@ -187,9 +187,9 @@ def test_failed_port_construction_releases_reader_then_clock():
 
 
 def accepting_guard(limits, **kwargs):
-    def accept(obs, info, after):
+    def accept(obs, info, after, after_sdk_ns=None):
         return True
-    accept.revalidate = lambda obs, info: True
+    accept.revalidate = lambda obs, info, after=None, after_sdk_ns=None: True
     return accept
 
 
@@ -232,7 +232,7 @@ def test_feedback_lease_expires_without_another_gym_step(monkeypatch):
 def test_freshness_lease_requires_exact_true_and_expires():
     now = [10.]
     accepted = [True]
-    lease = FreshnessLeaseGuard(lambda obs, info, after: accepted[0],
+    lease = FreshnessLeaseGuard(lambda obs, info, after, after_sdk_ns=None: accepted[0],
                                 feedback_lease_s=.1, clock=lambda: now[0])
     assert lease() is False
     assert lease.accept({}, {}, None) is True

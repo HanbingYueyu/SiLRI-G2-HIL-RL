@@ -43,7 +43,7 @@ def _backend(reader, port, outcome):
         config=LocalTaskConfig(action_scale=(.01,) * 6,
                                 workspace_low=(-1.,) * 3,
                                 workspace_high=(1.,) * 3),
-        observation_guard=lambda obs, info, after: True,
+        observation_guard=lambda obs, info, after, after_sdk_ns=None: True,
         outcome=outcome,
         command_timeout=.3, send_timeout=.1, step_period=.02,
         allow_motion=True)

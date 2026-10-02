@@ -260,6 +260,7 @@ class SiLRIPolicy(
             loss_actor_dict = self.compute_loss_actor(
                     observations=observations,
                     observation_features=observation_features,
+                    bc_weight=batch.get("bc_weight"),
                 )
 
             if self.config.num_discrete_actions is not None:
@@ -299,6 +300,18 @@ class SiLRIPolicy(
                 param.data * self.config.actor_target_update_weight
                 + target_param.data * (1.0 - self.config.actor_target_update_weight)
             )
+
+    def hard_update_actor_target(self):
+        """Copy the online Actor into the Target Actor exactly once.
+
+        The Target Actor is created as a copy of the *initial* Actor. After a
+        behaviour-cloning warm start the online Actor is a different network, so
+        the soft update (tau = 0.005 per update) would let the Critic bootstrap
+        from the pre-BC policy for hundreds of updates. A warm start must end
+        with this hard sync, otherwise the whole point of the warm start is
+        partly cancelled by early, wrong TD targets.
+        """
+        self.actor_target.load_state_dict(self.actor.state_dict())
 
     def compute_loss_expert(self, observations, actions, observation_features: Tensor | None = None, is_intervention: Tensor | None = None) -> Tensor:
         log_probs = self.expert_network.get_log_probs(observations, actions[:, 0:self.continuous_action_dim], observation_features)
@@ -430,7 +443,8 @@ class SiLRIPolicy(
     def compute_loss_actor(
         self,
         observations,
-        observation_features: Tensor | None = None
+        observation_features: Tensor | None = None,
+        bc_weight: float | None = None
     ) -> Tensor:    
 
         with torch.no_grad():
@@ -452,7 +466,17 @@ class SiLRIPolicy(
 
         min_q_preds = - q_preds.min(dim=0)[0]
 
-        actor_loss  = (min_q_preds + combine_BC * lagrange_multiplier) / (1 + lagrange_multiplier)
+        # Explicit behaviour-cloning weight for the start of online training.
+        # It is added to the state-wise multiplier before the same
+        # normalisation, so the imitation share of this loss is exactly
+        # (lambda + w) / (1 + lambda + w) and w = 0 reproduces the previous
+        # formulation.
+        explicit_bc = 0.0 if bc_weight is None else float(bc_weight)
+        if not explicit_bc >= 0.0:
+            raise ValueError('bc_weight must be nonnegative')
+        effective_weight = lagrange_multiplier + explicit_bc
+
+        actor_loss  = (min_q_preds + combine_BC * effective_weight) / (1 + effective_weight)
         actor_loss = actor_loss.mean()
 
         min_q_preds = min_q_preds.mean().detach()
@@ -465,6 +489,10 @@ class SiLRIPolicy(
             "bc_loss": bc_loss.item(),
             "min_q_preds": min_q_preds,
             'lagrange_multiplier_value': lagrange_multiplier_value,
+            'explicit_bc_weight': explicit_bc,
+            'imitation_share': float(
+                ((lagrange_multiplier + explicit_bc) /
+                 (1 + lagrange_multiplier + explicit_bc)).mean().item()),
         }
 
 
