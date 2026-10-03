@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 import threading
+import time
 import grpc
 import json
 import numpy as np
@@ -45,6 +46,7 @@ class FakeTransport:
     def __init__(self, messages, blocked=False):
         self.messages = list(messages)
         self.sent = []
+        self.unconfirmed = []
         self.blocked = blocked
         self.closed = False
 
@@ -58,6 +60,13 @@ class FakeTransport:
         if self.blocked:
             raise TimeoutError('transition uplink backpressure')
         self.sent.extend(rows)
+        self.unconfirmed.extend(rows)
+
+    def take_confirmed(self):
+        if not self.unconfirmed:
+            return []
+        rows, self.unconfirmed = tuple(self.unconfirmed), []
+        return [rows]
 
     def close(self):
         self.closed = True
@@ -225,7 +234,7 @@ def test_actor_never_steps_behind_an_unverified_input_gate(monkeypatch, capsys):
     monkeypatch.setattr(FakeIntervention, '__call__', counting)
     rig.runtime.run(max_completed_steps=1)
     out = capsys.readouterr().out
-    assert 'SpaceMouse 还没有上报过轴向数据' in out
+    assert '等待 SpaceMouse 就绪' in out
     assert rig.env.step_calls == 1
     assert gate_at_step == [True]          # the only step ran behind a fresh gate
     assert counter['polls'] >= 5           # and it genuinely waited first
@@ -253,7 +262,7 @@ def test_console_announces_parameters_start_and_episode_steps(capsys):
     out = capsys.readouterr().out
     assert '已收到 Learner 策略参数：version=v3' in out
     assert '双键已识别：第 1 个回合开始' in out
-    assert '回合 #1 结束：steps=1 结果=截断' in out
+    assert '本回合结束（本进程第 1 个）：steps=1 结果=截断' in out
     assert out.startswith('[')
 
 
@@ -599,6 +608,73 @@ def test_transition_validator_rejects_unknown_identity_and_nonfinite_action():
         validate_real_transition(row, 'run-1', 'hash-1')
 
 
+def test_idle_actor_waits_past_the_learner_silence_timeout(monkeypatch):
+    """Hardware regression: the Learner publishes on version change and stays quiet
+    while idle, so a five-second silence timeout killed the Actor while it was still
+    waiting for the operator to press the double key (the runbook promises 30 s).
+
+    Silence is only meaningful while control is running, or before the first
+    parameters have ever arrived.
+    """
+    rig = actor_rig()
+    runtime = rig.runtime
+    rig.transport.messages.clear()         # the Learner has nothing new to say
+    clock = {'now': 0.}
+    monkeypatch.setattr(runtime, 'clock', lambda: clock['now'])
+    runtime.parameter_version = 3          # parameters were received earlier
+    runtime.last_parameter_at = 0.
+    clock['now'] = 1000.                   # far beyond learner_silence_timeout_s
+    runtime.coordinator.running = False
+    assert runtime.accept_latest_parameters() is False
+    runtime.coordinator.running = True     # mid-episode silence is still fatal
+    with pytest.raises(TimeoutError, match='silence'):
+        runtime.accept_latest_parameters()
+    runtime.coordinator.running = False    # and so is never having spoken at all
+    runtime.parameter_version = -1
+    with pytest.raises(TimeoutError, match='silence'):
+        runtime.accept_latest_parameters()
+
+
+def test_uplink_never_blocks_the_control_path_on_a_slow_learner():
+    """Hardware regression for 'Command stream fault: target lease expired'.
+
+    One Learner optimizer update was measured at 2.378 s while the command lease is
+    1.5 s, and the Actor used to wait for the uplink acknowledgement inside the
+    control loop, so a healthy episode died. Enqueueing must return immediately;
+    confirmation is collected afterwards through take_confirmed().
+    """
+    from lerobot.transport.utils import receive_bytes_in_chunks
+    closed = threading.Event()
+    finished = threading.Event()
+
+    class Stub:
+        def StreamParameters(self, request):
+            while not closed.wait(.01):
+                yield from ()
+
+        def SendTransitions(self, chunks, timeout):
+            receive_bytes_in_chunks(chunks, None, closed)
+            time.sleep(.6)          # a slow Learner, well beyond the 1.5 s lease
+            finished.set()
+
+    transport = GrpcActorTransport('127.0.0.1:9999', queue_capacity=4,
+                                   timeout_s=2., stub=Stub(),
+                                   channel=SimpleNamespace(close=closed.set))
+    try:
+        started = time.monotonic()
+        transport.send_transition_batch([{'complementary_info': {
+            'transition_id': 'run-1/episode-1/0'}}])
+        elapsed = time.monotonic()-started
+        assert elapsed < .2, f'the control path blocked for {elapsed:.3f}s on the Learner'
+        assert transport.take_confirmed() == []
+        assert transport.drain() is True
+        assert finished.is_set()
+        assert [rows[0]['complementary_info']['transition_id']
+                for rows in transport.take_confirmed()] == ['run-1/episode-1/0']
+    finally:
+        transport.close()
+
+
 def test_timed_out_uplink_retries_identical_transition_ids():
     from lerobot.transport.utils import bytes_to_transitions, receive_bytes_in_chunks
     closed = threading.Event()
@@ -623,9 +699,14 @@ def test_timed_out_uplink_retries_identical_transition_ids():
                                    timeout_s=.1, stub=Stub(),
                                    channel=SimpleNamespace(close=closed.set))
     try:
+        # Enqueue is non-blocking by design (the control loop must not wait for the
+        # Learner); drain before asserting what the wire actually carried.
         transport.send_transition_batch([{'complementary_info': {'transition_id':
                                                                   'run-1/episode-1/0'}}])
+        assert transport.drain() is True
         assert ids == ['run-1/episode-1/0', 'run-1/episode-1/0']
+        assert transport.take_confirmed() == [({'complementary_info': {'transition_id':
+                                                                        'run-1/episode-1/0'}},)]
     finally:
         transport.close()
 

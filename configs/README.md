@@ -18,6 +18,10 @@ bash run_g2_python.sh scripts/export_run_manifest.py
 
 每轮实验应提交：`configs/runtime-live.json`、`runtime/experiment-manifest-*.json`，以及 seed 目录里的 `datasets.json` / `events.jsonl` / `result.json`（若需要审计）。
 
+**实测的裁剪与频率**（2026-10-02 真机 1336 步）：工作空间裁剪发生 **20 步（1.5%）**，最大裁剪 **1.21 mm**（一步 XYZ 满幅才 1.5 mm，所以触发时幅度不小）；`control_period_s` 中位 **0.102 s**，即**实测约 10 Hz，不是配置里的 30 Hz**。奖励/折扣的步数分析按"步"计，与频率无关；但"每回合约 11.7 秒"是按 30 Hz 算的，实测约 35 秒。`min_online_transitions=256` 是**回放池最小容量**（示教已经把它填满，所以第一条真机转移就能触发更新），不是"先攒 256 条真机数据"；日志里 `真机新增 N` 才是本次 run 新收集的真机转移数。
+
+**内存（14 GB 机器的硬约束）**：回放里的相机帧现在按**采集精度 uint8** 存储（2026-10-02 改）。改动前每步的 `state`+`next_state` 图像是 float32，768 KB/步 → human 5632 步 4.22 GB + online 1024 步 0.77 GB ≈ 5.0 GB，加上存盘时的序列化峰值，Learner 常驻到 **11.6 GB** 并被内核 OOM 杀掉（`/var/log/syslog`: `Out of memory: Killed process … anon-rss:11560296kB`）。uint8 后每步 192 KB → 回放 ≈1.25 GB，checkpoint 从 4.9 GB 降到约 1.3 GB，常驻约 3–4 GB、存盘峰值约 5 GB。旧 checkpoint（float32 回放）在加载时会自动转换成 uint8，进度不丢。注意：`ReplayBuffer` 的存储 dtype 由**第一条** transition 决定，所以任何新的插入路径都必须先过 `_training_row`。
+
 **身份分两层**（`g2_local/code_identity.py`）：`contract_sha256` 强制（示教契约键 + `g2_local/contract.py`/`config.py`/`demonstrations.py` 的字节 + 策略配置，剔除 `device`/`storage_device`/`use_amp` 这三个部署相关键，因此与本机是否插着 GPU 无关），变了才需要重建 seed；`source_sha256` 只记录全部算法源码、git HEAD 和依赖版本，用于审计，**不同也照常加载**（只在 stderr 提示）。所以"修运行时代码"不再作废 seed/checkpoint，`config_hash`（整份配置）仍然强制。
 
 seed 相关的两个数字**不在配置里**，只在命令行和 `result.json` / `events.jsonl` 里，审计时必须一起看：

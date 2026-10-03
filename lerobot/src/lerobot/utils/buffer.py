@@ -140,10 +140,14 @@ class ReplayBuffer:
         # Determine shapes from the first transition
         state_shapes = {key: val.squeeze(0).shape for key, val in state.items()}
         action_shape = action.squeeze(0).shape
-        # Pre-allocate tensors for storage
+        # Pre-allocate tensors for storage, keeping the dtype each field arrives
+        # with. `torch.empty` defaults to float32, so camera frames (uint8, 4x
+        # smaller) used to be silently upcast into 4x the memory and into values
+        # the policy does not expect.
         self.states = {
-            key: torch.empty((self.capacity, *shape), device=self.storage_device)
-            for key, shape in state_shapes.items()
+            key: torch.empty((self.capacity, *value.squeeze(0).shape),
+                             dtype=value.dtype, device=self.storage_device)
+            for key, value in state.items()
         }
         self.actions = torch.empty((self.capacity, *action_shape), device=self.storage_device)
         self.rewards = torch.empty((self.capacity,), device=self.storage_device)
@@ -151,8 +155,9 @@ class ReplayBuffer:
         if not self.optimize_memory:
             # Standard approach: store states and next_states separately
             self.next_states = {
-                key: torch.empty((self.capacity, *shape), device=self.storage_device)
-                for key, shape in state_shapes.items()
+                key: torch.empty((self.capacity, *value.squeeze(0).shape),
+                                 dtype=value.dtype, device=self.storage_device)
+                for key, value in state.items()
             }
         else:
             # Memory-optimized approach: don't allocate next_states buffer

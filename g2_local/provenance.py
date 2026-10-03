@@ -34,9 +34,9 @@ def compact_record(row):
                for field in ('state', 'next_state')}}
 
 
-def validate_record(row, run_id, config_hash):
+def validate_record(row, run_id, config_hash, *, check_identity=True):
     validate_transition_provenance({**row, 'action': torch.tensor(row['action'], dtype=torch.float32)},
-                                   run_id, config_hash)
+                                   run_id, config_hash, check_identity=check_identity)
     expected = {'observation.state', *(f'observation.images.{key}' for key in CAMERA_KEYS)}
     for field in ('state', 'next_state'):
         observation = row[field]
@@ -127,7 +127,8 @@ class ProvenanceRecords:
             os.fsync(stream.fileno())
 
     @classmethod
-    def restore(cls, directory, descriptor, *, capacity, run_id, config_hash):
+    def restore(cls, directory, descriptor, *, capacity, run_id, config_hash,
+                check_identity=True):
         if (type(descriptor) is not dict or set(descriptor) != {'format', 'file', 'sha256', 'size', 'count'} or
                 descriptor['format'] != 'rgb-sha256-v1' or
                 type(descriptor['sha256']) is not str or len(descriptor['sha256']) != 64 or
@@ -146,7 +147,7 @@ class ProvenanceRecords:
                 if len(data) > 131072 or not data.endswith(b'\n'):
                     raise ValueError('Invalid provenance record boundary')
                 row = json.loads(data, object_pairs_hook=_unique_pairs, parse_constant=_reject_constant)
-                validate_record(row, run_id, config_hash)
+                validate_record(row, run_id, config_hash, check_identity=check_identity)
                 records.append(row)
         if records.descriptor() != descriptor:
             raise ValueError('Checkpoint provenance integrity mismatch')

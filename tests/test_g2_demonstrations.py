@@ -83,7 +83,14 @@ def test_complete_demo_imports_human_actions_pixels_and_resumes_without_duplicat
     assert len(learner.human_replay) == len(learner.online_replay) == 2
     assert len(learner.imported_demo_episodes) == 1
     assert learner.human_replay.actions[0, 0].item() == pytest.approx(.4)
-    assert torch.all(learner.human_replay.next_states['observation.images.left_wrist'][0] == .25)
+    # Frames are stored at capture precision: uint8 (0.25 -> 64), and converted
+    # back to float32 in [0, 1] when the policy consumes a batch.
+    stored = learner.human_replay.next_states['observation.images.left_wrist'][0]
+    assert stored.dtype == torch.uint8 and torch.all(stored == 64)
+    from g2_local.real_learner import _frames_for_policy
+    fed = _frames_for_policy(learner.human_replay.sample(1))['next_state']
+    assert fed['observation.images.left_wrist'].dtype == torch.float32
+    assert torch.allclose(fed['observation.images.left_wrist'], torch.tensor(64/255.), atol=1e-6)
     assert learner.human_replay.dones[:2].tolist() == [False, True]
     assert evidence.events[0][1]['source_run_id'] == 'run-1'
     checkpoint = learner.save_checkpoint(tmp_path / 'checkpoint.pt')

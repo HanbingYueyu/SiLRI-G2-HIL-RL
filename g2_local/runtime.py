@@ -36,8 +36,27 @@ def receive_parameters(stream, output, stop):
             output.put(exc)
 
 
+def _policy_frames(data):
+    """Give the policy float32 frames in [0, 1] whatever the replay stores.
+
+    The replay keeps captured frames as uint8 (4x smaller; float32 storage was what
+    pushed a 14 GB machine into the OOM killer). Converting here means every caller
+    -- actor, critic, expert and BC passes -- sees the dtype the networks expect,
+    instead of each call site having to remember.
+    """
+    for field in ('state', 'next_state'):
+        observation = data.get(field)
+        if type(observation) is not dict:
+            continue
+        for key, value in list(observation.items()):
+            if (key.startswith('observation.images.') and
+                    type(value) is torch.Tensor and value.dtype == torch.uint8):
+                observation[key] = value.to(torch.float32)/255.
+    return data
+
+
 def train_batch(policy, optimizers, data, names):
-    data = dict(data, is_intervention=data['complementary_info']['is_intervention'])
+    data = _policy_frames(dict(data, is_intervention=data['complementary_info']['is_intervention']))
     metrics = {}
     for name in names:
         if name in ('expert', 'actor_bc') and not data['is_intervention'].any():

@@ -1,9 +1,10 @@
 """Freshness checks with local receipt times (upstream G2 semantics).
 
 The guard never converts a robot timestamp into local time.  The age of a
-source is how long this process has gone without a *new* timestamp from it, and
-the robot's own timestamps must still strictly advance so a repeated or frozen
-frame is rejected.
+source is how long this process has gone without a *new* timestamp from it. A
+stamp that moves backwards is an anomaly; a repeated stamp is tolerated while the
+source keeps changing inside its age limit (two guarded reads can fall inside one
+publication cycle of a source).
 """
 import numpy as np
 import pytest
@@ -87,11 +88,26 @@ def test_a_delayed_receipt_is_rejected_immediately():
     assert g.last_decision.code == 'camera_stale:left_wrist'
 
 
-def test_robot_state_sources_must_still_strictly_advance():
+def test_a_repeated_state_stamp_is_tolerated_but_a_frozen_source_is_not():
+    """Hardware regression: the TF cache repeated one stamp while its age was still
+    0 ms, and the old strict-advance rule aborted a healthy episode 100 steps in."""
     g = guard()
     assert g(observation(), evidence()) is True
-    assert g(observation(), evidence()) is False
-    assert g.last_decision.code == 'source_frozen:joint'
+    # Same stamp, but the source changed 5 ms ago: a benign duplicate read.
+    assert g(observation(), evidence()) is True
+    # A source that stopped changing ages past its limit and is rejected.
+    stale = evidence()
+    stale['source_changed_monotonic_ns'] = dict.fromkeys(
+        SOURCES, NOW - int(limits().state_age_s*1e9) - 1)
+    assert g(observation(), stale) is False
+    assert g.last_decision.code == 'state_stale:joint'
+
+
+def test_a_state_stamp_that_moves_backwards_is_still_rejected():
+    g = guard()
+    assert g(observation(), evidence()) is True
+    assert g(observation(), evidence(joint=SOURCE_NOW - 20_000_000)) is False
+    assert g.last_decision.code == 'source_reversed:joint'
 
 
 def test_a_recent_camera_frame_may_be_reused_but_the_age_still_bounds_it():

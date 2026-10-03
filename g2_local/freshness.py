@@ -24,6 +24,18 @@ MAX_REPORT_INTEGER = 2**63 - 1
 SDK_SAME_DOMAIN_MAX_NS = 500_000_000
 
 
+class PolicyInputExpired(RuntimeError):
+    """The action's input observation expired before the command was submitted.
+
+    Nothing was sent, so the step can be recomputed from a fresh observation
+    instead of ending the episode. The age limits measure time since this process
+    last *saw a changed* timestamp, which also grows with the loop's own latency
+    (planning, validation, inference) while the robot is publishing normally:
+    measured here, joint/tf update every ~13 ms (78 Hz) while the control loop runs
+    at ~10 Hz and re-validates 20-80 ms after the read.
+    """
+
+
 def _finite(value, name, *, positive=False):
     try:
         finite = type(value) in (int, float) and math.isfinite(value)
@@ -321,11 +333,19 @@ class ObservationFreshnessGuard:
                     if source in ('joint', 'tf') and self._skip_state_progress:
                         continue
                     previous = self._previous_source_ns.get(source)
-                    if check_progress and previous is not None and stamps[source] <= previous:
-                        if source in SOURCES[:2] and stamps[source] == previous:
-                            continue
-                        code = 'source_frozen:' if stamps[source] == previous else 'source_reversed:'
-                        raise _Rejected(code+source, f'{source} timestamp did not strictly advance')
+                    if (check_progress and previous is not None and
+                            stamps[source] < previous):
+                        # Only a stamp that moves BACKWARDS is an anomaly here.
+                        # An equal stamp is not: two guarded reads can land inside
+                        # one publication cycle of a source (the cameras have always
+                        # been allowed this, and on hardware the TF cache repeated a
+                        # stamp while the age was still 0 ms, which used to abort a
+                        # healthy episode 100 steps in). A genuinely frozen stream is
+                        # still caught, because the age above is measured from the
+                        # last observed *change*: it grows past `state_age_s` and is
+                        # rejected as `state_stale`.
+                        raise _Rejected('source_reversed:'+source,
+                                        f'{source} timestamp moved backwards')
                 if sent_ns is not None:
                     for source, (earliest, _) in intervals.items():
                         if earliest <= sent_ns:

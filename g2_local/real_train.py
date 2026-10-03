@@ -48,14 +48,19 @@ class LearnerConsole:
                 self.actor_loss = row['actor_loss']
             if not self.limit.due():
                 return
+            fresh = row.get('fresh_online')
+            fresh = '' if fresh is None else f"｜真机新增 {fresh}"
             say(f"更新 {row['learner_update']}｜critic {number(row.get('critic_loss'))}"
-                f"｜actor {number(self.actor_loss)}"
+                f"｜actor {number(self.actor_loss)}{fresh}"
                 f"｜已完成回合 {row.get('completed_episodes')}")
         elif kind == 'episode_completed':
             steps = row.get('steps')
             length = '' if steps is None else f"，本回合 {steps} 步"
             say(f"回合完成：第 {row['completed_episodes']} 个{length}｜"
                 f"learner_update {row['learner_update']}")
+        elif kind == 'zero_intervention_success':
+            say(f"★ 零接管成功！第 {row['steps']} 步，策略 v{row['version']}，"
+                f"已单独存档：{row['path']}")
         elif kind == 'checkpoint_saved':
             say(f"检查点已保存：{row['path']}"
                 f"（回合 {row['completed_episodes']}，update {row['learner_update']}）")
@@ -284,9 +289,15 @@ class EvidenceActorTransport:
         return getattr(self.transport, name)
 
     def send_transition_batch(self, rows):
-        rows = tuple(rows)
-        self.transport.send_transition_batch(rows)
-        self.tracker.send_transition_batch(rows)
+        # Enqueue only. The evidence tracker is fed from `take_confirmed()`, so a
+        # batch is recorded here only after the Learner has accepted it.
+        self.transport.send_transition_batch(tuple(rows))
+
+    def take_confirmed(self):
+        confirmed = self.transport.take_confirmed()
+        for rows in confirmed:
+            self.tracker.send_transition_batch(rows)
+        return confirmed
 
     def telemetry(self, kind, **fields):
         self.tracker.telemetry(kind, **fields)
@@ -311,23 +322,26 @@ def load_eval_checkpoint(path, *, run_id, config_hash, contract_sha256=None):
     with os.fdopen(fd, 'rb') as stream:
         payload = torch.load(stream, map_location='cpu', weights_only=False)
     if (type(payload) is not dict or payload.get('schema') != 1 or
-            payload.get('run_id') != run_id or payload.get('config_hash') != config_hash or
-            payload.get('manifest_digest') != config_hash or
+            payload.get('run_id') != run_id or
             tuple(payload.get('camera_keys', ())) != CAMERA_KEYS or
             payload.get('image_size') != 128 or payload.get('action_size') != 6):
         raise ValueError('Checkpoint identity or camera/action contract mismatch')
+    from .code_identity import announce_config_drift
+    announce_config_drift(path, payload.get('config_hash'), config_hash)
     from .code_identity import seed_identity_check
     if type(payload.get('runtime')) is not dict:
         raise ValueError('Algorithm contract identity mismatch; explicit migration required')
     if contract_sha256 is not None:
+        from .code_identity import algorithm_digest
         ok, detail = seed_identity_check(path, payload.get('algorithm_identity'),
-                                         {'contract_sha256': contract_sha256})
+                                         {'contract_sha256': contract_sha256,
+                                          'algorithm_sha256': algorithm_digest()})
         if not ok:
             raise ValueError(
-                'Algorithm contract identity mismatch; the stored task/action contract or '
-                'policy configuration differs from this configuration. ' + detail
-                + '; rebuild the seed with g2_local.offline_pretrain, or migrate this '
-                  'checkpoint explicitly')
+                'Algorithm identity mismatch; the stored task/action contract or the '
+                'training-semantics implementation differs from this checkout. ' + detail
+                + '; rebuild the seed with g2_local.offline_pretrain, or re-stamp this '
+                  'checkpoint explicitly with scripts/migrate_checkpoint_identity.py')
     version = payload.get('published_version')
     state = payload.get('published_actor_state')
     if (type(version) is not int or version < 0 or

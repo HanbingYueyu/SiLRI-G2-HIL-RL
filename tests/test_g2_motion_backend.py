@@ -265,6 +265,40 @@ def test_missing_post_command_camera_frame_uses_recoverable_camera_fault():
         driver.close()
 
 
+def test_an_expired_predecessor_is_revalidated_with_a_fresh_read():
+    """Hardware regression: `Policy input expired before command: state_stale:tf`
+    killed an episode 141 steps in. The age limits also cover this loop's own
+    latency (read -> infer -> plan -> validate), so an expired *observation* is not
+    a dead source: refresh the evidence, keep the action's origin, and only fail
+    when the sources really are gone."""
+    reader = Reader()
+    port = Port(reader)
+
+    class OnceExpired:
+        """Reports `state_stale:tf` on the first check, healthy afterwards."""
+
+        def __init__(self):
+            self.calls = 0
+            self.last_decision = FreshnessDecision('not_checked', 'fixture')
+
+        def __call__(self, obs, info, after=None, after_sdk_ns=None):
+            self.calls += 1
+            expired = self.calls == 1
+            self.last_decision = FreshnessDecision(
+                'state_stale:tf' if expired else 'ok', 'fixture')
+            return not expired
+
+    guard = OnceExpired()
+    driver = backend(reader, port, allow_motion=True, reference_guard=guard)
+    try:
+        predecessor = driver.observe()
+        driver.execute_from((0.,)*6, predecessor)
+        assert guard.calls == 2, 'the guard was not revalidated with a fresh read'
+        assert port.sent, 'the action must still be submitted'
+    finally:
+        driver.close()
+
+
 def test_expired_policy_predecessor_cannot_send():
     reader = Reader()
     port = Port(reader)

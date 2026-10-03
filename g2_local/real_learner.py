@@ -55,16 +55,60 @@ class LearnerSnapshot:
         raise AttributeError(name)
 
 
+_IMAGE_KEYS = tuple(f'observation.images.{key}' for key in CAMERA_KEYS)
+
+
+def _store_frames_as_captured(training):
+    """Store camera frames at their captured precision: uint8.
+
+    Frames arrive as uint8 and the policy only wants float32 in [0, 1] while it is
+    computing. Keeping float32 in the replay costs 768 KB per transition (two
+    cameras x state/next_state x 3x128x128 x 4 bytes), i.e. 5.0 GB for the current
+    capacities -- which, plus the save-time serialization peak, pushed this 14 GB
+    machine into the kernel OOM killer at 11.6 GB RSS. uint8 is 4x smaller and
+    lossless for the captured data.
+    """
+    stored = dict(training)
+    for field in ('state', 'next_state'):
+        observation = training.get(field)
+        if type(observation) is not dict:
+            continue
+        # Pure: the caller still owns the row it handed in (the same row can be
+        # re-validated later, e.g. a duplicate resend), so never mutate it.
+        stored[field] = {
+            key: ((value.clamp(0., 1.)*255.).round().to(torch.uint8)
+                  if key in _IMAGE_KEYS and type(value) is torch.Tensor and
+                  value.dtype != torch.uint8 else value)
+            for key, value in observation.items()}
+    return stored
+
+
+def _frames_for_policy(data):
+    """Return the batch the policy expects: float32 frames in [0, 1]."""
+    ready = dict(data)
+    for field in ('state', 'next_state'):
+        observation = data.get(field)
+        if type(observation) is not dict:
+            continue
+        ready[field] = {
+            key: (value.to(torch.float32)/255.
+                  if key in _IMAGE_KEYS and type(value) is torch.Tensor and
+                  value.dtype == torch.uint8 else value)
+            for key, value in observation.items()}
+    return ready
+
+
 def _training_row(row):
     with np.errstate(over='ignore'):
         stored_reward = np.float32(row['reward'])
     if not np.isfinite(stored_reward):
         raise ValueError('Reward cannot be represented in replay float32 storage')
-    return {**{key: row[key] for key in ('state', 'next_state', 'action',
-                                        'done', 'truncated')},
+    return _store_frames_as_captured({**{key: row[key] for key in
+                                         ('state', 'next_state', 'action',
+                                          'done', 'truncated')},
             'reward': float(stored_reward),
             'complementary_info': {
-                'is_intervention': float(row['complementary_info']['is_intervention'])}}
+                'is_intervention': float(row['complementary_info']['is_intervention'])}})
 
 
 def _replay_state(buffer):
@@ -136,11 +180,22 @@ def _restore_replay(buffer, state):
         if type(state[field]) is not dict or set(state[field]) != set(observation_shapes):
             raise ValueError('Replay camera contract mismatch')
         for key, shape in observation_shapes.items():
-            check_tensor(state[field][key], shape, torch.float32, finite=True)
+            value = state[field][key]
             if key.startswith('observation.images.'):
-                occupied = state[field][key][:state['size']]
-                if bool((occupied < 0).any() or (occupied > 1).any()):
+                # Frames are stored at capture precision (uint8). Checkpoints
+                # written before that change hold float32 in [0, 1]; convert them
+                # so an existing run resumes instead of being refused.
+                if type(value) is torch.Tensor and value.dtype == torch.float32:
+                    occupied = value[:state['size']]
+                    if bool((occupied < 0).any() or (occupied > 1).any()):
+                        raise ValueError('Replay camera value mismatch')
+                    state[field][key] = (value.clamp(0., 1.)*255.).round().to(torch.uint8)
+                    value = state[field][key]
+                check_tensor(value, shape, torch.uint8)
+                if bool((value[:state['size']] > 255).any()):
                     raise ValueError('Replay camera value mismatch')
+                continue
+            check_tensor(value, shape, torch.float32, finite=True)
     for field, shape, dtype, finite in (
             ('actions', (buffer.capacity, 6), torch.float32, True),
             ('rewards', (buffer.capacity,), torch.float32, True),
@@ -178,8 +233,17 @@ def _check_replay_records(buffer, records):
         for field, replay_field in (('state', 'states'), ('next_state', 'next_states')):
             for key, value in row[field].items():
                 stored = getattr(buffer, replay_field)[key][slot].cpu()
-                matches = (torch.equal(stored, torch.tensor(value, dtype=torch.float32).squeeze(0))
-                           if key == 'observation.state' else tensor_digest(stored) == value)
+                if key == 'observation.state':
+                    matches = torch.equal(stored,
+                                          torch.tensor(value, dtype=torch.float32).squeeze(0))
+                else:
+                    matches = tensor_digest(stored) == value
+                    if not matches and stored.dtype == torch.uint8:
+                        # Legacy checkpoints recorded the digest of the float32 form
+                        # of these frames; the same frames are now stored at capture
+                        # precision (uint8), and uint8 -> float32/255 round-trips
+                        # exactly, so the recorded digest still describes this frame.
+                        matches = tensor_digest(stored.to(torch.float32)/255.) == value
                 if not matches:
                     raise ValueError('Replay observation and provenance mismatch')
         if (buffer.rewards[slot].item() != torch.tensor(row['reward'], dtype=torch.float32).item() or
@@ -246,6 +310,18 @@ class RealLearnerRuntime:
         self.beta_pretrain_completed = 0
         self.beta_update_count = 0
         self.human_transitions_total = 0
+        # Live (non-imported) transitions accepted in THIS run. The warm-up gate
+        # below is about fresh real-robot experience, so it must not be satisfied
+        # by the demonstrations that the offline seed already put in the online
+        # replay: `len(self.online_replay)` counts those too.
+        self.fresh_online_transitions = 0
+        # Per-episode live intervention counters, used to archive the policy the
+        # first time an episode succeeds with no human takeover at all. That
+        # artifact used to be lost: the training checkpoint is a single file that
+        # the next save overwrites (the run that first succeeded autonomously on
+        # 2026-10-02 had its pre-success checkpoint overwritten 13 minutes later).
+        self._episode_interventions = {}
+        self.zero_intervention_archive = None
         self.beta_last_human_count = 0
         self.beta_last_loss = None
         self.actor_bc_pretrain_steps = 0
@@ -267,10 +343,32 @@ class RealLearnerRuntime:
                     'human_total': self.human_transitions_total,
                     'imported_demo_episodes': len(self.imported_demo_episodes),
                     'accepted': self.accepted_transitions, 'updates': self.update_count,
+                    'fresh_online': self.fresh_online_transitions,
                     'completed_episodes': len(self.completed_episode_ids),
                     'budget': self._interaction_budget,
                     'online_position': self.online_replay.position,
                     'human_position': self.human_replay.position}
+
+    def _archive_zero_intervention_success(self, episode_id, steps):
+        """Keep the first fully autonomous success instead of losing it to the next
+        atomic overwrite of the training checkpoint."""
+        if self.checkpoint_path is None:
+            return
+        path = Path(self.checkpoint_path).with_name(
+            f'checkpoint-zero-intervention-v{self.version}.pt')
+        try:
+            self.save_checkpoint(path)
+        except BaseException as error:      # never lose training over an archive
+            logging.exception('Could not archive the zero-intervention success')
+            if self.progress is not None:
+                self.progress(dict(event='zero_intervention_archive_failed',
+                                   episode_id=episode_id,
+                                   error=f'{type(error).__name__}: {error}'[:256]))
+            return
+        self.zero_intervention_archive = path
+        if self.progress is not None:
+            self.progress(dict(event='zero_intervention_success', episode_id=episode_id,
+                               steps=steps, version=self.version, path=str(path)))
 
     def ingest(self, rows, *, count_episodes=True, grant_interaction_credit=True):
         with self._update_lock, self._lock:
@@ -280,8 +378,16 @@ class RealLearnerRuntime:
                                         grant_interaction_credit=grant_interaction_credit)
 
     def _prepare_rows(self, rows):
-        return tuple((validate_real_transition(row, self.run_id, self.config_hash).value,
-                      _training_row(row), compact_record(row)) for row in rows)
+        prepared = []
+        for row in rows:
+            identity = validate_real_transition(row, self.run_id, self.config_hash).value
+            training = _training_row(row)
+            # The journal must describe the bytes the replay actually holds, so the
+            # frame digests are taken from the stored (uint8) frames, not from the
+            # float32 tensors that arrived over the wire.
+            prepared.append((identity, training, compact_record(dict(
+                row, state=training['state'], next_state=training['next_state']))))
+        return tuple(prepared)
 
     def _ingest_prepared(self, prepared, *, accepted_before_stop=False, count_episodes=True,
                          grant_interaction_credit=True):
@@ -304,12 +410,19 @@ class RealLearnerRuntime:
                 new.add(identity)
                 self.records.append(record)
                 episode_id = record['complementary_info']['episode_id']
+                self._episode_interventions[episode_id] = (
+                    self._episode_interventions.get(episode_id, 0)
+                    + int(training['complementary_info']['is_intervention']))
                 steps = self._episode_steps.get(episode_id, 0) + 1
                 if training['done'] or training['truncated']:
                     # The episode is closed: report its length once and forget it,
                     # so the open-episode map stays bounded by live episodes.
                     self._episode_steps.pop(episode_id, None)
+                    interventions = self._episode_interventions.pop(episode_id, 0)
                     finished.append((episode_id, steps))
+                    if (interventions == 0 and
+                            record['complementary_info'].get('success_label') is True):
+                        self._archive_zero_intervention_success(episode_id, steps)
                 else:
                     self._episode_steps[episode_id] = steps
                 if count_episodes and (training['done'] or training['truncated']):
@@ -317,6 +430,9 @@ class RealLearnerRuntime:
                 accepted += 1
             self.accepted_transitions += accepted
             if grant_interaction_credit:
+                # Demonstration import is the only caller that opts out; it is
+                # offline data, not fresh online experience.
+                self.fresh_online_transitions += accepted
                 self._interaction_budget += accepted * self.config.optimization.utd_ratio
             completed = len(self.completed_episode_ids)
             if completed != previous_episodes and self.progress is not None:
@@ -382,7 +498,8 @@ class RealLearnerRuntime:
                     raise LearnerStopped('Learner stopped during beta pretraining')
                 with self._lock:
                     data = self.human_replay.sample(opt.human_batch_size)
-                metrics = train_batch(self.policy, self.optimizers, data, ('expert',))
+                metrics = train_batch(self.policy, self.optimizers,
+                                      _frames_for_policy(data), ('expert',))
                 self.beta_last_loss = metrics['expert']
                 self.beta_pretrain_completed += 1
             self.beta_last_human_count = baseline_count
@@ -415,7 +532,8 @@ class RealLearnerRuntime:
                 if not bool(data['complementary_info']['is_intervention'].any()):
                     # train_batch would skip the step; count only real steps.
                     continue
-                metrics = train_batch(self.policy, self.optimizers, data, ('actor_bc',))
+                metrics = train_batch(self.policy, self.optimizers,
+                                      _frames_for_policy(data), ('actor_bc',))
                 last_loss = metrics['actor_bc']
                 completed += 1
         # The Target Actor still holds the pre-BC copy; hard sync it after the
@@ -455,12 +573,22 @@ class RealLearnerRuntime:
                     with self._lock:
                         beta_data = self.human_replay.sample(opt.human_batch_size)
                     self.beta_last_loss = train_batch(
-                        self.policy, self.optimizers, beta_data, ('expert',))['expert']
+                        self.policy, self.optimizers,
+                        _frames_for_policy(beta_data), ('expert',))['expert']
                     self.beta_update_count += 1
                 self.beta_last_human_count += opt.beta_update_interval
             with self._lock:
+                # Deliberate reading of `min_online_transitions`: it is a REPLAY
+                # minimum (how much experience must exist before the first update),
+                # not a count of fresh real-robot transitions. The offline seed
+                # already fills the online replay with demonstrations, so gating on
+                # `fresh_online_transitions` instead would stall learning for the
+                # first 256 live steps -- longer than several of our episodes. Both
+                # numbers are reported (`fresh_online` in every progress payload and
+                # in `snapshot_counts`) so the distinction is visible in the logs
+                # instead of being implicit.
                 if len(self.online_replay) < max(opt.min_online_transitions,
-                                                  opt.online_batch_size):
+                                                 opt.online_batch_size):
                     return None
                 online = self.online_replay.sample(opt.online_batch_size)
                 has_human = len(self.human_replay) > 0
@@ -472,7 +600,7 @@ class RealLearnerRuntime:
             actor_due = (self.update_count + 1) % opt.actor_update_interval == 0
             names = ('critic', 'actor', 'lagrange') if actor_due else ('critic', 'lagrange')
             bc_weight = self.behavior_clone_weight()
-            data = dict(data, bc_weight=bc_weight)
+            data = _frames_for_policy(dict(data, bc_weight=bc_weight))
             metrics = train_batch(self.policy, self.optimizers, data, names)
             metrics.update(beta_pretrain_steps=self.beta_pretrain_completed,
                            beta_update_steps=self.beta_update_count,
@@ -486,7 +614,9 @@ class RealLearnerRuntime:
                 self.progress(dict(event='learner_update', learner_update=self.update_count,
                                    completed_episodes=len(self.completed_episode_ids),
                                    actor_updated=actor_due, actor_loss=metrics.get('actor'),
-                                   critic_loss=metrics['critic'], bc_weight=bc_weight))
+                                   critic_loss=metrics['critic'], bc_weight=bc_weight,
+                                   fresh_online=self.fresh_online_transitions,
+                                   online_replay=len(self.online_replay)))
             if self.version % opt.target_update_interval == 0:
                 self.policy.update_target_networks()
             if self.version % opt.publish_interval == 0:
@@ -530,6 +660,7 @@ class RealLearnerRuntime:
                     human_transitions_total=self.human_transitions_total,
                     beta_last_human_count=self.beta_last_human_count,
                     beta_last_loss=self.beta_last_loss,
+                    fresh_online_transitions=self.fresh_online_transitions,
                     actor_bc_pretrain_steps=self.actor_bc_pretrain_steps,
                     actor_bc_last_loss=self.actor_bc_last_loss,
                     imported_demo_episodes=sorted(self.imported_demo_episodes),
@@ -599,27 +730,30 @@ def load_checkpoint(path: Path, *, expected_run_id: str, expected_config_hash: s
         payload = torch.load(stream, map_location='cpu', weights_only=False)
     if (type(payload) is not dict or payload.get('schema') != 1 or
             payload.get('run_id') != expected_run_id or
-            payload.get('config_hash') != expected_config_hash or
-            payload.get('manifest_digest') != (expected_manifest_digest or expected_config_hash) or
             tuple(payload.get('camera_keys', ())) != CAMERA_KEYS or
             payload.get('image_size') != 128 or payload.get('action_size') != 6):
         raise ValueError('Checkpoint identity or camera/action contract mismatch')
-    if full_config is not None and full_config.config_hash != expected_config_hash:
+    if expected_manifest_digest is not None and \
+            payload.get('manifest_digest') != expected_manifest_digest:
         raise ValueError('Checkpoint identity or camera/action contract mismatch')
+    from .code_identity import announce_config_drift
+    announce_config_drift(path, payload.get('config_hash'), expected_config_hash)
     config = SimpleNamespace(
         optimization=OptimizationConfig(**payload['optimization']),
         runtime=RuntimeConfig(**payload['runtime']),
         config_hash=expected_config_hash) if full_config is None else full_config
     if expected_contract_sha256 is not None:
         stored_identity = payload.get('algorithm_identity')
+        from .code_identity import algorithm_digest
         ok, detail = seed_identity_check(path, stored_identity,
-                                         {'contract_sha256': expected_contract_sha256})
+                                         {'contract_sha256': expected_contract_sha256,
+                                          'algorithm_sha256': algorithm_digest()})
         if not ok:
             raise ValueError(
-                'Algorithm contract identity mismatch; the stored task/action contract or '
-                'policy configuration differs from this configuration. ' + detail
-                + '; rebuild the seed with g2_local.offline_pretrain, or migrate this '
-                  'checkpoint explicitly')
+                'Algorithm identity mismatch; the stored task/action contract or the '
+                'training-semantics implementation differs from this checkout. ' + detail
+                + '; rebuild the seed with g2_local.offline_pretrain, or re-stamp this '
+                  'checkpoint explicitly with scripts/migrate_checkpoint_identity.py')
         from .code_identity import announce_source_drift, current_source_digest
         announce_source_drift(path, stored_identity,
                               {'source_sha256': current_source_digest()})
@@ -633,10 +767,17 @@ def load_checkpoint(path: Path, *, expected_run_id: str, expected_config_hash: s
     _restore_replay(learner.online_replay, payload['online_replay'])
     _restore_replay(learner.human_replay, payload['human_replay'])
     learner.seen_transition_ids = set(payload['seen_transition_ids'])
+    learner.fresh_online_transitions = int(payload.get('fresh_online_transitions', 0))
+    # Rows are validated against the identity of the run that PRODUCED them, not
+    # against the current configuration: a non-contract tunable may legitimately
+    # differ between the build and now (that is why config_hash is audit-only), and
+    # every stored row still carries its build-time hash. What cross-checks the two
+    # eras is the enforced contract/algorithm identity above, not this field.
     learner.records = ProvenanceRecords.restore(
         Path(path).parent, payload.get('provenance'),
         capacity=config.optimization.online_capacity + config.optimization.human_capacity,
-        run_id=expected_run_id, config_hash=expected_config_hash)
+        run_id=expected_run_id, config_hash=payload.get('config_hash'),
+        check_identity=False)
     record_ids = {row['complementary_info']['transition_id'] for row in learner.records}
     if learner.seen_transition_ids != record_ids or len(record_ids) != len(learner.records):
         raise ValueError('Checkpoint transition dedup mismatch')
@@ -863,10 +1004,37 @@ class GrpcLearnerService(rpc.LearnerServiceServicer):
                 self._pending_rows += len(prepared)
                 self._acknowledged_rows += len(prepared)
                 self._schedule()
-        except BaseException:
+        except BaseException as error:
+            if self._client_gone(context, error):
+                # The Actor exited (its own fault handling, Ctrl+C, or the loop
+                # stopping between episodes). Its in-flight batch is then incomplete
+                # and the RPC is cancelled -- that is not a protocol violation by a
+                # live client, and stopping the Learner here made every Actor death
+                # cost a full Learner restart: the next Actor's first batch was
+                # rejected with `Learner stopped`. The next Actor reconnects and
+                # receives the current parameters on subscribe.
+                logging.info('Transition stream ended with its client: %s', error)
+                raise
             self._stop()
             raise
         return pb.Empty()
+
+    @staticmethod
+    def _client_gone(context, error):
+        """True when this ingest failure is just the client having left."""
+        try:
+            if hasattr(context, 'is_active') and context.is_active() is False:
+                return True
+        except BaseException:
+            pass
+        import grpc
+        code = getattr(error, 'code', None)
+        if callable(code):
+            try:
+                return code() == grpc.StatusCode.CANCELLED
+            except BaseException:
+                return False
+        return False
 
     def StreamParameters(self, request, context):  # noqa: N802
         heartbeat = self.learner.config.runtime.parameter_heartbeat_s

@@ -10,8 +10,11 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location(
-    'g2_start_training_actor', ROOT / 'scripts/start_training_actor.py')
+LAUNCHER = ROOT / 'scripts/start_training_actor.py'
+if not LAUNCHER.is_file():  # pragma: no cover - only a checkout without scripts/
+    pytest.skip('scripts/start_training_actor.py is not present in this checkout',
+                allow_module_level=True)
+SPEC = importlib.util.spec_from_file_location('g2_start_training_actor', LAUNCHER)
 launcher = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(launcher)
 

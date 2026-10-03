@@ -109,8 +109,17 @@ def _policy_observation(obs, device, image_size):
     return result
 
 
-def validate_transition_provenance(row, run_id, config_hash):
-    """Validate identity, actions, outcomes and scene provenance."""
+def validate_transition_provenance(row, run_id, config_hash, *, check_identity=True):
+    """Validate identity, actions, outcomes and scene provenance.
+
+    ``check_identity=False`` is for *restoring* stored rows. The identity of a
+    checkpoint is a checkpoint-level property (run_id + contract/algorithm digests);
+    the per-row run_id/config_hash are era markers, and a replay legitimately mixes
+    eras -- demonstrations imported during the seed build plus live transitions
+    written under later, non-contract configuration changes. Comparing every stored
+    row against one hash refuses such a replay even though it is consistent.
+    Live ingestion still checks identity (the default).
+    """
     if type(row) is not dict or set(row) != {
             'state', 'next_state', 'action', 'reward', 'done', 'truncated',
             'complementary_info'}:
@@ -127,7 +136,7 @@ def validate_transition_provenance(row, run_id, config_hash):
         required.add('automatic_reset_monotonic_ns')
     if type(info) is not dict or set(info) != required:
         raise ValueError('Invalid transition provenance fields')
-    if info['run_id'] != run_id or info['config_hash'] != config_hash:
+    if check_identity and (info['run_id'] != run_id or info['config_hash'] != config_hash):
         raise ValueError('transition run/config identity mismatch')
     identity = TransitionIdentity(info['run_id'], info['episode_id'], info['step_id'])
     if info['transition_id'] != identity.value or info['synthetic'] is not False:
@@ -172,9 +181,10 @@ def validate_transition_provenance(row, run_id, config_hash):
     return identity
 
 
-def validate_real_transition(row, run_id, config_hash):
+def validate_real_transition(row, run_id, config_hash, *, check_identity=True):
     """Validate full real provenance before learner replay mutation."""
-    identity = validate_transition_provenance(row, run_id, config_hash)
+    identity = validate_transition_provenance(row, run_id, config_hash,
+                                              check_identity=check_identity)
     for field in ('state', 'next_state'):
         obs = row[field]
         if type(obs) is not dict or set(obs) != {
@@ -192,6 +202,19 @@ def validate_real_transition(row, run_id, config_hash):
                     bool((image < 0).any()) or bool((image > 1).any())):
                 raise ValueError('Invalid policy RGB tensor')
     return identity
+
+
+# The control loop must never wait for the Learner. A single Learner optimizer
+# update has been measured at 2.38 s on this bench, while the command lease
+# (`motion.command_timeout_s`) is 1.5 s: waiting for the uplink acknowledgement
+# inside the loop made the lease expire and killed a healthy episode. A batch is
+# therefore enqueued with this short bound and its confirmation is collected
+# afterwards through `take_confirmed()`, so a transition still counts as sent only
+# once the Learner has accepted it. A full queue is a fault, not a stall, and
+# `assert_alive()` (called every iteration and after every enqueue) turns any send
+# failure fatal. On exit `drain()` gives in-flight batches a bounded chance to
+# land before the transport closes.
+CONTROL_PATH_UPLINK_PUT_S = .05
 
 
 class _SendRequest:
@@ -226,6 +249,9 @@ class GrpcActorTransport:
         self.stub = stub or rpc.LearnerServiceStub(self.channel)
         self.parameters = Queue(maxsize=queue_capacity)
         self.outgoing = Queue(maxsize=queue_capacity)
+        self.uplink_put_timeout_s = min(queue_put_timeout_s, CONTROL_PATH_UPLINK_PUT_S)
+        self.outstanding = []
+        self.outstanding_lock = threading.Lock()
         self.stopped = threading.Event()
         self.error = None
         self.sender = threading.Thread(target=self._send_loop, daemon=True)
@@ -293,6 +319,8 @@ class GrpcActorTransport:
             finally:
                 request.done.set()
                 self.outgoing.task_done()
+                # Deliberately not forgotten here: take_confirmed() pops finished
+                # requests, and that is the only place a batch becomes confirmed.
 
     def assert_alive(self):
         if self.error is not None:
@@ -310,20 +338,51 @@ class GrpcActorTransport:
         except Empty:
             return None
 
+    def _forget(self, request):
+        with self.outstanding_lock:
+            try:
+                self.outstanding.remove(request)
+            except ValueError:
+                pass
+
     def send_transition_batch(self, rows):
+        """Enqueue a batch without waiting for the Learner (control path)."""
         self.assert_alive()
         request = _SendRequest(rows)
+        with self.outstanding_lock:
+            self.outstanding.append(request)
         try:
-            self.outgoing.put(request, timeout=self.queue_put_timeout_s)
+            self.outgoing.put(request, timeout=self.uplink_put_timeout_s)
         except Full as exc:
+            self._forget(request)
             self._fail(TimeoutError('transition uplink backpressure'))
             raise TimeoutError('transition uplink backpressure') from exc
-        if not request.done.wait(self.timeout_s * 3):
-            self._fail(TimeoutError('transition uplink backpressure'))
-            raise TimeoutError('transition uplink backpressure')
-        if request.error is not None:
-            raise request.error
         self.assert_alive()
+
+    def take_confirmed(self):
+        """Pop the batches the Learner has accepted since the last call."""
+        with self.outstanding_lock:
+            finished = [item for item in self.outstanding if item.done.is_set()]
+        confirmed = []
+        for item in finished:
+            self._forget(item)
+            if item.error is None:
+                confirmed.append(item.rows)
+        return confirmed
+
+    def drain(self, timeout_s=None):
+        """Wait, bounded, for in-flight batches. True when all are finished."""
+        budget = self.timeout_s if timeout_s is None else timeout_s
+        deadline = time.monotonic()+budget
+        while True:
+            with self.outstanding_lock:
+                pending = [item for item in self.outstanding if not item.done.is_set()]
+            if not pending:
+                return True
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                return False
+            pending[0].done.wait(min(remaining, .05))
 
     def close(self):
         self.stopped.set()
@@ -351,7 +410,6 @@ class RealActorRuntime:
         # NOTE: the real Actor role passes policy=None on purpose (the runtime
         # loads parameters from the Learner over gRPC), so a None policy here is
         # not an error. The CLI restricts this flag to the demo and actor roles.
-        
         self.exit_after_labeled_demo = exit_after_labeled_demo
         self._policy_warmed = False
         if demonstration and policy is not None:
@@ -385,7 +443,15 @@ class RealActorRuntime:
             raise RuntimeError('Cannot load parameters during in-flight step')
         envelope = self.transport.receive_latest_parameters()
         if envelope is None:
-            if self.clock() - self.last_parameter_at > self.config.runtime.learner_silence_timeout_s:
+            # The Learner publishes when its policy version changes and stays quiet
+            # while it is idle (between episodes it has no transitions to learn
+            # from). Silence is therefore only meaningful while control is actually
+            # running: waiting for the operator to press the double key must not
+            # turn into a fatal `learner parameter silence timeout` five seconds in,
+            # which is what the 30 s context window in the runbook promises.
+            if ((self.parameter_version < 0 or self.coordinator.running) and
+                    self.clock() - self.last_parameter_at >
+                    self.config.runtime.learner_silence_timeout_s):
                 raise TimeoutError('learner parameter silence timeout')
             return False
         changed = validate_parameter_envelope(
@@ -562,16 +628,36 @@ class RealActorRuntime:
         pending = None
         episode_steps = 0
         episode_interventions = 0
+        def apply_confirmations():
+            take = getattr(self.transport, 'take_confirmed', None)
+            if not callable(take):
+                return
+            for rows in take():
+                for row in rows:
+                    self.transitions_sent += 1
+                    self.interventions += int(row['complementary_info']['is_intervention'])
+        def settle_uplink():
+            """Let in-flight batches land before the summary is taken."""
+            drain = getattr(self.transport, 'drain', None)
+            if callable(drain):
+                try:
+                    drain()
+                except BaseException:
+                    logging.exception('Transition uplink drain failed')
+            apply_confirmations()
         waiting_context = RateLimit(10.)
         waiting_reminder = RateLimit(60.)
         waiting_announced = False
         heartbeat = RateLimit(2.)
         gate_wait_reminder = RateLimit(60.)
         gate_wait_announced = False
+        gate_wait_reason = 'no fresh report yet'
         def upload(row):
+            # Enqueue only: `send_transition_batch` must not make the control loop
+            # wait for the Learner (see CONTROL_PATH_UPLINK_PUT_S). The row counts
+            # as sent once the Learner has accepted it.
             self.transport.send_transition_batch((row,))
-            self.transitions_sent += 1
-            self.interventions += int(row['complementary_info']['is_intervention'])
+            apply_confirmations()
         def finish_episode(token, context, truncated, *, labeled=False, success=None):
             nonlocal env, previous_step_at, episode_steps, episode_interventions
             self.episodes_completed += 1
@@ -585,8 +671,14 @@ class RealActorRuntime:
             completed_env.close()
             outcome = ('成功' if success is True else '失败' if success is False
                        else '截断' if truncated else '未标注')
-            say(f'回合 #{self.episodes_completed} 结束：steps={episode_steps} 结果={outcome} '
-                f'人工接管={episode_interventions}/{episode_steps} 已提交转移={self.transitions_sent}')
+            # Deliberately NOT "回合 #N": every loop episode runs in its own Actor
+            # process, so a per-process counter would always read #1 and invite the
+            # reader to confuse it with the Learner's completed-episode count. The
+            # launcher prints the loop index, the Learner prints how many episodes
+            # are actually in the training data.
+            say(f'本回合结束（本进程第 {self.episodes_completed} 个）：steps={episode_steps} '
+                f'结果={outcome} 人工接管={episode_interventions}/{episode_steps} '
+                f'已提交转移={self.transitions_sent}')
             episode_steps = 0
             episode_interventions = 0
             reset_config = getattr(getattr(self.config, 'motion', None), 'auto_reset', None)
@@ -675,6 +767,7 @@ class RealActorRuntime:
                 if terminal_before_next_action():
                     continue
                 self.transport.assert_alive()
+                apply_confirmations()
                 self.accept_latest_parameters()  # boundary: never inside env.step
                 if not self.coordinator.running:
                     if self.parameter_version < 0:
@@ -770,18 +863,24 @@ class RealActorRuntime:
                     # background reader as in the demonstration role), so the gate
                     # can only become verifiable by calling it. A genuine input
                     # fault still raises here and stops the Actor, as designed.
+                    from .spacemouse import InputNotVerifiable
                     gate = getattr(intervention, 'gate', None)
                     if not (getattr(gate, 'fresh', False) or
                             getattr(intervention, 'verified_neutral', False)):
-                        intervention()
+                        # Before the first step of an episode an unverifiable gate is
+                        # a "wait", never a fault, and it needs nothing from the
+                        # operator: the device reports on its own and the gate
+                        # becomes verifiable within a moment. Mid-episode the same
+                        # exception stays fatal (fail closed).
+                        try:
+                            intervention()
+                        except InputNotVerifiable as pending_input:
+                            gate_wait_reason = str(pending_input)
                         if not (getattr(gate, 'fresh', False) or
                                 getattr(intervention, 'verified_neutral', False)):
                             if not gate_wait_announced:
                                 gate_wait_announced = True
-                                say('SpaceMouse 还没有上报过轴向数据（只按双键不算）：'
-                                    '请轻拨一下旋帽再松手，收到轴向报告后本回合立即继续。')
-                            elif gate_wait_reminder.due():
-                                say('仍在等待 SpaceMouse 轴向数据：轻拨一下旋帽再松手。')
+                                say(f'等待 SpaceMouse 就绪…（{gate_wait_reason}）')
                             time.sleep(self.config.runtime.operator_poll_interval_s)
                             continue
                 try:
@@ -861,7 +960,9 @@ class RealActorRuntime:
                     if not terminal_before_next_action() and pending is not None:
                         upload(pending[0])
                         pending = None
+                    settle_uplink()
                     return self.summary()
+            settle_uplink()
             return self.summary()
         except BaseException as error:
             primary_error = error
@@ -911,6 +1012,23 @@ class RealActorRuntime:
                 self.stop_confirmed = False
                 self.stop_error = error
             finally:
+                # Give in-flight transition batches a bounded chance to land before
+                # the uplink is closed; a slow Learner must not turn a clean stop
+                # into an unconfirmed delivery.
+                drain = getattr(self.transport, 'drain', None)
+                if callable(drain):
+                    try:
+                        if drain() is not True:
+                            logging.error('Transition uplink not confirmed within the '
+                                          'drain budget before Actor exit')
+                    except BaseException as error:
+                        logging.exception('Transition uplink drain failed')
+                        if cleanup_error is None:
+                            cleanup_error = error
+                try:
+                    apply_confirmations()
+                except BaseException:
+                    logging.exception('Could not collect final uplink confirmations')
                 close_transport = getattr(self.transport, 'close', None)
                 if callable(close_transport):
                     try:

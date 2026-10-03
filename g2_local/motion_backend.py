@@ -14,6 +14,7 @@ from scipy.spatial.transform import Rotation
 from .command_stream import CommandStream
 from .contract import CAMERA_KEYS, vector
 from .episode import StepResult
+from .freshness import PolicyInputExpired
 from .motion import plan_target
 from .outcome import coerce_outcome
 
@@ -28,6 +29,11 @@ class ObservationRejected(RuntimeError):
     def __init__(self, message, code):
         super().__init__(message)
         self.code = code
+
+
+# How many fresh re-reads are allowed to prove the sources are alive before an
+# expired action is discarded. Nothing has been submitted while this runs.
+PREDECESSOR_RECHECK_ATTEMPTS = 2
 
 
 class MotionBackend:
@@ -264,11 +270,16 @@ class MotionBackend:
             if self.local_envelope is not None and self.episode_reference is None:
                 raise RuntimeError('Episode reference required before motion')
             reference = None
+            guard_reference = None
             if predecessor is not None:
                 reference = self._last_accepted
                 if reference is None or not np.array_equal(
                         predecessor['state'], reference[0]['state']):
                     raise ValueError('Execution predecessor does not match accepted policy input')
+                # `reference` stays the action's ORIGIN (the drift check below uses
+                # it); `guard_reference` is the evidence revalidation input, which
+                # may be refreshed when only the loop's own latency expired it.
+                guard_reference = reference
             read_pose = getattr(self.reader, 'read_control_pose', None)
             if reference is not None and self.reference_guard is not None and callable(read_pose):
                 # The policy predecessor already contains both camera frames.
@@ -314,13 +325,28 @@ class MotionBackend:
                 self._check_local(pose, 'pre_command_target')
             if self.before_command is not None:
                 self.before_command()
-            if reference is not None and self.reference_guard is not None:
-                if self.reference_guard(*reference) is not True:
-                    owner = getattr(self.reference_guard, '__self__', None)
+            if guard_reference is not None and self.reference_guard is not None:
+                attempts = 0
+                while self.reference_guard(*guard_reference) is not True:
+                    # The guard may be a bound method (production) or a callable
+                    # object (tests); both expose `last_decision`.
+                    owner = getattr(self.reference_guard, '__self__', None) or self.reference_guard
                     decision = getattr(owner, 'last_decision', None)
-                    code = getattr(decision, 'code', 'unknown')
-                    raise RuntimeError('Policy input expired before command; action discarded: '
-                                       + str(code)[:128])
+                    code = str(getattr(decision, 'code', 'unknown'))
+                    # The age limits also grow with this loop's own latency, so an
+                    # expired *observation* is not the same as a dead source: refresh
+                    # the evidence and ask again. The action's origin is unchanged,
+                    # and the drift check below still bounds how far the robot moved
+                    # since that action was computed.
+                    retryable = code.split(':')[0] in (
+                        'state_stale', 'camera_stale', 'camera_skew', 'source_frozen',
+                        'source_reversed', 'not_after_command', 'not_after_command_sdk')
+                    if attempts >= PREDECESSOR_RECHECK_ATTEMPTS or not retryable:
+                        raise PolicyInputExpired('Policy input expired before command; '
+                                                 'action discarded: ' + code[:128])
+                    attempts += 1
+                    self._read()
+                    guard_reference = self._last_accepted
             execution['send_status'] = 'submission_attempted_unconfirmed'
             sequence = self.stream.submit(PoseTarget(pose[:3], pose[3:]))
             execution.update(send_status='submitted_unconfirmed', command_sequence=sequence)

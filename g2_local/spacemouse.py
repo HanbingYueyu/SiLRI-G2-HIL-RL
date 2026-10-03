@@ -6,6 +6,17 @@ import time
 from .contract import vector
 
 
+class InputNotVerifiable(RuntimeError):
+    """The human-input gate cannot be verified right now (not a device fault).
+
+    Raised when the SpaceMouse stream carries no fresh axis report and no observed
+    exact-zero evidence: the upstream Compact device only reports axes when the
+    knob moves, so a freshly opened reader that was never touched, or a knob held
+    off-centre for longer than the report age, is genuinely unverifiable. The
+    caller decides whether to wait (before a step) or fail closed (mid-episode).
+    """
+
+
 class ContinuousInputReader:
     """Keep draining a nonblocking HID reader independently of motion/vision work."""
 
@@ -299,13 +310,13 @@ class AutomaticIntervention:
                 return False, None
             if not self.gate.fresh and any(value != 0 for value in frame.axes):
                 ages = tuple(round(now-t, 4) for t in stamps)
-                raise RuntimeError(
+                raise InputNotVerifiable(
                     'stale nonzero SpaceMouse input: '
                     f'axis_ages_s={ages}, axes={tuple(frame.axes)}, '
                     f'left_pressed={frame.buttons[self.config.left_button]}, '
                     f'max_age_s={self.config.report_max_age_s}')
             if not self.gate.fresh and not self.verified_neutral and self.require_fresh():
-                raise RuntimeError('stale neutral SpaceMouse input')
+                raise InputNotVerifiable('stale neutral SpaceMouse input')
             moving = max(map(abs, proposal.action)) > self.config.engage_deadzone
             if moving:
                 self.active, self.neutral_since = True, None

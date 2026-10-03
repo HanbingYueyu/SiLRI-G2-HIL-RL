@@ -175,15 +175,26 @@ def test_eval_checkpoint_checks_identity_without_constructing_optimizer(tmp_path
         real_train.load_eval_checkpoint(checkpoint, run_id='other', config_hash='hash-1')
 
 
-def test_train_records_episode_only_after_successful_upload(tmp_path):
+def test_train_records_episode_only_after_the_learner_confirms(tmp_path):
+    """The uplink is enqueued without waiting (a slow Learner must not stall the
+    control loop), so the evidence record is written on *confirmation*, not on
+    hand-off."""
     output = tmp_path / 'run'
     output.mkdir(mode=0o700)
     evidence = real_train.RunEvidenceWriter(output, output / 'run_manifest.json', role='actor')
     sent = []
 
     class Transport:
+        def __init__(self):
+            self.unconfirmed = []
+
         def send_transition_batch(self, rows):
             sent.extend(rows)
+            self.unconfirmed.extend(rows)
+
+        def take_confirmed(self):
+            rows, self.unconfirmed = tuple(self.unconfirmed), []
+            return [rows] if rows else []
 
     transport = real_train.EvidenceActorTransport(Transport(), evidence)
     row = {'done': True, 'truncated': False,
@@ -194,6 +205,8 @@ def test_train_records_episode_only_after_successful_upload(tmp_path):
                                   'actor_version': 2}}
     transport.send_transition_batch([row])
     assert sent == [row]
+    assert not (output / 'episode_summaries.jsonl').exists(), 'recorded before confirmation'
+    assert transport.take_confirmed() == [(row,)]
     summary = json.loads((output / 'episode_summaries.jsonl').read_text())
     assert summary['episode_id'] == 'episode-1'
     assert summary['success'] is True

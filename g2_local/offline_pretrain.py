@@ -95,7 +95,10 @@ def main():
         evidence.event('actor_bc_pretrain_complete', steps=bc_steps, loss=bc_loss,
                        requested_steps=args.actor_bc_steps,
                        batch_size=config.optimization.human_batch_size)
-    assert before_actor != digest(learner.policy.actor)
+        # Only a warm start that actually ran may be asserted to have moved the
+        # Actor: `--actor-bc-steps 0` is a supported "no warm start" run and the
+        # unconditional assertion used to abort the seed build after the BC block.
+        assert before_actor != digest(learner.policy.actor)
     for index in range(args.updates):
         metrics = learner.update_once()
         if metrics is None:

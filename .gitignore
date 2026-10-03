@@ -11,7 +11,10 @@ outputs
 save_frames/
 save_frames
 scripts/
-scripts
+# The root operator scripts/ are tracked on purpose: the runbook and the tests
+# reference them, and an external reviewer cannot run or even see them when they
+# are ignored. Nested scripts/ directories inside vendored trees stay ignored.
+!/scripts/
 # Keep vendored LeRobot entrypoints trackable despite the generic scripts rule.
 !lerobot/src/lerobot/scripts/
 !lerobot/src/lerobot/scripts/**

@@ -41,6 +41,27 @@ SEED_CONTRACT_SOURCES = (
 # own hash (``config_hash``) is still enforced.
 POLICY_PLACEMENT_KEYS = ('device', 'storage_device', 'use_amp')
 
+# Training-signal keys that are *baked into stored transitions*: every saved row
+# carries the reward and the done/truncated labels computed with these values, so
+# a checkpoint trained under different values would silently mix two reward
+# definitions. They therefore belong to the enforced contract, while tunables that
+# are not baked in (timeouts, batch sizes, bc_weight, learning rates, checkpoint
+# cadence, capacities -- the latter is checked by the replay contract anyway) do
+# not, and can be changed without rebuilding anything.
+CHECKPOINT_SIGNAL_TASK_KEYS = ('success_reward', 'failure_reward', 'step_reward',
+                              'max_episode_steps')
+
+# Training-semantics implementation: the Actor/Critic/Expert/Target mathematics and
+# the optimizer step itself. A checkpoint carries optimizer state and target
+# networks that only mean what they meant when this code wrote them, so changing
+# any of these files must NOT be able to resume silently. Everything else in the
+# source tree stays audit-only (see `source_sha256`).
+TRAINING_SEMANTICS_SOURCES = (
+    'lerobot/src/lerobot/policies/silri/modeling_silri.py',
+    'lerobot/src/lerobot/policies/silri/configuration_silri.py',
+    'g2_local/runtime.py',
+)
+
 
 def source_digest(root):
     """Full source identity, including dirty env code; not a dataset snapshot."""
@@ -55,6 +76,17 @@ def source_digest(root):
     for path in sorted(paths):
         digest.update(str(path.relative_to(root)).encode()+b'\0')
         digest.update(path.read_bytes())
+        digest.update(b'\0')
+    return digest.hexdigest()
+
+
+def algorithm_digest():
+    """The enforced training-semantics digest (losses, targets, optimizer step)."""
+    root = Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256()
+    for name in TRAINING_SEMANTICS_SOURCES:
+        digest.update(name.encode()+b'\0')
+        digest.update((root/name).read_bytes())
         digest.update(b'\0')
     return digest.hexdigest()
 
@@ -74,6 +106,9 @@ def contract_digest(config):
     digest = hashlib.sha256()
     digest.update(b'demonstration-contract\0')
     digest.update(demonstration_contract(config).encode())
+    digest.update(b'checkpoint-signal\0')
+    task = dict(config.canonical_payload)['task']
+    digest.update(canonical_json({key: task[key] for key in CHECKPOINT_SIGNAL_TASK_KEYS}))
     for name in SEED_CONTRACT_SOURCES:
         digest.update(name.encode()+b'\0')
         digest.update((root/name).read_bytes())
@@ -120,6 +155,7 @@ def algorithm_identity(config):
                     policy_config=draccus.encode(create_policy_config(config.runtime.device)))
     if hasattr(config, 'canonical_payload'):
         identity['contract_sha256'] = contract_digest(config)
+    identity['algorithm_sha256'] = algorithm_digest()
     return identity
 
 
@@ -130,16 +166,34 @@ def _field(identity, name):
 def seed_identity_check(path, stored, current):
     """(ok, detail) for a stored vs current algorithm identity.
 
-    Only the contract decides usability. Full source/git/package drift is
-    reported by ``source_drift_notice`` instead of refusing the checkpoint.
+    Two things decide usability: the data/task contract and the training-semantics
+    implementation. Everything else (runtime code, logs, git revision, packages)
+    is reported by ``*_drift_notice`` instead of refusing the checkpoint.
     """
-    stored_contract = _field(stored, 'contract_sha256')
-    current_contract = _field(current, 'contract_sha256')
-    if stored_contract is None or stored_contract != current_contract:
-        return False, (f'checkpoint={Path(path).resolve()} '
-                       f'stored_contract_sha256={stored_contract} '
-                       f'current_contract_sha256={current_contract}')
+    if not isinstance(stored, dict):
+        return False, f'checkpoint={Path(path).resolve()} has no algorithm identity'
+    for field in ('contract_sha256', 'algorithm_sha256'):
+        if stored.get(field) is None or stored.get(field) != current.get(field):
+            return False, (f'checkpoint={Path(path).resolve()} {field}: '
+                           f'stored={stored.get(field)} current={current.get(field)}')
     return True, None
+
+
+def config_drift_notice(path, stored_hash, current_hash):
+    """One-line notice when only the (unenforced) config hash differs."""
+    if stored_hash is None or stored_hash == current_hash:
+        return None
+    return (f'note: {Path(path).resolve()} was written under config_hash '
+            f'{stored_hash} but this run uses {current_hash}; the task/reward/action '
+            'contract is unchanged, so this checkpoint stays usable. The mismatch is '
+            'recorded for audit only.')
+
+
+def announce_config_drift(path, stored_hash, current_hash):
+    notice = config_drift_notice(path, stored_hash, current_hash)
+    if notice is not None:
+        print(notice, file=sys.stderr, flush=True)
+    return notice
 
 
 def source_drift_notice(path, stored, current):

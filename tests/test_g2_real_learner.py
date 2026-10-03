@@ -339,6 +339,73 @@ def test_grpc_ingress_rejects_entire_bad_batch_before_mutation():
     assert learner.stopped.is_set()
 
 
+def test_a_zero_intervention_success_is_archived_separately(tmp_path):
+    """The training checkpoint is a single file the next save overwrites, so a fully
+    autonomous success must be kept somewhere the next save cannot touch."""
+    learner = _learner()
+    learner.checkpoint_path = tmp_path / 'checkpoint.pt'
+    rows = []
+    for step in range(3):
+        row = _row(step)
+        row['complementary_info']['episode_id'] = 'ep-clean'
+        row['complementary_info']['transition_id'] = f'run-1/ep-clean/{step}'
+        rows.append(row)
+    last = rows[-1]
+    last['done'] = True
+    last['complementary_info']['success_label'] = True
+    learner.ingest(rows)
+    archive = learner.zero_intervention_archive
+    assert archive is not None and archive.is_file()
+    assert archive.name.startswith('checkpoint-zero-intervention-v')
+    # A takeover anywhere in the episode disqualifies it.
+    learner.zero_intervention_archive = None
+    rows = []
+    for step in range(3):
+        row = _row(step, human=(step == 1))
+        row['complementary_info']['episode_id'] = 'ep-assisted'
+        row['complementary_info']['transition_id'] = f'run-1/ep-assisted/{step}'
+        rows.append(row)
+    rows[-1]['done'] = True
+    rows[-1]['complementary_info']['success_label'] = True
+    learner.ingest(rows)
+    assert learner.zero_intervention_archive is None
+
+
+def test_a_journal_written_from_float_frames_still_verifies():
+    """Hardware regression: resuming stopped with `Replay observation and provenance
+    mismatch`. Legacy checkpoints recorded digests of the float32 form of the frames,
+    while the replay now stores capture-precision uint8 (an exactly lossless
+    round-trip), so the recorded digest must still be accepted."""
+    from g2_local.provenance import compact_record
+    from g2_local.real_learner import _check_replay_records
+
+    learner = _learner()
+    learner.ingest([_row()])
+    assert learner.online_replay.states['observation.images.left_wrist'].dtype is torch.uint8
+    _check_replay_records(learner.online_replay, [compact_record(_row())])
+
+
+def test_an_actor_leaving_does_not_stop_the_learner():
+    """Hardware regression: the Actor exiting mid-batch left an incomplete batch, and
+    the ingest path stopped the whole Learner. The next Actor's first batch was then
+    rejected with `RuntimeError: Learner stopped`, i.e. every Actor death cost a
+    Learner restart. The Learner must stay up and serve the next Actor.
+    """
+    learner = _learner()
+    service = GrpcLearnerService(learner)
+
+    class Gone:
+        def is_active(self):
+            return False
+
+    def cancelled():
+        return iter(())                     # stream cancelled before any END chunk
+
+    with pytest.raises(ValueError, match='Incomplete transition batch'):
+        service.SendTransitions(cancelled(), Gone())
+    assert not learner.stopped.is_set(), 'the Learner must survive an Actor leaving'
+
+
 def test_heartbeat_keeps_version_and_state_with_new_sequence():
     learner = _learner()
     first = learner.publish_parameters()
@@ -634,7 +701,7 @@ def test_contract_identity_is_enforced_while_source_drift_is_only_noticed(tmp_pa
     stored = torch.load(checkpoint, weights_only=False)['algorithm_identity']
 
     # A checkpoint whose contract digest is unknown or different is refused.
-    with pytest.raises(ValueError, match='contract identity mismatch'):
+    with pytest.raises(ValueError, match='Algorithm identity mismatch'):
         load_checkpoint(checkpoint, expected_run_id='run-1', expected_config_hash='hash-1',
                         expected_contract_sha256='0' * 64)
 
@@ -663,6 +730,56 @@ def test_contract_digest_is_stable_and_covers_the_contract_modules():
     assert len(first) == 64
     assert 'g2_local/contract.py' in SEED_CONTRACT_SOURCES
     assert 'g2_local/demonstrations.py' in SEED_CONTRACT_SOURCES
+
+
+def test_resume_survives_a_non_contract_config_change(tmp_path, capsys):
+    """Hardware regression: after a hyper-parameter change the Learner refused its
+    own seed with `transition run/config identity mismatch`, because restored rows
+    were validated against the CURRENT config hash instead of the hash of the run
+    that produced them. Rows belong to their build era; the enforced contract and
+    algorithm digests are what make two eras compatible.
+    """
+    learner = _learner()
+    learner.ingest([_row()])
+    checkpoint = learner.save_checkpoint(tmp_path / 'cp.pt')
+    restored = load_checkpoint(checkpoint, expected_run_id='run-1',
+                               expected_config_hash='hash-2')
+    assert restored.runtime.run_id == 'run-1'
+    assert len(restored.runtime.records) == 1
+    assert 'config_hash' in capsys.readouterr().err
+
+
+def test_a_stored_row_may_carry_an_older_config_era():
+    """Hardware regression: resuming was refused with `transition run/config identity
+    mismatch` because every stored row was compared against one config hash. A replay
+    legitimately mixes eras (demonstrations imported at seed time + live rows written
+    under later, non-contract configuration changes); identity is a checkpoint-level
+    property, so restored rows are validated structurally instead. Live ingestion
+    still checks identity.
+    """
+    from g2_local.real_actor import validate_transition_provenance
+    row = _row(0)
+    info = row['complementary_info']
+    assert validate_transition_provenance(row, 'run-1', 'hash-1') is not None
+    info['config_hash'] = 'hash-0'          # a different era, same contract
+    with pytest.raises(ValueError, match='run/config identity mismatch'):
+        validate_transition_provenance(row, 'run-1', 'hash-1')
+    assert validate_transition_provenance(row, 'run-1', 'hash-1',
+                                          check_identity=False) is not None
+
+
+def test_imported_demonstrations_are_not_counted_as_fresh_online_data():
+    """Reviewer finding: `min_online_transitions` is a REPLAY minimum, and the seed's
+    demonstrations already fill the online replay, so it must not be read as "wait
+    for N fresh real-robot transitions". Both numbers are reported separately."""
+    learner = _learner()
+    learner.ingest([_row(0), _row(1)], count_episodes=False, grant_interaction_credit=False)
+    assert learner.fresh_online_transitions == 0
+    assert learner.snapshot_counts()['fresh_online'] == 0
+    learner.ingest([_row(2)])
+    assert learner.fresh_online_transitions == 1
+    counts = learner.snapshot_counts()
+    assert counts['fresh_online'] == 1 and counts['online'] == 3
 
 
 def test_a_learner_checkpoint_carries_the_contract_and_resumes(tmp_path):
